@@ -8336,11 +8336,11 @@ _autodetach_should() {
 # result retrieval as `bg`). The cloud preack is already satisfied: _cloud_disclose ran BEFORE this
 # and set OSRC_CLOUD_ACKED=1 (route_delegate path), or _bg_cloud_preack acquires it here (second-
 # opinion path), so _bg_cloud_preack returns early and the ack propagates to the child/tmux pane.
+# Cloud consent comes FIRST, before ANY launch machinery below (the tmux probe included): a
+# non-interactive cloud run must fail at the CLOUD GATE, never at a missing-tmux error, so the
+# gate stays the first thing a cloud dispatch hits on every platform.
 _autodetach_run() {
   local _ar_verb="$1"; shift
-  # Cloud consent comes FIRST, before ANY launch machinery (the tmux probe included): a
-  # non-interactive cloud run must fail at the CLOUD GATE, never at a missing-tmux error,
-  # so the gate stays the first thing a cloud dispatch hits on every platform.
   _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
   # HEADLESS BG PATH (explicit opt-out). Also the path the bg re-entry tests exercise.
   if [ "${OSRC_REQUIRE_INTERACTIVE:-1}" != "1" ]; then

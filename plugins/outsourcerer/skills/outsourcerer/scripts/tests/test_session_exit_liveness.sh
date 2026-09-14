@@ -50,6 +50,26 @@ case "\$1" in
 esac
 EOF
 chmod +x "$BIN/tmux"
+
+# Fake droid: the adapter probes `droid --help` before assembling the launch, and CI runners have
+# no droid binary — without a stub, check 6 dies inside _session_launch_error (which `die`s, i.e.
+# EXITs the sourced test shell) before the -r assertion can even run. The help text advertises
+# exactly the three capabilities the adapter gates on (interactive-by-default, exec as the
+# non-interactive path, bounded --auto levels).
+cat > "$BIN/droid" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--help" ]; then
+  cat <<'HELP'
+Usage: droid [options] [prompt...]
+Starts interactive mode by default when no subcommand is given.
+  exec <prompt>   Run a single non-interactive prompt for scripts/automation
+  --auto <level>  Bounded interactive autonomy: low, medium, high
+HELP
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$BIN/droid"
 export PATH="$BIN:$PATH"
 
 . "$SRC" >/dev/null 2>&1
