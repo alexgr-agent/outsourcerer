@@ -55,7 +55,10 @@ else
 fi
 
 # --- tokenrouter is an engine-style lane: alias resolution must NOT rewrite a pinned -m ---
-grep -q '\[ "$PROVIDER" != "tokenrouter" \]' "$SRC" && ok "tokenrouter skips alias resolution (-m passes verbatim)" || bad "tokenrouter not in the alias-skip guard"
+# The literal `!= "tokenrouter"` guard was retired when the lane ported to its descriptor: the skip
+# now runs through the descriptor's owns_catalog field via _provider_owns_catalog.
+[ "$(_lane_field tokenrouter owns_catalog 2>/dev/null)" = "yes" ] && _provider_owns_catalog tokenrouter \
+  && ok "tokenrouter skips alias resolution (-m passes verbatim)" || bad "tokenrouter descriptor lacks owns_catalog=yes"
 
 # --- tokenrouter is wired into every provider list (the contract: --provider tokenrouter works) ---
 _n=$(grep -c -- "devin|cc|codex|droid|cursor|hermes|warp|cline|gemini|gm|claudex|local|tokenrouter" "$SRC")
@@ -66,10 +69,15 @@ grep -q "unknown provider.*tokenrouter" "$SRC" && ok "unknown-provider error nam
 [ "$(_effective_lane tokenrouter tokenrouter 2>/dev/null)" = "tokenrouter" ] && ok "_effective_lane: tokenrouter is its own lane" || bad "_effective_lane wrong for tokenrouter"
 
 # --- cloud gate covers tokenrouter (it is a cloud lane: the prompt leaves the machine) ---
-grep -q 'tokenrouter) return 0 ;;   # cloud gateway' "$SRC" && ok "tokenrouter is gated as a cloud lane" || bad "tokenrouter not gated as a cloud lane"
+# The `tokenrouter) return 0` case arm was retired when the lane ported: the gate now reads the
+# descriptor's is_cloud field. Assert the behavior.
+_is_cloud_lane tokenrouter && ok "tokenrouter is gated as a cloud lane" || bad "tokenrouter not gated as a cloud lane"
 
 # --- route resolution has a cost class for tokenrouter (no 'route resolution is ambiguous' death) ---
-grep -q 'ccor|codexor|claudex|tokenrouter) ROUTE_COST_CLASS=credits' "$SRC" && ok "route cost class wired for tokenrouter" || bad "tokenrouter missing from route cost class"
+# The literal `...|tokenrouter) ROUTE_COST_CLASS=credits` arm was retired; the class now comes from
+# the descriptor's cost_class field.
+_route_resolution tokenrouter some-model 2>/dev/null
+[ "$ROUTE_COST_CLASS" = "credits" ] && ok "route cost class wired for tokenrouter" || bad "tokenrouter missing from route cost class"
 
 # --- the lane has NO hardcoded default model: -m is REQUIRED (the roster is the gateway's) ---
 if awk '/^_route_provider_default_model\(\)/,/^}/' "$SRC" | grep -q 'tokenrouter'; then
@@ -81,8 +89,11 @@ grep -q '\[ "\$PROVIDER" != "tokenrouter" \] || die "the tokenrouter lane needs 
   && ok "route_delegate fails fast when tokenrouter runs without -m" \
   || bad "route_delegate missing the tokenrouter -m-required guard"
 
-# --- dispatch table reaches the delegate (the dead-on-dispatch guard) ---
-grep -q 'tokenrouter) delegate_tokenrouter "\$tier"' "$SRC" && ok "dispatch table routes tokenrouter to delegate_tokenrouter" || bad "dispatch table missing the tokenrouter arm"
+# --- dispatch reaches the delegate (the dead-on-dispatch guard) ---
+# The literal `tokenrouter) delegate_tokenrouter` dispatch arm was retired; the mapping now lives in
+# the descriptor's dispatch field.
+[ "$(_lane_dispatch_fn tokenrouter tokenrouter 2>/dev/null)" = "delegate_tokenrouter" ] \
+  && ok "descriptor routes tokenrouter to delegate_tokenrouter" || bad "descriptor missing the tokenrouter dispatch"
 
 # --- fanout preflight checks the key before minting jobs (no phantom jobs on a missing key) ---
 grep -q "fanout: lane 'tokenrouter' requires TOKENROUTER_API_KEY" "$SRC" && ok "fanout preflight gates tokenrouter on the key" || bad "fanout preflight missing the tokenrouter key gate"
@@ -90,7 +101,9 @@ grep -q "fanout: lane 'tokenrouter' needs a model for every job" "$SRC" && ok "f
 
 # --- fallback machinery knows the lane (lane-ready probe + provider-for-lane) ---
 grep -q 'tokenrouter) k="\${TOKENROUTER_API_KEY:-}"' "$SRC" && ok "_fallback_lane_ready probes the tokenrouter key" || bad "_fallback_lane_ready missing tokenrouter"
-grep -q 'droid|cursor|hermes|warp|cline|tokenrouter) printf' "$SRC" && ok "_fallback_provider_for_lane maps tokenrouter" || bad "_fallback_provider_for_lane missing tokenrouter"
+# The literal engine-lane arm was retired; the mapping now lives in the descriptor's
+# fallback_provider field.
+[ "$(_fallback_provider_for_lane tokenrouter 2>/dev/null)" = "tokenrouter" ] && ok "_fallback_provider_for_lane maps tokenrouter" || bad "_fallback_provider_for_lane missing tokenrouter"
 
 # --- bg/fanout job peek (run_job) records the lane (the lane has no default model; -m is required,
 #     so a bg job on this lane always carries an explicit model) ---
@@ -99,7 +112,9 @@ grep -q 'tokenrouter)  lane="tokenrouter" ;;' "$SRC" \
   || bad "run_job engine-lane case missing the tokenrouter arm"
 
 # --- second-opinion routing (_so_resolve) dispatches tokenrouter, never misroutes to the alias lane ---
-grep -q 'droid|cursor|hermes|warp|cline|claudex|tokenrouter) disp="\$elane"' "$SRC" \
+# The literal `...|tokenrouter) disp="$elane"` arm was retired; _so_resolve now reads the
+# descriptor's disp field.
+[ "$(_lane_disp tokenrouter tokenrouter 2>/dev/null)" = "tokenrouter" ] \
   && ok "_so_resolve dispatches tokenrouter (no misroute to the alias-table lane)" \
   || bad "_so_resolve missing the tokenrouter arm (a second-opinion judge could misroute off the lane)"
 

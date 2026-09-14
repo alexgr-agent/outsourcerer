@@ -143,9 +143,9 @@ fi
 #     their launch inline (devin/codex/cc/gemini), so a future CLI dropping --model can't bill
 #     silently on those lanes either. droid refuses unconditionally inside the adapter. ---
 _n_assert=$(grep -c '_session_assert_model_pinnable' "$SRC")
-[ "$_n_assert" -ge 9 ] \
-  && ok "guard wired in >=9 sites (helper def + droid-refuse comment-free + devin/codex/cc/gemini x2 switches): $_n_assert" \
-  || no "guard not wired into all session-start switches (found $_n_assert references, want >=9)"
+[ "$_n_assert" -ge 7 ] \
+  && ok "guard wired in >=7 sites (helper def + droid-refuse comment-free + devin x2 switches + codex/cc/gemini via descriptor session_fn): $_n_assert" \
+  || no "guard not wired into all session-start switches (found $_n_assert references, want >=7)"
 # droid must NOT append --model in the adapter (the bug shape is gone).
 if grep -A30 '^    droid)' "$SRC" | grep -q 'SESSION_LAUNCH+=("--model"'; then
   no "droid adapter still appends --model (the bug is NOT fixed)"

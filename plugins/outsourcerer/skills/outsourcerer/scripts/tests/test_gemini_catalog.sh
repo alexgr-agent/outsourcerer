@@ -134,7 +134,17 @@ dated="$(grep -nE 'gemini-[0-9]+\.[0-9]+-(flash|pro)' "$SRC" | grep -vE '^[0-9]+
 $dated"
 grep -q '\-\-model "$(_agy_model_token gemini-flash)"' "$SRC" && ok "both agy liveness probes go through the resolver" || bad "an agy probe still names a literal model"
 grep -q '\-\-model "$(_gemini_api_id gemini-flash-lite)"' "$SRC" && ok "the gemini-cli probe goes through the resolver" || bad "gemini-cli probe still names a literal model"
-grep -q "gemini|gm) printf 'gemini-flash-lite'" "$SRC" && ok "the route default for the gemini lane is symbolic" || bad "route default still dated"
+# The gemini-lane route default lives on the gm lane descriptor now (lane-contract
+# refactor): the descriptor's default_model is the undated family alias, and
+# --provider gemini must resolve to the gm lane so _route_provider_default_model
+# reads it.
+OSRC_SOURCED=1 bash -c '
+  source "$1" || exit 1
+  lane_descriptor_gm | grep -q "default_model=gemini-flash-lite" || exit 1
+  [ "$(_lane_by_provider gemini)" = "gm" ] || exit 1
+  [ "$(_route_provider_default_model gemini)" = "gemini-flash-lite" ]
+' _ "$SRC" >/dev/null 2>&1 \
+  && ok "the route default for the gemini lane is symbolic" || bad "route default still dated"
 
 echo; echo "test_gemini_catalog: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

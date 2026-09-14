@@ -127,20 +127,29 @@ echo "=== (e) Interactive session lanes pass the flag (no --ignore-user-config) 
   # so it inherits the user's config. The explicit -c features.code_mode_host=true is the ONLY thing
   # that overrides a stale config=false. Verify the launch string includes the flag.
 
-  # tmux session lane: ccmh built from _codex_code_mode_host_flag + interpolated into launch.
-  if grep -q 'ccmh=.*features.code_mode_host=$(_codex_code_mode_host_flag)' "$SRC" \
-     && grep -q 'launch="codex .*workspace-write$ccmh"' "$SRC"; then
-    ok "(e) tmux session lane: ccmh built from _codex_code_mode_host_flag + interpolated into launch"
-  else
-    bad "(e) tmux session lane: ccmh or launch wiring missing"
-  fi
-
-  # winpty session lane: _ccmh built from _codex_code_mode_host_flag + appended to LAUNCH.
+  # Session lanes: the cx descriptor's session_fn (_session_launch_cx) builds the
+  # launch vector once for both tmux and winpty paths — _ccmh built from
+  # _codex_code_mode_host_flag + appended to SESSION_LAUNCH.
   if grep -q '_ccmh=.*features.code_mode_host=$(_codex_code_mode_host_flag)' "$SRC" \
      && grep -q 'LAUNCH+=.*_ccmh' "$SRC"; then
-    ok "(e) winpty session lane: _ccmh built from _codex_code_mode_host_flag + appended to LAUNCH"
+    ok "(e) session lane: _ccmh built from _codex_code_mode_host_flag + appended to LAUNCH"
   else
-    bad "(e) winpty session lane: _ccmh or LAUNCH wiring missing"
+    bad "(e) session lane: _ccmh or LAUNCH wiring missing"
+  fi
+
+  # Behavioral: the adapter must route --provider codex to the cx lane's session_fn
+  # and the vector must carry the flag. (A stub codex satisfies the `have` gate;
+  # MODEL_EXPLICIT=0 skips the --help probe, which needs no flag anyway.)
+  cat > "$_FAKE_BIN/codex" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+  chmod +x "$_FAKE_BIN/codex"
+  if ( PATH="$_FAKE_BIN:$PATH" MODEL="" MODEL_EXPLICIT=0 EFFORT="" _session_launch_adapter codex \
+       && printf '%s\n' "${SESSION_LAUNCH[@]}" | grep -q 'features.code_mode_host=' ) 2>/dev/null; then
+    ok "(e) --provider codex session launch carries features.code_mode_host via the descriptor"
+  else
+    bad "(e) --provider codex session launch lost features.code_mode_host"
   fi
 
   # Functional: build the launch string the same way the session start codex arm does, with the
@@ -184,15 +193,16 @@ echo "=== (f) Structural: every call site uses the bidirectional pattern ==="
     bad "(f) _codex_code_mode_host_flag function definition missing"
   fi
 
-  # Every delegate path that invokes codex must pass the flag. 5 sites use the function directly,
-  # 1 site (delegate_cxnative) stores it in a variable first (for the self-heal notice). Total = 6.
+  # Every delegate path that invokes codex must pass the flag. 4 sites use the function directly,
+  # 1 site (delegate_cxnative) stores it in a variable first (for the self-heal notice). Total = 5.
+  # (The two session-start arms collapsed into _session_launch_cx in the lane-descriptor refactor.)
   _DIRECT_SITES="$(grep -c 'features.code_mode_host=$(_codex_code_mode_host_flag)' "$SRC" 2>/dev/null)"
   _VARIABLE_SITES="$(grep -c 'features.code_mode_host=\$_cmh_flag' "$SRC" 2>/dev/null)"
   _TOTAL=$((_DIRECT_SITES + _VARIABLE_SITES))
-  if [ "$_TOTAL" -ge 6 ]; then
-    ok "(f) features.code_mode_host flag passed at $_TOTAL sites (5 direct + 1 variable, expected >= 6)"
+  if [ "$_TOTAL" -ge 5 ]; then
+    ok "(f) features.code_mode_host flag passed at $_TOTAL sites (4 direct + 1 variable, expected >= 5)"
   else
-    bad "(f) only $_TOTAL sites pass the flag ($_DIRECT_SITES direct + $_VARIABLE_SITES variable, expected >= 6)"
+    bad "(f) only $_TOTAL sites pass the flag ($_DIRECT_SITES direct + $_VARIABLE_SITES variable, expected >= 5)"
   fi
 
   # _codex_code_mode_host_flag referenced enough times (function def + call sites + comments).

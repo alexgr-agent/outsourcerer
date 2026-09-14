@@ -94,7 +94,10 @@ grep -q 'npm i -g cline' "$SRC" && ok "install instruction uses the real package
 
 # --- cline is an engine lane: alias resolution must NOT rewrite a pinned -m ---
 # The route_delegate guard skips alias resolution for engine lanes; cline must be in that list.
-grep -q '\[ "$PROVIDER" != "cline" \]' "$SRC" && ok "cline skips alias resolution (-m passes verbatim)" || bad "cline not in the alias-skip guard"
+# The literal `!= "cline"` chain was retired when cline ported to its lane descriptor: the skip now
+# runs through the descriptor's owns_catalog field via _provider_owns_catalog.
+[ "$(_lane_field cline owns_catalog 2>/dev/null)" = "yes" ] && _provider_owns_catalog cline \
+  && ok "cline skips alias resolution (-m passes verbatim)" || bad "cline descriptor lacks owns_catalog=yes"
 
 # --- cline is wired into every provider list (the contract: the alias picks the lane) ---
 _n=$(grep -c -- "devin|cc|codex|droid|cursor|hermes|warp|cline|gemini|gm|claudex|local" "$SRC")
@@ -106,7 +109,9 @@ grep -q "unknown provider.*cline" "$SRC" && ok "unknown-provider error names cli
 [ "$(_effective_lane cline cline 2>/dev/null)" = "cline" ] && ok "_effective_lane: cline is its own lane" || bad "_effective_lane wrong for cline"
 
 # --- cloud gate covers cline (it is a cloud lane: cline's backend + the model API) ---
-grep -q 'cline|claudex) return 0' "$SRC" && ok "cline is in the _is_cloud_lane set" || bad "cline not gated as a cloud lane"
+# The `cline|claudex) return 0` case arm was retired when cline ported: the gate now reads the
+# descriptor's is_cloud field. Assert the behavior, not the case text.
+_is_cloud_lane cline && ok "cline is in the _is_cloud_lane set" || bad "cline not gated as a cloud lane"
 
 # --- brief advertises cline when the CLI is present (auto-detection, no config) ---
 # Stub PATH so `have cline` is true, then run the lane probe.

@@ -270,7 +270,7 @@ OSRC_FLEET_FORCE="${OSRC_FLEET_FORCE:-0}"
 OSRC_FLEET_COMPACT="${OSRC_FLEET_COMPACT:-suggest}"
 # Any per-run MCP config temp is removed at script exit (only in the main shell, not in
 # command-substitution subshells where the file may still be needed by a later claude invocation).
-trap 'if [ "${BASH_SUBSHELL:-0}" -eq 0 ]; then rm -f "$OSRC_HOME/with-mcp-$$.json" "$OSRC_HOME/.hdr."* 2>/dev/null; fi' EXIT
+trap 'if [ "${BASH_SUBSHELL:-0}" -eq 0 ]; then rm -f "$OSRC_HOME/with-mcp-$$.json" "$OSRC_HOME/.hdr.$$."* 2>/dev/null; fi' EXIT
 # ---- state-home writability preflight (FAIL FAST, self-explaining). A sandboxed harness shell
 # (e.g. Claude Code sandbox whose allowWrite covers ~/.local/share/devin but NOT ~/.outsourcerer)
 # lets jobs launch with nowhere to write: terminal status, truncated out.log, sessions lost. One
@@ -1048,10 +1048,15 @@ _devin_resolve_model() {
 
 # Resolve aliases whose accepted model id differs by engine lane. Unknown model ids remain under
 # the engine's control because Droid and Warp also support user-configured catalogs.
+# Descriptor-first (model_for_fn field: dv->_devin_resolve_model, droid/warp->_kimi_alias_for);
+# the case below is the unported-lane fallback.
 _lane_model_for() {
-  local lane="${1:-}" model="${2:-}"
+  local lane="${1:-}" model="${2:-}" _l _f
+  if _l="$(_lane_by_token "$lane" 2>/dev/null)" && _f="$(_lane_field "$_l" model_for_fn 2>/dev/null)" && [ -n "$_f" ]; then
+    "$_f" "$model"; return
+  fi
   case "$lane:$model" in
-    devin:kimi|devin:kimi-k3|dv:kimi|dv:kimi-k3|droid:kimi|droid:kimi-k3|warp:kimi|warp:kimi-k3)
+    devin:kimi|devin:kimi-k3|dv:kimi|dv:kimi-k3)
       printf 'kimi-k3' ;;
     devin:*|dv:*) _devin_resolve_model "$model" ;;
     *) printf '%s' "$model" ;;
@@ -1096,7 +1101,16 @@ live_models() {
 # Lane whitelist: only the lanes that HAVE a live catalog (dv, warp, gm = Antigravity `agy models`,
 # gi = the Gemini API model list). A literal set closes any latent path-traversal from a future
 # caller passing an attacker-influenced lane string.
-_catalog_path() { case "${1:-}" in dv|warp|gm|gi) printf '%s/catalogs/%s.json' "$OSRC_HOME" "$1" ;; *) return 1 ;; esac; }
+# Descriptor-first: lanes that declare `catalog_lane` own a live catalog file; the
+# case below is the unported-lane fallback (literal set = path-traversal guard).
+_catalog_path() {
+  local _l _v
+  for _l in $OSRC_LANE_REGISTRY; do
+    _v="$(_lane_field "$_l" catalog_lane 2>/dev/null)"
+    [ -n "$_v" ] && [ "$_v" = "${1:-}" ] && { printf '%s/catalogs/%s.json' "$OSRC_HOME" "$_v"; return 0; }
+  done
+  case "${1:-}" in dv) printf '%s/catalogs/%s.json' "$OSRC_HOME" "$1" ;; *) return 1 ;; esac
+}
 
 # _catalog_fresh <lane> -> rc 0 if cache exists and is younger than TTL, rc 1 otherwise.
 # stat portability: GNU stat takes -c %Y (mtime epoch); macOS BSD stat takes -f %m. GNU MUST be
@@ -1246,7 +1260,7 @@ _catalog_fetch_inner() {
       [ -n "$_gk" ] || _gk="$(_extract_kv_value GEMINI_API_KEY 2>/dev/null)"
       [ -n "$_gk" ] || _gk="$(_extract_kv_value GOOGLE_API_KEY 2>/dev/null)"
       [ -n "$_gk" ] && have curl || return 1
-      raw="$(_timeout "${OSRC_CATALOG_FETCH_TIMEOUT:-10}" curl -fsS -H "x-goog-api-key: $_gk" \
+      raw="$(_timeout "${OSRC_CATALOG_FETCH_TIMEOUT:-10}" _curl_with_gemini_key "$_gk" -fsS \
               'https://generativelanguage.googleapis.com/v1beta/models?pageSize=500' 2>/dev/null)"
       printf '%s' "$raw" | jq -e '.' >/dev/null 2>&1 || raw=""
       ;;
@@ -1664,7 +1678,11 @@ delegate() {
   # No retry/routing change -- the hint just names the cause and the fix (disable the sandbox/proxy).
   # `|| true` keeps the diagnostic line from leaking a non-zero status into delegate()'s return
   # (rc is already captured above; the helper is best-effort and silent on no match).
-  [ "$rc" -ne 0 ] && _devin_sandboxed_proxy_tls_hint || true
+  if [ "$rc" -ne 0 ] && _devin_sandboxed_proxy_tls_hint; then
+    # Confirmed proxy-TLS lane outage: mark the devin lane down (short self-healing TTL) so the
+    # dispatch gate + fallback shortlist skip it instead of absorbing more full-timeout dispatches.
+    _lane_down_mark dv || true
+  fi
   # Bug-1 hint: a FREE-tier model that fails should never leave the user thinking the paid "0%%" gated it.
   # Now PRECISE — we captured Devin's stderr above, so we can tell a real quota/ACU/billing refusal from
   # an unrelated failure instead of hedging on every error:
@@ -1783,7 +1801,7 @@ _tr_load_key() {
 _curl_hdr_tmp=""
 _curl_with_auth() {
   local _hdr_val="$1"; shift
-  _curl_hdr_tmp="$(mktemp "$OSRC_HOME/.hdr.XXXXXX" 2>/dev/null || mktemp)"
+  _curl_hdr_tmp="$(mktemp "$OSRC_HOME/.hdr.$$.XXXXXX" 2>/dev/null || mktemp)"
   chmod 600 "$_curl_hdr_tmp" 2>/dev/null || true
   printf 'Authorization: Bearer %s\n' "$_hdr_val" > "$_curl_hdr_tmp"
   curl -H @"$_curl_hdr_tmp" "$@"
@@ -1793,7 +1811,7 @@ _curl_with_auth() {
 }
 _curl_with_gemini_key() {
   local _hdr_val="$1"; shift
-  _curl_hdr_tmp="$(mktemp "$OSRC_HOME/.hdr.XXXXXX" 2>/dev/null || mktemp)"
+  _curl_hdr_tmp="$(mktemp "$OSRC_HOME/.hdr.$$.XXXXXX" 2>/dev/null || mktemp)"
   chmod 600 "$_curl_hdr_tmp" 2>/dev/null || true
   printf 'x-goog-api-key: %s\n' "$_hdr_val" > "$_curl_hdr_tmp"
   curl -H @"$_curl_hdr_tmp" "$@"
@@ -1901,12 +1919,17 @@ tier_from_price() {   # <openrouter-id> -> budget|mid|frontier from cached prici
 # infer here. Open-weight ids (glm/deepseek/kimi/qwen…) are deliberately absent — they are dual-lane
 # and correctly ride the provider default, so they must fall through to the provider router below.
 lane_from_name() {
-  case "$1" in
-    claude-*|*-opus-*|*opus[0-9-]*|opus|fable|fable-*|claude*|*sonnet*|*haiku*) echo cc ;;
-    gpt-[0-9]*|gpt-*|sol|sol-*|terra|terra-*|luna|luna-*|o[0-9]-*|*-codex) echo cx ;;
-    gemini-*|gemini|*-gemini-*) echo gm ;;
-    *) return 1 ;;
-  esac
+  # Descriptor-first: family_globs on each native lane (cc/cx/gm). The iteration order
+  # is the old case's first-match order (cc, cx, gm) — NOT registry order — because a
+  # token matching two lanes' globs must resolve the same way it did before.
+  local _l _g
+  for _l in cc cx gm; do
+    _words_noglob "$(_lane_field "$_l" family_globs 2>/dev/null)"   # split WITHOUT globbing the patterns against cwd
+    for _g in ${WORDS[@]+"${WORDS[@]}"}; do
+      case "$1" in $_g) echo "$_l"; return ;; esac
+    done
+  done
+  return 1
 }
 
 tier_from_name() {    # <model-id> -> capable|frontier|budget by name regex, or nonzero if unrecognized.
@@ -1936,6 +1959,954 @@ resolve_tier() {
   echo mid                                                                           # last-resort default
 }
 
+# =============================================================================
+# LANE DESCRIPTOR CONTRACT — one descriptor per lane (docs/lane-contract-design.md).
+#
+# A lane used to be described by ~12 parallel `case` statements plus a bespoke
+# delegate_<lane> (docs/lane-contract-inventory.md maps all ~61 sites). Every lane
+# now declares a single `lane_descriptor_<name>`; the router and the attribute
+# tables read descriptor fields instead of keying on lane strings. Adding a lane
+# means writing one descriptor — not editing twelve tables.
+#
+# Three naming layers collapse here, and they are CONTEXT-dependent — the same
+# string resolves differently per lookup kind ("cc" is lane-cc for cost
+# disclosure but provider-cc -> or for quota/default-model; "codex" is cx's
+# native provider for session observation but or's transport provider elsewhere;
+# "gemini" is the paid-API lane gi for disclosure but gm's provider for routing):
+#   provider  (--provider):  devin|cc|codex|gemini|gm|droid|cursor|hermes|warp|cline|claudex|local|tokenrouter
+#   lane code (internal):    dv|or|cc|cx|gm|gi|ci|local|droid|cursor|hermes|warp|cline|claudex|tokenrouter
+#   disp      (vehicle):     devin|ccor|codexor|ccnative|cxnative|gmnative|claudex|droid|cursor|hermes|warp|cline|tokenrouter|local
+#
+# Three resolvers keep the contexts honest:
+#   _lane_by_token    — lane codes + disp vehicles + legacy names (name/aliases/disp)
+#   _lane_by_provider — --provider values that default to a lane  (providers)
+#   _lane_by_native   — family-provider tokens (session observe)  (native_of)
+#
+# Field reference (per lane; see the design doc for the full contract):
+#   name               canonical lane code
+#   aliases            space-joined lane-context tokens: disp vehicles + legacy names
+#                      (NEVER --provider values — those live in `providers`)
+#   providers          --provider values that default to this lane with no pinning -m
+#   native_of          family-provider tokens that mean this lane in native context
+#   provider_is_lane   provider name == lane (droid/cursor/hermes/warp/cline/claudex/
+#                      tokenrouter/local): the provider pins the lane outright
+#   owns_catalog       engine owns its model catalog -> -m passes verbatim, alias
+#                      resolution is skipped (droid/cursor/hermes/warp/cline/tokenrouter)
+#   catalog_lane       live-catalog key for _catalog_path/_catalog_validate (dv/warp/gm/gi)
+#   default_model      model when no -m given (empty = a bare run is a user error)
+#   default_lane       the catch-all implicit-provider lane (dv)
+#   or_transport_providers  provider tokens that mean "OpenRouter transport" (or: cc codex)
+#   model_globs        model-token globs that force this lane (local endpoint prefixes)
+#   cli                space-joined CLI binaries, ANY-of satisfies the gate
+#   cli_missing_hint   install hint for the fail-fast missing-CLI die
+#   gate_fn            extra dispatchability probe run by the CLI gate (_tr_load_key)
+#   ready_fn           readiness probe emitting "displayname=detail" for brief
+#   disp               dispatch vehicle (what _route_resolution/_is_cloud_lane key on)
+#   disp_by_provider   "provider=vehicle" pairs when a lane has several vehicles
+#                      (or: cc=ccor codex=codexor)
+#   dispatch           the delegate function (descriptor names it; bodies stay put)
+#   dispatch_by_disp   "vehicle=fn" pairs when vehicles dispatch differently
+#                      (or: ccor=delegate_cc codexor=delegate_codex)
+#   route_check_fn     explicit-lane guard run before disp assignment (cx/cc conflicts,
+#                      gi/ci image refusal)
+#   route_fn           full explicit-lane router (or: _route_or_lane — dual-lane
+#                      reroute + auto-route)
+#   credit_gate_fn     post-resolution balance gate (or: _or_credit_gate)
+#   warn_model/warn_verbs/warn_msg   pre-dispatch warning (dv swe-1.7 write verbs)
+#   resolve_model_fn   alias -> launchable id (dv: _devin_resolve_model, gm/gi:
+#                      _gemini_api_id; engine lanes: passthrough — they own catalogs)
+#   model_for_fn       cross-lane sibling resolver (_lane_model_for users)
+#   effort_fn          effort -> native flag (_droid_effort, _cline_effort, _agy_effort)
+#   quota_key          quota-pool code (ccor/codexor fold to or; gi folds to gm)
+#   cost_class         local|limited|credits — drives _route_confirm copy
+#   cost_disclosure    the user-visible cost string
+#   is_cloud           ships data off-machine (drives _cloud_disclose)
+#   plan_limited       subscription-lane: advise zeroes price, shows "plan limits"
+#   conserve_label     label for the conserve-line note (cc/cx)
+#   compare_class      advise cost-compare bucket: plan|free|""(unknown)
+#   fallback_provider  provider used to rebuild argv on a fallback hop
+#   image_backend      image-verb backend this lane serves (ci/gi/or)
+#   image_disp         disp vehicle the image backend discloses under
+#   observe_fn         session live-model observer (dv/cx/cc/droid/cursor/hermes/gm)
+#   receipt_fn         session receipt verifier (dv)
+#   session_fn         session-start capability adapter (droid/cursor/hermes/cline)
+#   brief_line         the "On your subscriptions" brief line (cx/cc/gm)
+#   participates_health  Slice-1 convergence slot: the lane-down state
+#                      (_lane_down_mark/_lane_down_active) keys on the canonical lane
+#                      code — the same code `name` declares and _lane_by_token /
+#                      _quota_lane_key resolve. The descriptor declares participation
+#                      ONLY; the dispatch-skip gate is Slice 1's, not reimplemented here.
+#
+# bash 3.2-safe: no assoc arrays; descriptors are printf lists, fields are read by
+# a while-read scan. During the per-lane migration every table reads the descriptor
+# FIRST and falls back to its legacy `case` arm for unported lanes; the fallback
+# arms retire as each lane lands.
+# =============================================================================
+OSRC_LANE_REGISTRY="local dv gm cx or cc gi ci droid cursor hermes warp cline claudex tokenrouter"
+
+# _lane_field <lane> <field> -> the field's value, rc1 when unregistered or unset.
+_lane_field() {
+  local l="${1:-}" f="${2:-}" line
+  case " $OSRC_LANE_REGISTRY " in *" $l "*) ;; *) return 1 ;; esac
+  while IFS= read -r line; do
+    case "$line" in "$f="*) printf '%s' "${line#*=}"; return 0 ;; esac
+  done <<_OSRC_LANE_FIELDS
+$(lane_descriptor_"$l" 2>/dev/null)
+_OSRC_LANE_FIELDS
+  return 1
+}
+
+# _lane_by_token <lane-code|disp|legacy-alias> -> canonical lane name, rc1 unknown.
+# Lane context ONLY: provider names never live in name/aliases/disp, so `codex`
+# does not resolve here (it is or's transport provider, not a lane token).
+_lane_by_token() {
+  local t="${1:-}" l v pair
+  [ -n "$t" ] || return 1
+  for l in $OSRC_LANE_REGISTRY; do
+    [ "$l" = "$t" ] && { printf '%s' "$l"; return 0; }
+    v="$(_lane_field "$l" aliases)"; case " $v " in *" $t "*) printf '%s' "$l"; return 0 ;; esac
+    v="$(_lane_field "$l" disp)"; [ "$v" = "$t" ] && { printf '%s' "$l"; return 0; }
+    _words_noglob "$(_lane_field "$l" disp_by_provider)"   # split WITHOUT globbing values against cwd (class-complete with the family/model_globs fix)
+    for pair in ${WORDS[@]+"${WORDS[@]}"}; do
+      case "$pair" in *"=$t") printf '%s' "$l"; return 0 ;; esac
+    done
+  done
+  return 1
+}
+
+# _lane_by_disp <disp-vehicle> -> canonical lane, rc1 otherwise. Disp context ONLY:
+# matches the `disp` field and `disp_by_provider` VALUES — never the canonical name
+# or a provider token. This distinction is load-bearing: _is_cloud_lane and
+# _route_resolution are keyed on dispatch vehicles, but the session path passes
+# raw provider names through them (`session start --provider cc` skips the cloud
+# gate today because `cc` hits the `*` arm). Resolving `cc` here would silently
+# START gating those sessions, so canonical codes deliberately do not match.
+_lane_by_disp() {
+  local t="${1:-}" l v pair
+  [ -n "$t" ] || return 1
+  for l in $OSRC_LANE_REGISTRY; do
+    v="$(_lane_field "$l" disp)"; [ "$v" = "$t" ] && { printf '%s' "$l"; return 0; }
+    _words_noglob "$(_lane_field "$l" disp_by_provider)"   # split WITHOUT globbing values against cwd (class-complete with the family/model_globs fix)
+    for pair in ${WORDS[@]+"${WORDS[@]}"}; do
+      case "$pair" in *"=$t") printf '%s' "$l"; return 0 ;; esac
+    done
+  done
+  return 1
+}
+
+# _lane_by_model_glob <model-token> -> canonical lane whose model_globs match the
+# token (local's ollama:/lmstudio:/lms:/local: endpoint prefixes), rc1 otherwise.
+_lane_by_model_glob() {
+  local m="${1:-}" l g
+  [ -n "$m" ] || return 1
+  for l in $OSRC_LANE_REGISTRY; do
+    _words_noglob "$(_lane_field "$l" model_globs 2>/dev/null)"   # split WITHOUT globbing the patterns against cwd
+    for g in ${WORDS[@]+"${WORDS[@]}"}; do
+      case "$m" in $g) printf '%s' "$l"; return 0 ;; esac
+    done
+  done
+  return 1
+}
+
+# _lane_by_provider <--provider value> -> canonical lane via the providers field.
+_lane_by_provider() {
+  local p="${1:-}" l v
+  [ -n "$p" ] || return 1
+  for l in $OSRC_LANE_REGISTRY; do
+    v="$(_lane_field "$l" providers)"; case " $v " in *" $p "*) printf '%s' "$l"; return 0 ;; esac
+  done
+  return 1
+}
+
+# _lane_by_native <token> -> canonical lane via the native_of field (session-observe
+# context: codex->cx, claude->cc, gemini->gm — the provider's NATIVE family lane,
+# not its transport default).
+_lane_by_native() {
+  local t="${1:-}" l v
+  [ -n "$t" ] || return 1
+  for l in $OSRC_LANE_REGISTRY; do
+    v="$(_lane_field "$l" native_of)"; case " $v " in *" $t "*) printf '%s' "$l"; return 0 ;; esac
+  done
+  return 1
+}
+
+# _lane_by_field <field> <token> -> canonical lane whose space-joined field contains
+# the token. Generic membership lookup for fields not worth their own resolver.
+_lane_by_field() {
+  local f="${1:-}" t="${2:-}" l v
+  [ -n "$f" ] && [ -n "$t" ] || return 1
+  for l in $OSRC_LANE_REGISTRY; do
+    v="$(_lane_field "$l" "$f")"; case " $v " in *" $t "*) printf '%s' "$l"; return 0 ;; esac
+  done
+  return 1
+}
+
+# _lane_flag <token> <field> -> rc0 when the token's lane declares field=yes.
+_lane_flag() {
+  local l; l="$(_lane_by_token "${1:-}" 2>/dev/null)" || return 1
+  [ "$(_lane_field "$l" "$2" 2>/dev/null)" = "yes" ]
+}
+
+# _lane_default -> the catch-all implicit-provider lane (dv). Reads default_lane
+# from the registry; the literal is the hard floor while dv is unported.
+_lane_default() {
+  local l
+  for l in $OSRC_LANE_REGISTRY; do
+    [ "$(_lane_field "$l" default_lane 2>/dev/null)" = "yes" ] && { printf '%s' "$l"; return 0; }
+  done
+  printf 'dv'
+}
+
+# _lane_disp <lane> [provider] -> the dispatch vehicle: disp_by_provider pairs first
+# (or serves ccor under cc, codexor under codex), then the lane's disp field.
+_lane_disp() {
+  local l="${1:-}" p="${2:-}" pair m
+  if [ -n "$p" ]; then
+    m="$(_lane_field "$l" disp_by_provider 2>/dev/null)"
+    for pair in $m; do case "$pair" in "$p="*) printf '%s' "${pair#*=}"; return 0 ;; esac; done
+  fi
+  _lane_field "$l" disp
+}
+
+# _lane_dispatch_fn <lane> <disp> -> the delegate function for this vehicle:
+# dispatch_by_disp pairs first (ccor->delegate_cc vs codexor->delegate_codex),
+# then the lane's dispatch field.
+_lane_dispatch_fn() {
+  local l="${1:-}" d="${2:-}" pair m
+  if [ -n "$d" ]; then
+    m="$(_lane_field "$l" dispatch_by_disp 2>/dev/null)"
+    for pair in $m; do case "$pair" in "$d="*) printf '%s' "${pair#*=}"; return 0 ;; esac; done
+  fi
+  _lane_field "$l" dispatch
+}
+
+# _provider_owns_catalog <provider> -> rc0 when the provider's lane owns its model
+# catalog (engine lanes): -m passes verbatim and alias resolution is skipped.
+_provider_owns_catalog() {
+  local l; l="$(_lane_by_provider "${1:-}" 2>/dev/null)" || return 1
+  [ "$(_lane_field "$l" owns_catalog 2>/dev/null)" = "yes" ]
+}
+
+# _provider_engine_lane <provider> -> echoes the lane when the provider names an
+# owns_catalog engine lane (the route_delegate engine branch's entry condition),
+# rc1 otherwise. Falls back to the literal engine-provider set while unported.
+_provider_engine_lane() {
+  local l
+  if l="$(_lane_by_provider "${1:-}" 2>/dev/null)" && [ "$(_lane_field "$l" owns_catalog 2>/dev/null)" = "yes" ]; then
+    printf '%s' "$l"; return 0
+  fi
+  case "$1" in tokenrouter) printf '%s' "$1"; return 0 ;; esac
+  return 1
+}
+
+# _lane_cli_gate <lane> — the fail-fast dispatchability gate that used to live in
+# route_delegate's engine `case`: any-of `cli` binaries on PATH, else die with
+# cli_missing_hint; then an optional gate_fn (tokenrouter's _tr_load_key — the KEY
+# is the dispatchability gate there). Runs pre-cloud-gate, pre-auto-detach so a
+# missing CLI/key is an instant pointer, not an error buried in a detached job.
+# No-op for unregistered lanes (their legacy case arm still gates them).
+_lane_cli_gate() {
+  local l="$1" cli c ok=0 gf
+  cli="$(_lane_field "$l" cli 2>/dev/null)"
+  for c in $cli; do have "$c" && { ok=1; break; }; done
+  [ -z "$cli" ] || [ "$ok" = "1" ] || die "$(_lane_field "$l" cli_missing_hint)"
+  gf="$(_lane_field "$l" gate_fn 2>/dev/null)"; [ -n "$gf" ] && "$gf"
+  return 0
+}
+
+# _lane_ready_probe <lane> -> emits "displayname=detail" when the lane is ready
+# right now (drives _ready_lanes / the brief). rc1 when the lane has no probe or
+# is not ready.
+_lane_ready_probe() {
+  local f; f="$(_lane_field "${1:-}" ready_fn 2>/dev/null)" || return 1
+  [ -n "$f" ] || return 1
+  "$f"
+}
+
+# _lane_health_key <token> -> the canonical lane code Slice-1 lane-down state keys
+# on (same code _quota_lane_key emits for a lane token). The descriptor exposes
+# the slot; the mark/active state and the dispatch-skip gate belong to Slice 1.
+_lane_health_key() { _lane_by_token "${1:-}"; }
+
+# =============================================================================
+# LANE DESCRIPTORS — one per lane, in registry order. A lane's helpers (ready
+# probe, session adapter, cross-lane alias fn) sit beside their descriptor so the
+# whole lane is one contiguous block.
+# =============================================================================
+
+# ---- droid (Factory Droid — BYOK agentic engine) -----------------------------
+lane_descriptor_droid() {
+  printf '%s\n' \
+    "name=droid" \
+    "providers=droid" \
+    "provider_is_lane=yes" \
+    "owns_catalog=yes" \
+    "cli=droid" \
+    "cli_missing_hint=droid CLI not on PATH (Factory Droid lane). Install it using the official guide: https://docs.factory.ai/cli. Then run 'droid' once to log in." \
+    "ready_fn=_ready_probe_droid" \
+    "disp=droid" \
+    "dispatch=delegate_droid" \
+    "default_model=droid-default" \
+    "model_for_fn=_kimi_alias_for" \
+    "effort_fn=_droid_effort" \
+    "session_fn=_session_launch_droid" \
+    "observe_fn=_session_model_observe_droid" \
+    "quota_key=droid" \
+    "cost_class=limited" \
+    "cost_disclosure=cash depends on your Factory plan or BYOK model; BYOK usage is measured or estimated by its provider" \
+    "is_cloud=yes" \
+    "fallback_provider=droid" \
+    "participates_health=yes"
+}
+_ready_probe_droid() { have droid && printf 'droid=byok'; }
+
+# kimi alias shared by the engine lanes carrying a Devin-compatible kimi family
+# (droid/warp): kimi|kimi-k3 -> kimi-k3, everything else passes through verbatim.
+_kimi_alias_for() { case "$1" in kimi|kimi-k3) printf 'kimi-k3' ;; *) printf '%s' "$1" ;; esac; }
+
+# _session_launch_droid — interactive-droid capability adapter. Reads `provider`,
+# `help_text`, `EFFORT`, `MODEL`, `MODEL_EXPLICIT` from _session_launch_adapter's
+# scope (dynamic) and fills SESSION_LAUNCH. Body verbatim from the retired
+# `droid)` case arm — every refusal cites the live-CLI-verified reason.
+_session_launch_droid() {
+  local provider="${provider:-$PROVIDER}"
+  have droid || _session_launch_error "$provider" "droid is not on PATH"
+  help_text="$(_session_probe_help droid --help)" \
+    || _session_launch_error "$provider" "the local help probe failed or timed out"
+  printf '%s\n' "$help_text" | grep -Eqi 'interactive mode.*default|start.*interactive mode' \
+    || _session_launch_error "$provider" "help does not advertise an interactive mode"
+  printf '%s\n' "$help_text" | grep -Eqi 'exec.*non-interactive|exec.*noninteractively|exec.*scripts/automation' \
+    || _session_launch_error "$provider" "help does not distinguish interactive mode from one-shot exec"
+  printf '%s\n' "$help_text" | grep -Eqi -- '--auto.*low.*medium.*high' \
+    || _session_launch_error "$provider" "help does not advertise bounded interactive autonomy"
+  SESSION_LAUNCH=("droid" "--auto" "medium")
+  if [ -n "$EFFORT" ]; then
+    # VERIFIED against the live CLI (full `droid --help`, never truncated): the TOP-LEVEL
+    # `droid` documents `-r, --resume [sessionId]` (Resume a session), NOT reasoning effort.
+    # `-r, --reasoning-effort <level>` exists ONLY under `droid exec --help`. Same bug class
+    # as the --model leak: this launch was assembled from the EXEC flag set. Passing
+    # `droid --auto medium -r <effort>` does NOT set effort — it tries to RESUME a session
+    # named "<effort>" (off/none/low/medium/high, none of which is a real session id), finds
+    # none, and EXITS SILENTLY TO A BARE SHELL with exit code 0 and no error. That is how
+    # every droid interactive lane died invisibly tonight. Interactive droid has NO reasoning-
+    # effort flag, so an explicit --effort on a droid session is REFUSED loudly (not silently
+    # dropped — a dropped effort is how this stayed invisible), naming the verified reason
+    # and pointing at the exec/delegate path where `-r` does mean reasoning-effort. Do NOT
+    # re-add `-r` behind a probe.
+    _session_launch_error "$provider" "interactive droid has NO reasoning-effort flag in \`droid --help\` (verified against the live CLI: top-level \`-r, --resume [sessionId]\` means RESUME a session, not effort; \`-r, --reasoning-effort <level>\` exists ONLY under \`droid exec --help\`). \`droid --auto medium -r <effort>\` would try to RESUME a session named \"<effort>\", find none, and exit 0 to a bare shell with no error — an invisible non-start. Drop --effort to start interactive droid on its default reasoning, or use '$0 --provider droid run --effort <level> -m <model> \"task\"' (or bg/delegate) which sets effort via \`droid exec -r\`."
+  fi
+  if [ "$MODEL_EXPLICIT" = "1" ]; then
+    # VERIFIED against the live CLI (full `droid --help`, never truncated): the TOP-LEVEL
+    # `droid` documents NO model flag. Usage is `droid [options] [prompt...]`, so a `--model`
+    # token falls through into the PROMPT and the run proceeds on droid's DEFAULT model
+    # (claude-opus-5), silently billing Claude quota. `-m, --model <id>` exists ONLY under
+    # `droid exec --help`, which delegate_droid uses correctly (`droid exec -m <id>`).
+    # The previous comment claimed "interactive droid accepts --model too" — that was an
+    # unverified assertion (it said the probe was skipped because it was slow) and it was
+    # FALSE. Do NOT re-add the flag behind a probe: interactive droid has no model override,
+    # so a pinned-model interactive session is REFUSED loudly rather than billing on the
+    # default. The honest alternatives for a pinned-model droid run are the exec/delegate
+    # paths (run / delegate / bg), which pin via `droid exec -m`. Refusing here (rather than
+    # falling back to exec) is deliberate: `session start` is for a steerable interactive
+    # REPL, and a headless `droid exec` in a pane exits on completion and breaks the
+    # send/read contract — silently converting an interactive request to headless would be
+    # a different surprise. Name the lane, state the verified reason, point at exec.
+    _session_launch_error "$provider" "interactive droid has NO model override in \`droid --help\` (verified against the live CLI: \`-m, --model <id>\` exists ONLY under \`droid exec --help\`). A --model token falls through into the prompt and the run bills on droid's DEFAULT model (claude-opus-5). Drop -m to start interactive droid on its configured model, or use '$0 --provider droid run -m <model> \"task\"' (or bg/delegate) which pins via \`droid exec -m\`."
+  fi
+}
+
+# ---- cursor (Cursor agent — subscription/BYOK engine) ------------------------
+lane_descriptor_cursor() {
+  printf '%s\n' \
+    "name=cursor" \
+    "providers=cursor" \
+    "provider_is_lane=yes" \
+    "owns_catalog=yes" \
+    "cli=cursor-agent agent" \
+    "cli_missing_hint=cursor-agent CLI not on PATH (Cursor lane). Install it using the official guide: https://cursor.com/docs/cli/installation. Then run 'cursor-agent login' once (or set CURSOR_API_KEY)." \
+    "ready_fn=_ready_probe_cursor" \
+    "disp=cursor" \
+    "dispatch=delegate_cursor" \
+    "default_model=cursor-default" \
+    "session_fn=_session_launch_cursor" \
+    "observe_fn=_session_model_observe_cursor" \
+    "quota_key=cursor" \
+    "cost_class=limited" \
+    "cost_disclosure=\$0 cash, spends your Cursor plan limits" \
+    "is_cloud=yes" \
+    "fallback_provider=cursor" \
+    "participates_health=yes"
+}
+_ready_probe_cursor() { have cursor-agent && printf 'cursor=subscription'; }
+
+# _session_launch_cursor — cursor-agent/agent capability adapter. Reads
+# `provider`, `MODEL`, `MODEL_EXPLICIT` from _session_launch_adapter's scope
+# (dynamic); writes `cli` + `help_text` (also dynamic-scope) and SESSION_LAUNCH.
+# Body verbatim from the retired `cursor)` case arm.
+_session_launch_cursor() {
+  local provider="${provider:-$PROVIDER}"
+  if have cursor-agent; then
+    cli="cursor-agent"
+  elif have agent; then
+    cli="agent"
+  else
+    _session_launch_error "$provider" "neither cursor-agent nor agent is on PATH"
+  fi
+  help_text="$(_session_probe_help "$cli" --help)" \
+    || _session_launch_error "$provider" "the local help probe failed or timed out"
+  if [ "$cli" = "agent" ]; then
+    printf '%s\n' "$help_text" | grep -qi 'cursor' \
+      || _session_launch_error "$provider" "the agent executable does not identify itself as Cursor"
+  fi
+  printf '%s\n' "$help_text" | grep -Eqi 'interactive (terminal|mode|session)|chat mode.*default|start.*chat mode' \
+    || _session_launch_error "$provider" "help does not advertise an interactive chat mode"
+  printf '%s\n' "$help_text" | grep -Eqi -- '--print.*non-interactive|-p.*non-interactive' \
+    || _session_launch_error "$provider" "help does not distinguish interactive chat from one-shot print mode"
+  SESSION_LAUNCH=("$cli")
+  if [ "$MODEL_EXPLICIT" = "1" ]; then
+    printf '%s\n' "$help_text" | grep -Eq -- '--model([ =]|$)' \
+      || _session_launch_error "$provider" "help does not advertise an interactive model override"
+    SESSION_LAUNCH+=("--model" "$MODEL")
+  fi
+}
+
+# ---- hermes (Hermes agent — BYOK engine) -------------------------------------
+lane_descriptor_hermes() {
+  printf '%s\n' \
+    "name=hermes" \
+    "providers=hermes" \
+    "provider_is_lane=yes" \
+    "owns_catalog=yes" \
+    "cli=hermes" \
+    "cli_missing_hint=hermes CLI not on PATH (Hermes agent lane). Install: https://github.com/NousResearch/hermes-agent  (then run 'hermes' once to configure). -m passes through verbatim; model catalog is yours to configure." \
+    "disp=hermes" \
+    "dispatch=delegate_hermes" \
+    "default_model=hermes-default" \
+    "session_fn=_session_launch_hermes" \
+    "observe_fn=_session_model_observe_hermes" \
+    "quota_key=hermes" \
+    "cost_class=limited" \
+    "cost_disclosure=metered cash from your configured provider, measured when available, otherwise estimated" \
+    "is_cloud=yes" \
+    "fallback_provider=hermes" \
+    "participates_health=yes"
+}
+
+# _session_launch_hermes — hermes chat capability adapter (dynamic scope as
+# documented on _session_launch_droid). Body verbatim from the `hermes)` arm.
+_session_launch_hermes() {
+  local provider="${provider:-$PROVIDER}"
+  have hermes || _session_launch_error "$provider" "hermes is not on PATH"
+  help_text="$(_session_probe_help hermes --help)" \
+    || _session_launch_error "$provider" "the local help probe failed or timed out"
+  chat_help="$(_session_probe_help hermes chat --help)" \
+    || _session_launch_error "$provider" "the local chat help probe failed or timed out"
+  printf '%s\n%s\n' "$help_text" "$chat_help" | grep -Eqi 'REPL|interactive (chat|mode|session)|chat.*interactive' \
+    || _session_launch_error "$provider" "help does not advertise an interactive REPL or chat"
+  printf '%s\n%s\n' "$help_text" "$chat_help" | grep -Eqi 'one-shot|non-interactive' \
+    || _session_launch_error "$provider" "help does not distinguish interactive chat from one-shot mode"
+  printf '%s\n' "$help_text" | grep -Eqi '(^|[[:space:]])chat([[:space:]]|$)' \
+    || _session_launch_error "$provider" "help does not advertise the chat command"
+  SESSION_LAUNCH=("hermes" "chat")
+  if [ "$MODEL_EXPLICIT" = "1" ]; then
+    printf '%s\n' "$chat_help" | grep -Eq -- '--model([ =]|$)' \
+      || _session_launch_error "$provider" "chat help does not advertise a model override"
+    SESSION_LAUNCH+=("--model" "$MODEL")
+  fi
+}
+
+# ---- warp (Warp Oz — plan/BYOK engine; provider name != CLI binary) ----------
+lane_descriptor_warp() {
+  printf '%s\n' \
+    "name=warp" \
+    "providers=warp" \
+    "provider_is_lane=yes" \
+    "owns_catalog=yes" \
+    "catalog_lane=warp" \
+    "cli=oz" \
+    "cli_missing_hint=oz CLI not on PATH (Warp lane). It ships INSIDE Warp.app at Contents/Resources/bin/oz — symlink it: ln -s '/Applications/Warp.app/Contents/Resources/bin/oz' ~/.local/bin/oz  (then 'oz login' once). -m passes through verbatim to 'oz model list'; use --harness via OSRC_WARP_HARNESS=claude|codex to host that harness instead of the default Oz one." \
+    "disp=warp" \
+    "dispatch=delegate_warp" \
+    "default_model=warp-default" \
+    "model_for_fn=_kimi_alias_for" \
+    "quota_key=warp" \
+    "cost_class=limited" \
+    "marginal_class=plan" \
+    "cost_disclosure=cash depends on your Warp plan or configured keys; key usage is measured or estimated by its provider" \
+    "is_cloud=yes" \
+    "fallback_provider=warp" \
+    "participates_health=yes"
+}
+
+# ---- cline (Cline — ClinePass/BYOK engine) -----------------------------------
+lane_descriptor_cline() {
+  printf '%s\n' \
+    "name=cline" \
+    "providers=cline" \
+    "provider_is_lane=yes" \
+    "owns_catalog=yes" \
+    "cli=cline" \
+    "cli_missing_hint=cline CLI not on PATH (Cline lane). Install: npm i -g cline  (or see https://github.com/cline/cline), then set up cline: sign in to ClinePass (~\$9.99/mo for discounted open-weight models) or configure your own keys in ~/.cline. -m passes through verbatim to whatever provider/model cline is set to; the Tab tracks the spend." \
+    "ready_fn=_ready_probe_cline" \
+    "disp=cline" \
+    "dispatch=delegate_cline" \
+    "default_model=cline-default" \
+    "effort_fn=_cline_effort" \
+    "session_fn=_session_launch_cline" \
+    "quota_key=cline" \
+    "cost_class=limited" \
+    "cost_disclosure=cash depends on your ClinePass subscription or the keys configured in ~/.cline; usage is measured or estimated by its provider" \
+    "is_cloud=yes" \
+    "fallback_provider=cline" \
+    "participates_health=yes"
+}
+_ready_probe_cline() { have cline && printf 'cline=clinepass-or-byok'; }
+
+# _session_launch_cline — cline REPL capability adapter (dynamic scope as
+# documented on _session_launch_droid). Body verbatim from the `cline)` arm.
+_session_launch_cline() {
+  local provider="${provider:-$PROVIDER}"
+  # Cline's interactive REPL is bare `cline`; the one-shot/headless path is driven by --plan and
+  # --auto-approve (the same flags the delegate_cline lane uses). Probe help before launching so we
+  # only start an interactive session on a CLI that advertises an interactive mode distinct from
+  # headless one-shot, and (when -m is given) a model override — matching the bar droid/cursor/hermes
+  # already clear. A failed/timed-out probe or a missing capability falls through to the one-shot lane.
+  have cline || _session_launch_error "$provider" "cline is not on PATH"
+  help_text="$(_session_probe_help cline --help)" \
+    || _session_launch_error "$provider" "the local help probe failed or timed out"
+  printf '%s\n' "$help_text" | grep -Eqi 'interactive|plan mode|act mode|repl|chat' \
+    || _session_launch_error "$provider" "help does not advertise an interactive mode"
+  printf '%s\n' "$help_text" | grep -Eqi -- '--plan|--auto-approve|non-interactive|headless' \
+    || _session_launch_error "$provider" "help does not distinguish interactive mode from headless one-shot"
+  SESSION_LAUNCH=("cline")
+  if [ "$MODEL_EXPLICIT" = "1" ]; then
+    if printf '%s\n' "$help_text" | grep -Eq -- '--model([ =]|$)'; then
+      SESSION_LAUNCH+=("--model" "$MODEL")
+    elif printf '%s\n' "$help_text" | grep -Eq '(^|[[:space:],])-m([[:space:],]|$)'; then
+      SESSION_LAUNCH+=("-m" "$MODEL")
+    else
+      _session_launch_error "$provider" "help does not advertise an interactive model override"
+    fi
+  fi
+}
+
+# ---- tokenrouter (TokenRouter gateway — keyed, no CLI) -----------------------
+# No cli field and no default_model: the KEY is the dispatchability gate
+# (gate_fn=_tr_load_key), and the roster is the gateway's live catalog so a bare
+# invocation dies at route_delegate's requires--m guard before any default applies.
+lane_descriptor_tokenrouter() {
+  printf '%s\n' \
+    "name=tokenrouter" \
+    "providers=tokenrouter" \
+    "provider_is_lane=yes" \
+    "owns_catalog=yes" \
+    "gate_fn=_tr_load_key" \
+    "ready_fn=_ready_probe_tokenrouter" \
+    "disp=tokenrouter" \
+    "dispatch=delegate_tokenrouter" \
+    "quota_key=tokenrouter" \
+    "cost_class=credits" \
+    "cost_disclosure=metered cash through your TokenRouter key (some models are a \$0 promo right now — confirmed at runtime by billing errors, never by a hardcoded date)" \
+    "is_cloud=yes" \
+    "fallback_provider=tokenrouter" \
+    "participates_health=yes"
+}
+_ready_probe_tokenrouter() {
+  [ -n "${TOKENROUTER_API_KEY:-}" ] || [ -n "$(_extract_kv_value TOKENROUTER_API_KEY 2>/dev/null)" ] \
+    || return 1
+  printf 'tokenrouter=keyed'
+}
+
+# ---- local (ollama/lmstudio/llama.cpp — on-machine inference) ----------------
+# model_globs is the endpoint-prefix vocabulary that forces the local lane
+# regardless of --provider; providers=local makes `--provider local` pin it too.
+lane_descriptor_local() {
+  printf '%s\n' \
+    "name=local" \
+    "providers=local" \
+    "provider_is_lane=yes" \
+    "owns_catalog=yes" \
+    "model_globs=ollama:* lmstudio:* lms:* local:* local" \
+    "fixed_lane=yes" \
+    "ready_fn=_ready_probe_local" \
+    "disp=local" \
+    "dispatch=delegate_local" \
+    "default_model=local" \
+    "quota_key=local" \
+    "cost_class=local" \
+    "marginal_class=free" \
+    "cost_disclosure=\$0 cash + \$0 plan" \
+    "is_cloud=no" \
+    "conserve_match= local=" \
+    "conserve_name=local" \
+    "conserve_why=private, \$0 cash + \$0 plan" \
+    "participates_health=yes"
+}
+_ready_probe_local() {
+  local ld; ld="$(_local_detect 2>/dev/null)" || return 1
+  printf 'local=%s' "${ld##*|}"
+}
+
+# ---- gm (Antigravity `agy` — keyless Gemini text; rides the Google app login) -
+# `gemini` splits two ways ON PURPOSE: as a --provider value it selects gm (agy
+# keyless is the default Gemini vehicle); as a lane/disclosure token it names gi
+# (the paid-API vehicle). providers/native_of vs aliases keep those contexts
+# apart — never put `gemini` in gm.aliases or provider-token lookups flip.
+lane_descriptor_gm() {
+  printf '%s\n' \
+    "name=gm" \
+    "aliases=gmnative antigravity-agy" \
+    "providers=gemini gm" \
+    "native_of=gemini" \
+    "family_globs=gemini-* gemini *-gemini-*" \
+    "fixed_lane=yes" \
+    "ready_fn=_ready_probe_gm" \
+    "fallback_ready_fn=_fallback_ready_gm" \
+    "session_fn=_session_launch_gm" \
+    "observe_fn=_session_model_observe_gemini" \
+    "disp=gmnative" \
+    "dispatch=delegate_gmnative" \
+    "default_model=gemini-flash-lite" \
+    "resolve_model_fn=_gemini_api_id" \
+    "effort_fn=_agy_effort" \
+    "quota_key=gm" \
+    "cost_class=limited" \
+    "marginal_class=plan" \
+    "cost_disclosure=\$0 cash, spends your Antigravity plan limits" \
+    "is_cloud=yes" \
+    "catalog_lane=gm" \
+    "plan_limited=yes" \
+    "fallback_provider=gemini" \
+    "session_provider=gemini" \
+    "conserve_match= gemini=keyless " \
+    "conserve_name=keyless Gemini" \
+    "conserve_why=Antigravity login, no API key" \
+    "participates_health=yes"
+}
+_ready_probe_gm() { have agy || return 1; printf 'gemini=keyless'; }
+_fallback_ready_gm() {
+  if have agy; then return 0; fi
+  have gemini || return 1
+  local k; k="$(_extract_kv_value GEMINI_API_KEY)"; [ -n "$k" ] || k="$(_extract_kv_value GOOGLE_API_KEY)"
+  [ -n "$k" ] || return 1
+}
+_session_launch_gm() {
+  # Dynamic scope: reads MODEL/MODEL_EXPLICIT from the session-start caller.
+  local gveh="${OSRC_GEMINI_VEHICLE:-}"
+  if [ -z "$gveh" ]; then if have agy; then gveh=agy; elif have gemini; then gveh=gemini; else die "gemini session needs a CLI (install Antigravity 'agy' keyless, or gemini-cli + GEMINI_API_KEY)"; fi; fi
+  have "$gveh" || die "OSRC_GEMINI_VEHICLE=$gveh but '$gveh' not on PATH"
+  [ "$gveh" != "gemini" ] || _gm_load_key
+  [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable gemini "$gveh" --help
+  if [ "$MODEL_EXPLICIT" = "1" ]; then SESSION_LAUNCH=("$gveh" "--model" "$MODEL"); else SESSION_LAUNCH=("$gveh"); fi
+}
+
+# ---- gi (gemini-cli on a paid Gemini API key — the metered Gemini vehicle) ----
+# Lane-side half of the `gemini` split (aliases, NOT providers): it carries the
+# image backend + catalog and REFUSES text dispatch (route_check_fn dies). No
+# disp field — gi never reaches a dispatch vehicle.
+lane_descriptor_gi() {
+  printf '%s\n' \
+    "name=gi" \
+    "aliases=gemini" \
+    "fixed_lane=yes" \
+    "image_lane=yes" \
+    "image_backend=gemini" \
+    "image_disp=gmnative" \
+    "catalog_lane=gi" \
+    "route_check_fn=_die_image_lane" \
+    "quota_key=gm" \
+    "cost_disclosure=metered cash through your Gemini API key, estimated before the run" \
+    "participates_health=yes"
+}
+_die_image_lane() {
+  # Runs under route_delegate's dynamic scope (MODEL/RESOLVED_ID visible).
+  die "'$MODEL' ($RESOLVED_ID) is an image-generation model, not a text-delegation lane. Use the image subcommand instead: $0 image -m $MODEL \"<prompt>\" [out.png]"
+}
+
+# ---- cx (Codex native — ChatGPT-subscription models on the codex CLI) ---------
+# `codex` is deliberately NOT in providers: in dispatch context it is or's
+# OpenRouter transport (codexor). In session/native context it means THIS lane —
+# native_of=codex drives _session_model_observe/_session_launch_adapter.
+lane_descriptor_cx() {
+  printf '%s\n' \
+    "name=cx" \
+    "aliases=cxnative codex-native" \
+    "native_of=codex" \
+    "family_globs=gpt-[0-9]* gpt-* sol sol-* terra terra-* luna luna-* o[0-9]-* *-codex" \
+    "fixed_lane=yes" \
+    "cli=codex" \
+    "ready_fn=_ready_probe_cx" \
+    "fallback_ready_fn=_fallback_ready_cx" \
+    "session_fn=_session_launch_cx" \
+    "session_resolved_fn=_session_resolved_cx" \
+    "relaunch_fn=_session_relaunch_cx" \
+    "observe_fn=_session_model_observe_codex" \
+    "route_check_fn=_route_check_cx" \
+    "disp=cxnative" \
+    "dispatch=delegate_cxnative" \
+    "quota_key=cx" \
+    "cost_class=limited" \
+    "marginal_class=plan" \
+    "cost_disclosure=\$0 cash, spends your ChatGPT plan limits" \
+    "is_cloud=yes" \
+    "plan_limited=yes" \
+    "fallback_provider=codex" \
+    "session_provider=codex" \
+    "conserve_windows=codex5h codexwk" \
+    "conserve_label=cx/Codex" \
+    "participates_health=yes"
+}
+_ready_probe_cx() { have codex || return 1; printf 'codex=sol/terra'; }
+_fallback_ready_cx() { have codex || return 1; }
+_route_check_cx() {
+  # Dynamic scope: reads PROVIDER/MODEL from route_delegate.
+  [ "$PROVIDER" = "cc" ] && die "gpt-5.6-* (Sol/Terra/Luna) is ChatGPT-backend-only; dispatching it via OpenRouter/cc 400s. Drop --provider and let '-m $MODEL' use the codex native lane (needs no OpenRouter key)."
+}
+_session_launch_cx() {
+  # Dynamic scope: reads MODEL/MODEL_EXPLICIT/EFFORT from the session-start caller.
+  have codex || die "codex not on PATH (needed for a codex session)"
+  local crow cid; crow="$(resolve_model_row "$MODEL")"; cid="${crow%%|*}"; [ -n "$cid" ] || cid="$MODEL"
+  [ -n "$cid" ] && _validate_model_token "$cid"   # empty = codex default; don't die on no-model session
+  [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable codex codex --help
+  local _ccmh=(); _ccmh=("-c" "features.code_mode_host=$(_codex_code_mode_host_flag)")
+  SESSION_LAUNCH=("codex" "-s" "workspace-write")
+  [ "$MODEL_EXPLICIT" = "1" ] && SESSION_LAUNCH+=("-m" "$cid")
+  [ -n "$EFFORT" ] && SESSION_LAUNCH+=("-c" "model_reasoning_effort=$EFFORT")
+  SESSION_LAUNCH+=(${_ccmh[@]+"${_ccmh[@]}"})
+}
+_session_resolved_cx() { # <model> -> resolved codex id (or passthrough)
+  local row; row="$(resolve_model_row "$1")"; [ -n "$row" ] && { printf '%s\n' "${row%%|*}"; return; }
+  printf '%s\n' "$1"
+}
+_session_relaunch_cx() { # <model> <effort> -> relaunch command string
+  local cid code_mode_host
+  cid="$(resolve_model_row "$1")"; cid="${cid%%|*}"; [ -n "$cid" ] || cid="$1"
+  _validate_model_token "$cid"
+  code_mode_host="$(_codex_code_mode_host_flag)" || return 1
+  printf 'codex -m %q -s workspace-write -c features.code_mode_host=%q -c model_reasoning_effort=%q' "$cid" "$code_mode_host" "$2"
+}
+
+# ---- ci (codex image — gpt-image on the ChatGPT subscription) -----------------
+lane_descriptor_ci() {
+  printf '%s\n' \
+    "name=ci" \
+    "fixed_lane=yes" \
+    "image_lane=yes" \
+    "image_backend=codex" \
+    "image_disp=cxnative" \
+    "route_check_fn=_die_image_lane" \
+    "quota_key=ci" \
+    "cost_disclosure=\$0 cash, spends your ChatGPT plan limits" \
+    "participates_health=yes"
+}
+
+# ---- claudex (ChatGPT-sub models in the Claude Code harness via CLIProxyAPI) --
+# provider_is_lane=yes (the provider pins the lane) but owns_catalog=no — alias
+# resolution still runs (sol -> gpt-5.6-sol) so RESOLVED_LANE is known when the
+# provider branch refuses Claude-subscription models. provider_fn owns the whole
+# provider-level branch: refusal + default + fail-fast gate + disp.
+lane_descriptor_claudex() {
+  printf '%s\n' \
+    "name=claudex" \
+    "providers=claudex" \
+    "provider_is_lane=yes" \
+    "owns_catalog=no" \
+    "provider_fn=_route_provider_claudex" \
+    "ready_fn=_ready_probe_claudex" \
+    "disp=claudex" \
+    "dispatch=delegate_claudex" \
+    "default_model=gpt-5.6-sol" \
+    "quota_key=claudex" \
+    "cost_class=credits" \
+    "cost_disclosure=\$0 cash, spends your ChatGPT plan limits" \
+    "is_cloud=yes" \
+    "participates_health=yes"
+}
+_ready_probe_claudex() { _claudex_up 2>/dev/null && printf 'claudex=proxy'; }
+
+# _route_provider_claudex — the claudex provider branch of route_delegate. Runs
+# under route_delegate's dynamic scope (reads PROVIDER/MODEL/MODEL_EXPLICIT/
+# RESOLVED_LANE, writes RESOLVED_ID/disp). Body verbatim from the retired
+# `[ "$PROVIDER" = "claudex" ]` elif.
+_route_provider_claudex() {
+    # CLAUDEX: a ChatGPT-sub model (sol/terra/luna/gpt-5.5) inside the Claude Code HARNESS via the
+    # user's local CLIProxyAPI. Alias resolution DID run above (sol -> gpt-5.6-sol). Guardrails:
+    #  - Claude-subscription models are REFUSED here: routing Claude OAuth through a third-party
+    #    proxy breaks Anthropic's usage policy; the claude-native lane already serves them first-class.
+    #  - no -m defaults to gpt-5.6-sol (the model this lane exists for).
+    case "$RESOLVED_LANE" in
+      cc) die "-m $MODEL is a Claude-subscription model; routing it through a third-party proxy breaks Anthropic's usage policy. Drop --provider claudex and run -m $MODEL on the claude-native lane (same harness, fully legit)." ;;
+    esac
+    [ "$MODEL_EXPLICIT" = "1" ] || RESOLVED_ID="gpt-5.6-sol"
+    # Fail FAST (pre-cloud-gate, pre-auto-detach): a missing claude CLI or dead proxy must be an
+    # instant pointer, not an error buried inside a detached background job.
+    have claude || die "claudex lane needs the claude CLI on PATH."
+    [ -n "${OSRC_JOB_DIR:-}" ] || _claudex_up || die "claudex lane: no CLIProxyAPI answering at $(_claudex_url) (or no api-key found). This lane rides a proxy YOU install and log into: https://github.com/router-for-me/CLIProxyAPI (then cli-proxy-api --codex-login). Set OSRC_CLAUDEX_URL / OSRC_CLAUDEX_TOKEN if yours is elsewhere. Meanwhile -m ${RESOLVED_ID} runs fine on the codex-native lane (drop --provider)."
+    disp=claudex
+}
+
+# ---- cc (Claude native — Claude-subscription models on the claude CLI) --------
+# The provider token `cc` does NOT pin this lane: in dispatch context it is an
+# OpenRouter transport provider (or's providers / or_transport_providers), so cc
+# carries no providers/provider_is_lane fields. This lane owns the native family
+# (claude-*/opus/fable/sonnet/haiku -> cc via family_globs), the ccnative vehicle,
+# and the session surface via native_of=claude. quota_key=cc is reachable ONLY
+# via the ccnative vehicle / lane code — a bare `cc` token is claimed by or's
+# provider group first (see _quota_lane_key).
+lane_descriptor_cc() {
+  printf '%s\n' \
+    "name=cc" \
+    "aliases=claude-native" \
+    "native_of=claude" \
+    "family_globs=claude-* *-opus-* *opus[0-9-]* opus fable fable-* claude* *sonnet* *haiku*" \
+    "fixed_lane=yes" \
+    "ready_fn=_ready_probe_cc" \
+    "fallback_ready_fn=_fallback_ready_cc" \
+    "session_fn=_session_launch_cc" \
+    "observe_fn=_session_model_observe_cc" \
+    "relaunch_fn=_session_relaunch_cc" \
+    "session_provider=cc" \
+    "route_check_fn=_route_check_cc" \
+    "disp=ccnative" \
+    "dispatch=delegate_ccnative" \
+    "quota_key=cc" \
+    "cost_class=limited" \
+    "marginal_class=plan" \
+    "cost_disclosure=\$0 cash, spends your Claude plan limits" \
+    "is_cloud=yes" \
+    "plan_limited=yes" \
+    "fallback_provider=cc" \
+    "conserve_windows=claude5h claude7d" \
+    "conserve_label=cc/Claude 5h" \
+    "participates_health=yes"
+}
+
+_ready_probe_cc() { have claude && printf 'claude=native\n'; }
+_fallback_ready_cc() { have claude || return 1; }
+
+# Claude-backend models cannot run through the Codex/OpenRouter transport.
+# Dynamic scope: reads PROVIDER/MODEL/RESOLVED_ID from route_delegate.
+_route_check_cc() {
+  [ "$PROVIDER" = "codex" ] && die "$RESOLVED_ID is Claude-backend-only; it cannot run through Codex/OpenRouter. Drop --provider and let '-m $MODEL' use the claude native lane (uses your Claude subscription)."
+}
+
+# Interactive claude launch for both session-start paths (unix array + winpty
+# string via _session_shell_command). Dynamic scope: reads MODEL/MODEL_EXPLICIT/
+# EFFORT, writes SESSION_LAUNCH. The winpty path used to emit a nested
+# `env MAX_THINKING_TOKENS=N env -u ...`; the flat argv below is the same spawn.
+_session_launch_cc() {
+  have claude || die "claude not on PATH (needed for a claude session)"
+  [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable cc claude --help
+  SESSION_LAUNCH=("env")
+  [ -n "$EFFORT" ] && SESSION_LAUNCH+=("MAX_THINKING_TOKENS=$(_effort_thinking_tokens "$EFFORT")")
+  SESSION_LAUNCH+=("-u" "CLAUDECODE" "-u" "CLAUDE_CODE_ENTRYPOINT" "-u" "CLAUDE_CODE_SESSION_ID" "-u" "CLAUDE_CODE_CHILD_SESSION" "-u" "CLAUDE_CODE_EXECPATH" "claude")
+  [ "$MODEL_EXPLICIT" = "1" ] && SESSION_LAUNCH+=("--model" "$MODEL")
+}
+
+# Relaunch command for `session effort` on a cc session (claude honors effort via
+# MAX_THINKING_TOKENS). No effort -> rc1 (the caller leaves the session intact).
+_session_relaunch_cc() {
+  local tokens; tokens="$(_effort_thinking_tokens "$2")"
+  [ -n "$tokens" ] || return 1
+  printf 'env MAX_THINKING_TOKENS=%q -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_EXECPATH claude --model %q' "$tokens" "$1"
+}
+
+# ---- or (OpenRouter — metered multi-provider gateway, rode by cc/codex transports)
+# providers=cc codex: those provider tokens mean "route via OpenRouter" in dispatch
+# context (they are or_transport_providers too). disp is provider-split:
+# ccor (Claude Code transport) / codexor (Codex Responses transport), defaulting to
+# ccor. route_fn owns the whole explicit-dispatch arm (provider split + Devin
+# dual-lane reroute + auto-route-to-cc). No session surface: or is not a session
+# provider.
+lane_descriptor_or() {
+  printf '%s\n' \
+    "name=or" \
+    "aliases=openrouter" \
+    "providers=cc codex" \
+    "or_transport_providers=cc codex" \
+    "disp=ccor" \
+    "disp_by_provider=cc=ccor codex=codexor" \
+    "dispatch_by_disp=ccor=delegate_cc codexor=delegate_codex" \
+    "route_fn=_route_or_lane" \
+    "credit_gate_fn=_or_credit_gate" \
+    "ready_fn=_ready_probe_or" \
+    "fallback_ready_fn=_fallback_ready_or" \
+    "default_model=z-ai/glm-5.2" \
+    "quota_key=or" \
+    "cost_class=credits" \
+    "marginal_class=metered" \
+    "cost_disclosure=metered cash, measured per run when available, otherwise estimated" \
+    "is_cloud=yes" \
+    "fallback_provider=cc" \
+    "image_backend=openrouter" \
+    "image_disp=codexor" \
+    "conserve_match= openrouter=funded " \
+    "conserve_name=OpenRouter" \
+    "conserve_why=funded cash lane, preserves subscription quotas" \
+    "participates_health=yes"
+}
+
+# Explicit-dispatch arm for the or lane (provider split + Devin dual-lane reroute +
+# auto-route-to-cc). Dynamic scope: reads/writes PROVIDER/MODEL/RESOLVED_ID/disp/ORIG
+# inside route_delegate; sets _or_autoroute_note for the credit gate to report.
+_route_or_lane() {
+  case "$PROVIDER" in
+    cc)    disp=ccor ;;
+    codex) disp=codexor ;;
+    *)     # availability-aware routing: default provider (devin) + an OpenRouter model that
+           # Devin ALSO serves -> use the Devin lane instead of dying/forcing OpenRouter.
+           # This is deterministic (keyed on _devin_model_for, not a live guess) and matches
+           # the documented default: `glm`/`deepseek` are dual-lane and ride Devin by default.
+           # It fixes `-m glm` hard-failing when the OpenRouter key is out of monthly quota.
+           local _dvm; _dvm="$(_devin_model_for "$MODEL")"
+           if [ -n "$_dvm" ]; then
+             printf '>>> [route] -m %s is served by BOTH OpenRouter and Devin; using the Devin lane (%s) on the default provider. Force OpenRouter with --provider cc|codex.\n' "$MODEL" "$_dvm" >&2
+             # Rewrite the model token in ORIG so the Devin lane runs the Devin id, not the OR alias.
+             local _i; for _i in "${!ORIG[@]}"; do
+               case "${ORIG[$_i]}" in -m|--model) [ $((_i+1)) -lt ${#ORIG[@]} ] && ORIG[$((_i+1))]="$_dvm" ;; esac
+             done
+             RESOLVED_ID="$_dvm"; disp=devin
+           else
+             # AUTO-ROUTE: an OpenRouter-only model the active provider cannot serve should
+             # FOLLOW its lane automatically -- the SKILL promise is "the alias picks the lane;
+             # no --provider needed." Route to the cc transport (Claude Code -> OpenRouter) and say so.
+             _or_autoroute_note="-m $MODEL is an OpenRouter-only model; active provider ($PROVIDER) cannot serve it"
+             PROVIDER=cc; disp=ccor
+           fi ;;
+  esac
+}
+
+# Post-resolution balance gate for the or vehicles: a live zero balance is
+# conclusive — stop before preflight or dispatch rather than announcing a route
+# which can only fail with 402. Unknown balances remain best-effort.
+_or_credit_gate() {
+  _or_credit_state="$(or_credits 2>/dev/null)"
+  local _or_remaining="${_or_credit_state##*remaining=}"; _or_remaining="${_or_remaining%% *}"
+  if awk -v n="$_or_remaining" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n <= 0) }' 2>/dev/null; then
+    die "OpenRouter reports zero remaining credits; refusing to route this run. Use a subscription/local lane or restore OpenRouter credit first."
+  fi
+  [ -n "$_or_autoroute_note" ] && printf '>>> [route] %s — auto-routing to the OpenRouter lane (--provider cc; credit state: %s). Force codex with --provider codex.\n' "$_or_autoroute_note" "${_or_credit_state:-unavailable}" >&2
+}
+
+# brief/readiness probe: needs an OPENROUTER_API_KEY; reports funded vs key-capped.
+_ready_probe_or() {
+  local cred rem
+  [ -n "$(_extract_kv_value OPENROUTER_API_KEY 2>/dev/null)" ] || return 1
+  # or_credits already caps curl via OSRC_CURL_TIMEOUT; tighten it for the interactive brief probe.
+  cred="$(OSRC_CURL_TIMEOUT="${OSRC_BRIEF_TIMEOUT:-5}" or_credits 2>/dev/null)"
+  rem="${cred##*remaining=}"; rem="${rem%% *}"
+  if awk -v n="$rem" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n>0) }' 2>/dev/null; then
+    printf 'openrouter=funded\n'
+  else
+    printf 'openrouter=key-capped\n'
+  fi
+}
+
+_fallback_ready_or() {
+  local k; k="$(_extract_kv_value OPENROUTER_API_KEY)"; [ -n "$k" ] || return 1
+  have claude || have codex || return 1
+}
+
 # _effective_lane <table_lane> <provider> [model] [model_explicit] -> effective lane code, MIRRORING
 # actual dispatch routing (not a provider-only guess). Precedence matches route_delegate:
 #   1. local short-circuit: an ollama:/lmstudio:/lms:/local: model or `--provider local` ALWAYS runs
@@ -1947,18 +2918,32 @@ resolve_tier() {
 #      --provider (a Devin-pinned glm-5.2 stays dv under --provider cc); a provider-routed open-weight
 #      model follows the transport provider (glm+devin->dv, glm+cc->or).
 _effective_lane() {
-  case "${3:-}" in local|ollama:*|lmstudio:*|lms:*|local:*) printf 'local'; return ;; esac
-  [ "$2" = "local" ] && { printf 'local'; return; }
-  case "$2" in droid|cursor|hermes|warp|cline|claudex|tokenrouter) printf '%s' "$2"; return ;; esac   # engine lanes: provider IS the lane
-  if [ "${4:-1}" != "1" ]; then                    # implicit model -> provider's default lane
-    case "$2" in cc|codex) printf 'or' ;; *) printf 'dv' ;; esac; return
+  local _el
+  # Local short-circuit — the descriptor's model_globs vocabulary forces local
+  # regardless of --provider; providers=local pins `--provider local` below.
+  if _el="$(_lane_by_model_glob "${3:-}" 2>/dev/null)"; then printf '%s' "$_el"; return; fi
+  # Engine lanes: the provider IS the lane (provider_is_lane=yes on the descriptor).
+  if _el="$(_lane_by_provider "$2" 2>/dev/null)" && [ "$(_lane_field "$_el" provider_is_lane 2>/dev/null)" = "yes" ]; then
+    printf '%s' "$_el"; return
   fi
-  case "$1" in cx|cc|gm|gi|ci|local|dv) printf '%s' "$1"; return ;; esac
-  case "$2" in
-    cc|codex) printf 'or' ;;
-    devin)    printf 'dv' ;;
-    *)        printf '%s' "${1:-$2}" ;;
-  esac
+  # (every engine-provider lane now resolves via provider_is_lane above — the
+  # literal fallback case this comment used to precede is fully retired)
+  if [ "${4:-1}" != "1" ]; then                    # implicit model -> provider's default lane
+    # or_transport_providers (cc|codex) ride OpenRouter; EVERYTHING else falls to the
+    # default lane dv — including `gemini`, a preserved ledger-mislabel quirk.
+    case " $(_lane_field or or_transport_providers 2>/dev/null) " in *" $2 "*) printf 'or'; return ;; esac
+    printf '%s' "$(_lane_default)"; return
+  fi
+  # Explicit model: a fixed native/image/local lane ignores --provider entirely.
+  if _el="$(_lane_by_token "$1" 2>/dev/null)" && [ "$(_lane_field "$_el" fixed_lane 2>/dev/null)" = "yes" ]; then
+    printf '%s' "$_el"; return
+  fi
+  case "$1" in dv) printf '%s' "$1"; return ;; esac   # unported fixed lanes
+  # Provider-routed open-weights follow the transport provider.
+  case " $(_lane_field or or_transport_providers 2>/dev/null) " in *" $2 "*) printf 'or'; return ;; esac
+  case " $(_lane_field dv providers 2>/dev/null) " in *" $2 "*) printf 'dv'; return ;; esac
+  [ "$2" = "devin" ] && { printf 'dv'; return; }   # unported
+  printf '%s' "${1:-$2}"
 }
 
 # _last_marker <file> -> the final terminal marker, preferring one SIGNED with this run's id.
@@ -2247,7 +3232,8 @@ build_with_preamble() {
   for tok in ${WORDS[@]+"${WORDS[@]}"}; do
     case "$tok" in
       skills=*) val="${tok#skills=}"
-        for name in $(printf '%s' "$val" | tr ',' ' '); do
+        _words_noglob "$(printf '%s' "$val" | tr ',' ' ')"
+        for name in ${WORDS[@]+"${WORDS[@]}"}; do
           # Resolve across every place a skill really lives, not just the user's own skills dir.
           # Only ~/.claude/skills was searched before, so every PLUGIN skill (the whole ce-* family)
           # silently resolved to "NOT FOUND" and the delegate ran without the capability the caller
@@ -2458,21 +3444,15 @@ _effort_thinking_tokens() {
 # THE TAB: per-run ledger, tab, estimate, credits.
 # =============================================================================
 # _lane_cost_disclosure <lane> -> the user-visible cost class for a resolved lane.
+# Descriptor-first (lane/disp/legacy-alias tokens -> cost_disclosure field); the
+# case below is the unported-lane fallback, shrinking as each lane lands.
 _lane_cost_disclosure() {
+  local _l _v
+  if _l="$(_lane_by_token "${1:-}" 2>/dev/null)" && _v="$(_lane_field "$_l" cost_disclosure 2>/dev/null)" && [ -n "$_v" ]; then
+    printf '%s' "$_v"; return
+  fi
   case "$1" in
-    local)                         printf '$0 cash + $0 plan' ;;
-    cx|codex-native|claudex|ci)    printf '$0 cash, spends your ChatGPT plan limits' ;;
-    cc|claude-native)              printf '$0 cash, spends your Claude plan limits' ;;
-    gm|antigravity-agy)            printf '$0 cash, spends your Antigravity plan limits' ;;
     dv|devin)                      printf '$0 cash, spends your Devin plan limits' ;;
-    cursor)                        printf '$0 cash, spends your Cursor plan limits' ;;
-    or|openrouter|ccor|codexor)    printf 'metered cash, measured per run when available, otherwise estimated' ;;
-    gemini|gi)                     printf 'metered cash through your Gemini API key, estimated before the run' ;;
-    hermes)                        printf 'metered cash from your configured provider, measured when available, otherwise estimated' ;;
-    droid)                         printf 'cash depends on your Factory plan or BYOK model; BYOK usage is measured or estimated by its provider' ;;
-    warp)                          printf 'cash depends on your Warp plan or configured keys; key usage is measured or estimated by its provider' ;;
-    cline)                         printf 'cash depends on your ClinePass subscription or the keys configured in ~/.cline; usage is measured or estimated by its provider' ;;
-    tokenrouter)                   printf 'metered cash through your TokenRouter key (some models are a $0 promo right now — confirmed at runtime by billing errors, never by a hardcoded date)' ;;
     *)                             printf 'cash and plan impact unknown for your %s lane' "$1" ;;
   esac
 }
@@ -2569,13 +3549,25 @@ _quota_countable() {  # <verb> -> rc0 if this ledger verb counts toward the dail
 # records. Without this, `limits set devin …` (key devin:…) and the gate (disp devin -> dv) diverged and
 # the cap silently never fired (P2-1). cc/codex providers dispatch OpenRouter, so they fold to `or`.
 _quota_lane_key() {  # <disp|provider|code> -> lane code (dv|or|cc|cx|gm|local|<engine>)
+  # Descriptor-first: provider context wins (`cc`/`codex`/`devin`/`gemini`/`gm` are
+  # --provider values that fold to their DEFAULT lane — cc->or, never cc->cc), then
+  # lane/disp tokens -> the descriptor's quota_key. The case below is the
+  # unported-lane fallback, shrinking as each lane lands.
+  local _l _v
+  case "${1:-}" in ''|'?') printf '?'; return ;; esac
+  if _l="$(_lane_by_provider "$1" 2>/dev/null)" && _v="$(_lane_field "$_l" quota_key 2>/dev/null)" && [ -n "$_v" ]; then
+    printf '%s' "$_v"; return
+  fi
+  # Provider-transport tokens resolve to their lane's quota pool FIRST: a bare
+  # `devin`/`dv` here is the transport provider/lane, claimed by dv's providers
+  # field once that lane ports (its descriptor then answers below).
   case "${1:-}" in
-    devin|dv)                printf dv ;;
-    cc|ccor|codex|codexor|or) printf or ;;
-    ccnative)                printf cc ;;
-    cxnative|cx)             printf cx ;;
-    gemini|gm|gmnative|gi)   printf gm ;;   # gi = the gemini-cli text vehicle's ledger code; fold to gm so a gemini cap matches both vehicles
-    local)                   printf local ;;
+    devin|dv) printf dv; return ;;
+  esac
+  if _l="$(_lane_by_provider "$1" 2>/dev/null)" || _l="$(_lane_by_token "$1" 2>/dev/null)"; then
+    _v="$(_lane_field "$_l" quota_key 2>/dev/null)" && [ -n "$_v" ] && { printf '%s' "$_v"; return; }
+  fi
+  case "${1:-}" in
     ''|'?')                  printf '?' ;;
     *)                       printf '%s' "$1" ;;   # engine lanes (droid/warp/cline/cursor/hermes/claudex) = own name
   esac
@@ -2654,6 +3646,46 @@ _quota_marker_active() {  # <lanekey> <model> -> rc0 if an unexpired marker exis
   [ "$cur" = "$v" ] && rm -f "$OSRC_POSTURE_DIR/$1.quota-$slug" 2>/dev/null
   return 1
 }
+
+# ---- LANE-DOWN marker (sibling of the quota exhausted-until marker) ----------------------------
+# A lane can be UNREACHABLE without being at-cap: the Devin free GLM probe times out, or a
+# sandboxed-proxy TLS reject makes the whole devin lane unusable. doctor already detects this, but
+# dispatch never consulted it, so a down default absorbed dozens of full-timeout dispatches before
+# falling through. This marker lets a dispatch-time gate skip a known-down LANE for a short,
+# self-healing window. Keyed by LANE (not model): a proxy/transport failure takes the whole lane
+# down, not one model. Strict direction only (forces skip, never forces "up"), mirroring the quota
+# marker's posture contract; expired markers self-purge value-matched. TTL is short so a transient
+# outage heals on its own with no manual reset (override via OSRC_LANE_DOWN_TTL, default 300s).
+_lane_down_mark() {  # <lane-or-disp> [ttl-secs]
+  local lane; lane="$(_quota_lane_key "$1")"
+  [ -n "$lane" ] && [ "$lane" != "?" ] || return 0
+  local ttl="${2:-${OSRC_LANE_DOWN_TTL:-300}}"
+  case "$ttl" in ''|*[!0-9]*) ttl=300 ;; esac
+  local until; until="$(( $(date +%s) + ttl ))"
+  _posture_set "$lane" "down" "$until"
+}
+_lane_down_active() {  # <lane-or-disp> -> rc0 if an unexpired down marker exists (self-purges)
+  local lane; lane="$(_quota_lane_key "$1")"
+  [ -n "$lane" ] && [ "$lane" != "?" ] || return 1
+  local v; v="$(_posture_get "$lane" "down" 2>/dev/null)" || return 1
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  local now; now="$(date +%s)"
+  if [ "$v" -gt "$now" ]; then return 0; fi
+  # Expired -> purge on read, VALUE-MATCHED (same hardening as _quota_marker_active): only delete if
+  # the file still holds the expired value we read, so a sibling's fresh marker in the race is kept.
+  local cur; cur="$(_posture_get "$lane" "down" 2>/dev/null)"
+  [ "$cur" = "$v" ] && rm -f "$OSRC_POSTURE_DIR/$lane.down" 2>/dev/null
+  return 1
+}
+# Clear a lane's down marker early — used when an authoritative live probe (doctor) just proved the
+# lane answers, so a still-unexpired marker from an earlier verdict doesn't outlive reality. The TTL
+# already self-heals; this only tightens the window. Silent no-op on unknown/unkeyed lanes.
+_lane_down_clear() {  # <lane-or-disp>
+  local lane; lane="$(_quota_lane_key "$1")"
+  [ -n "$lane" ] && [ "$lane" != "?" ] || return 0
+  rm -f "$OSRC_POSTURE_DIR/$lane.down" 2>/dev/null
+}
+
 # Mark <model> on <lane> exhausted until the next reset, from a REAL provider quota refusal. No-op
 # unless a cap is declared (the marker only reconciles a declared cap; cap-first _quota_gate would
 # ignore it otherwise, and writing one would just litter the posture dir). Reset zone follows the cap.
@@ -2798,7 +3830,7 @@ _state_lock_acquire() {
   _STATE_LOCK_KIND=""
   if command -v flock >/dev/null 2>&1; then
     [ ! -L "$lock" ] || return 1
-    exec 9>>"$lock" 2>/dev/null || return 1
+    { exec 9>>"$lock"; } 2>/dev/null || return 1
     flock -w 5 9 2>/dev/null || { exec 9>&-; return 1; }
     _STATE_LOCK_KIND="flock"
     return 0
@@ -3317,7 +4349,7 @@ _endpoint_mutation_lock() { # <pane>; held until _endpoint_mutation_unlock
   _ENDPOINT_MUTATION_KIND=""
   if [ "${OSRC_FORCE_MKDIR_LOCK:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
     [ ! -L "$lock" ] || return 1
-    exec 7>>"$lock" 2>/dev/null || return 1
+    { exec 7>>"$lock"; } 2>/dev/null || return 1
     flock -w 5 7 2>/dev/null || { exec 7>&-; return 1; }
     _ENDPOINT_MUTATION_KIND="flock"
     return 0
@@ -4330,7 +5362,7 @@ _heartbeat_election_acquire() { # <lock> <pid> <pid-start>
   local lock="$1" pid="$2" pid_start="$3" owner old_pid old_start live rc record grace lage corpse
   if [ "${OSRC_FORCE_MKDIR_ELECTION:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
     [ ! -L "$lock.flock" ] || return 1
-    exec 8>"$lock.flock" 2>/dev/null || return 1
+    { exec 8>"$lock.flock"; } 2>/dev/null || return 1
     flock -w 5 8 2>/dev/null || { exec 8>&-; return 1; }
     _HEARTBEAT_ELECTION_KIND=flock
     return 0
@@ -5431,7 +6463,7 @@ record_outcome() {
   esac
   # reason MUST be a fixed enum (never task text) — an unknown reason is dropped, not stored verbatim.
   case "$reason" in
-    ''|test_failure|compile_failure|invalid_output|empty-output|permission_denied|consent_denied|secret_scan|provider_error|timeout|watchdog|merge_conflict|user_cancelled|missing_tool) ;;
+    ''|test_failure|compile_failure|invalid_output|empty-output|permission_denied|consent_denied|secret_scan|provider_error|proxy_tls|timeout|watchdog|merge_conflict|user_cancelled|missing_tool|lane_down) ;;
     *) reason="" ;;
   esac
   # repo_key MUST be a cksum (numeric) or the PII guarantee breaks; turns MUST be numeric or omitted.
@@ -5914,20 +6946,25 @@ EOF
 }
 
 cmd_tab() {
-  [ -f "$OSRC_LEDGER" ] || { echo "The Tab is empty (no offloads recorded yet)."; return 0; }
+  # An empty or absent ledger is an empty Tab. Decide BEFORE printing the header so the render is
+  # identical whether the file is missing, zero-length, or whitespace-only (the normal state between
+  # install and the first recorded run — record_ledger pre-creates an empty ledger.jsonl). Printing
+  # the "== The Tab ==" banner first and then "The Tab is empty" was a garbled papercut.
+  # NOTE: grep -c prints "0" AND exits 1 when nothing matches, so an or-echo-0 fallback after it produced
+  # "0\n0" on an empty-but-existing ledger and the arithmetic below crashed the whole Tab (#21
+  # follow-up). Take the first line and default to 0 instead; an empty ledger is an empty Tab.
+  local _tot=0 _good _bad
+  if [ -f "$OSRC_LEDGER" ]; then
+    _tot="$(grep -cve '^[[:space:]]*$' "$OSRC_LEDGER" 2>/dev/null | head -1)"
+    case "$_tot" in ''|*[!0-9]*) _tot=0 ;; esac
+  fi
+  [ "$_tot" -eq 0 ] && { echo "The Tab is empty (no offloads recorded yet)."; return 0; }
   have jq || { echo "jq needed for tab (brew install jq)"; return 0; }
   echo "== The Tab (outsourcerer ledger: $OSRC_LEDGER) =="
   # RESILIENT PARSE: pre-filter with `fromjson? // empty` so ONE malformed/interleaved
   # ledger line (plausible under the flock-fallback append warned about in record_ledger) drops just
   # that row instead of failing the whole `jq -rs` slurp and blanking the entire Tab. Warn on stderr
   # if rows were dropped so a corrupted ledger is visible, not silent.
-  # NOTE: grep -c prints "0" AND exits 1 when nothing matches, so an or-echo-0 fallback after it produced
-  # "0\n0" on an empty-but-existing ledger and the arithmetic below crashed the whole Tab (#21
-  # follow-up). Take the first line and default to 0 instead; an empty ledger is an empty Tab.
-  local _tot _good _bad
-  _tot="$(grep -cve '^[[:space:]]*$' "$OSRC_LEDGER" 2>/dev/null | head -1)"; _tot="${_tot:-0}"
-  case "$_tot" in ''|*[!0-9]*) _tot=0 ;; esac
-  [ "$_tot" -eq 0 ] && { echo "The Tab is empty (no offloads recorded yet)."; return 0; }
   _good="$(jq -Rc 'fromjson? | select(type=="object")' "$OSRC_LEDGER" 2>/dev/null | grep -c '^' 2>/dev/null | head -1)"; _good="${_good:-0}"
   case "$_good" in ''|*[!0-9]*) _good=0 ;; esac
   _bad=$(( _tot - _good )); [ "$_bad" -lt 0 ] && _bad=0
@@ -6000,7 +7037,8 @@ cmd_estimate() {
     echo "  (no cached pricing; run: $0 models --refresh)"
   else
     local m pp pc
-    for m in $(printf '%s' "${OR_OFFLOAD_CHAIN:-$OR_CHAIN_DEFAULT}" | tr ',' ' '); do
+    _words_noglob "$(printf '%s' "${OR_OFFLOAD_CHAIN:-$OR_CHAIN_DEFAULT}" | tr ',' ' ')"
+    for m in ${WORDS[@]+"${WORDS[@]}"}; do
       pp="$(jq -r --arg id "$m" '.data[]|select(.id==$id)|.pricing.prompt' "$OSRC_MODELS_JSON" 2>/dev/null)"
       pc="$(jq -r --arg id "$m" '.data[]|select(.id==$id)|.pricing.completion' "$OSRC_MODELS_JSON" 2>/dev/null)"
       if [ -n "$pp" ] && [ "$pp" != "null" ]; then
@@ -6072,31 +7110,23 @@ cmd_suggest() {
 # Only ready lanes are ever offered to the user (Terra UX: never tour install paths for a lane they
 # lack). Best-effort + fast; a slow probe (OpenRouter credits) is time-capped.
 _ready_lanes() {
-  local lanes="" ld dlm cred rem
-  ld="$(_local_detect 2>/dev/null)" && lanes="$lanes local=${ld##*|}"
+  local lanes="" ld dlm cred rem _rp
+  _rp="$(_lane_ready_probe local 2>/dev/null)" && lanes="$lanes $_rp"
   # Devin probes (auth + live model list) hit the network; cap them so `brief` can't stall the
   # handshake for 10-30s on a slow backend. OSRC_BRIEF_TIMEOUT overrides (default 5s each).
   if have devin && _timeout "${OSRC_BRIEF_TIMEOUT:-5}" devin auth status 2>/dev/null | grep -qi "Logged in"; then
     dlm="$(_timeout "${OSRC_BRIEF_TIMEOUT:-5}" bash -c 'devin --model "__list__" -p "x" </dev/null 2>&1 | grep -i "^Available:"' 2>/dev/null)"
     printf '%s' "$dlm" | grep -qiE 'glm|swe' && lanes="$lanes devin=glm/swe"
   fi
-  have agy && lanes="$lanes gemini=keyless"
-  have codex && lanes="$lanes codex=sol/terra"
-  if [ -n "$(_extract_kv_value OPENROUTER_API_KEY 2>/dev/null)" ]; then
-    # or_credits already caps curl via OSRC_CURL_TIMEOUT; tighten it for the interactive brief probe.
-    cred="$(OSRC_CURL_TIMEOUT="${OSRC_BRIEF_TIMEOUT:-5}" or_credits 2>/dev/null)"
-    rem="${cred##*remaining=}"; rem="${rem%% *}"
-    awk -v n="$rem" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n>0) }' 2>/dev/null \
-      && lanes="$lanes openrouter=funded" || lanes="$lanes openrouter=key-capped"
-  fi
-  have claude && lanes="$lanes claude=native"
-  have droid && lanes="$lanes droid=byok"
-  have cursor-agent && lanes="$lanes cursor=subscription"
-  have cline && lanes="$lanes cline=clinepass-or-byok"
-  if [ -n "${TOKENROUTER_API_KEY:-}" ] || [ -n "$(_extract_kv_value TOKENROUTER_API_KEY 2>/dev/null)" ]; then
-    lanes="$lanes tokenrouter=keyed"
-  fi
-  _claudex_up 2>/dev/null && lanes="$lanes claudex=proxy"
+  _rp="$(_lane_ready_probe gm 2>/dev/null)" && lanes="$lanes $_rp"
+  _rp="$(_lane_ready_probe cx 2>/dev/null)" && lanes="$lanes $_rp"
+  _rp="$(_lane_ready_probe or 2>/dev/null)" && lanes="$lanes $_rp"
+  _rp="$(_lane_ready_probe cc 2>/dev/null)" && lanes="$lanes $_rp"
+  _rp="$(_lane_ready_probe droid 2>/dev/null)" && lanes="$lanes $_rp"
+  _rp="$(_lane_ready_probe cursor 2>/dev/null)" && lanes="$lanes $_rp"
+  _rp="$(_lane_ready_probe cline 2>/dev/null)" && lanes="$lanes $_rp"
+  _rp="$(_lane_ready_probe tokenrouter 2>/dev/null)" && lanes="$lanes $_rp"
+  _rp="$(_lane_ready_probe claudex 2>/dev/null)" && lanes="$lanes $_rp"
   printf '%s\n' "${lanes# }"
 }
 
@@ -6124,10 +7154,21 @@ _conserve_reco() {
     printf 'HEADROOM: %s (< %s%% conserve line) — route by best-fit; no forced conservation.\n' "$posture" "$OSRC_CONSERVE_THRESHOLD"
     return 0
   fi
-  case " $lanes " in
-    *" local="*)          lane="local";          why="private, \$0 cash + \$0 plan" ;;
+  # Descriptor-first: conserve_match holds the lane's _ready_lanes token (leading-space
+  # prefix match), conserve_name the display label, conserve_why/conserve_why_fn the reason.
+  # The case below is the unported tail — the priority order itself is routing policy.
+  local _cl _cm
+  for _cl in local dv gm; do
+    _cm="$(_lane_field "$_cl" conserve_match 2>/dev/null)"
+    if [ -n "$_cm" ] && case " $lanes " in *"$_cm"*) true ;; *) false ;; esac; then
+      lane="$(_lane_field "$_cl" conserve_name 2>/dev/null)"
+      local _cwf; _cwf="$(_lane_field "$_cl" conserve_why_fn 2>/dev/null)"
+      if [ -n "$_cwf" ]; then why="$("$_cwf")"; else why="$(_lane_field "$_cl" conserve_why 2>/dev/null)"; fi
+      break
+    fi
+  done
+  [ -n "$lane" ] || case " $lanes " in
     *" devin=glm/swe "*)  lane="Devin GLM/SWE";   why="$(_lane_cost_disclosure dv), preserves your Claude quota" ;;
-    *" gemini=keyless "*) lane="keyless Gemini";  why="Antigravity login, no API key" ;;
   esac
   if [ -z "$lane" ]; then
     local codex_ok=0 seen=0 blocked=0 v
@@ -6142,7 +7183,13 @@ _conserve_reco() {
     esac
     if [ "$codex_ok" = "1" ]; then lane="Codex Sol/Terra"; why="your ChatGPT plan is below the conserve line in every known window"
     elif [ -n "$xstale" ]; then : # codex deliberately skipped: its usage reading is too old to trust
-    else case " $lanes " in *" openrouter=funded "*) lane="OpenRouter"; why="funded cash lane, preserves subscription quotas" ;; esac; fi
+    else
+      _cm="$(_lane_field or conserve_match 2>/dev/null)"
+      if [ -n "$_cm" ] && case " $lanes " in *"$_cm"*) true ;; *) false ;; esac; then
+        lane="$(_lane_field or conserve_name 2>/dev/null)"
+        why="$(_lane_field or conserve_why 2>/dev/null)"
+      fi
+    fi
   fi
   if [ -n "$lane" ]; then printf 'CONSERVE: %s (>= %s%%) — route grind to %s (%s); keep Claude for judgment.\n' "$posture" "$OSRC_CONSERVE_THRESHOLD" "$lane" "$why"
   else printf 'CONSERVE: %s (>= %s%%) — but no lower-cost lane is ready. Start local inference (ollama) or log into Devin; meanwhile throttle and keep judgment on Claude.\n' "$posture" "$OSRC_CONSERVE_THRESHOLD"; fi
@@ -6503,7 +7550,7 @@ refresh_benchmarks() {
   local _k; _k="$(_extract_kv_value OPENROUTER_API_KEY)"
   [ -n "$_k" ] || { echo "OPENROUTER_API_KEY needed for benchmark data (put it in ~/.env)" >&2; return 1; }
   # Pass key via temp file to avoid exposure in process args (ps table).
-  local _hdr; _hdr="$(mktemp "$OSRC_HOME/.hdr.XXXXXX" 2>/dev/null)" || { echo "cannot create temp file" >&2; return 1; }
+  local _hdr; _hdr="$(mktemp "$OSRC_HOME/.hdr.$$.XXXXXX" 2>/dev/null)" || { echo "cannot create temp file" >&2; return 1; }
   printf 'Authorization: Bearer %s\n' "$_k" > "$_hdr"; chmod 600 "$_hdr"
   local _tmp; _tmp="$(mktemp "$OSRC_HOME/.bench.XXXXXX" 2>/dev/null)" || { rm -f "$_hdr"; echo "cannot create temp file" >&2; return 1; }
   if curl -fsS -m "${OSRC_CURL_TIMEOUT:-30}" -H @"$_hdr" \
@@ -6708,11 +7755,26 @@ _lane_conserve_mult() {
       codexwk=*)  xw="${tok#*=}" ;;
     esac
   done
-  case "$lane" in
-    cc) u="$c5"; [ -n "$c7" ] && awk -v a="$c7" -v b="${c5:-0}" 'BEGIN{exit !(a+0>b+0)}' && u="$c7" ;;  # weekly binds when more-spent
-    cx) u="$x5"; [ -n "$xw" ] && awk -v a="$xw" -v b="${x5:-0}" 'BEGIN{exit !(a+0>b+0)}' && u="$xw" ;;
-    *)  u="" ;;
-  esac
+  # Descriptor-first: conserve_windows names the limit tokens a lane is measured by
+  # (cc: claude5h claude7d — the MORE-spent binds; cx: codex5h codexwk). The case below
+  # is the unported-lane fallback.
+  local _cl _cw="" _w _wv
+  _cl="$(_lane_by_token "$lane" 2>/dev/null)" && _cw="$(_lane_field "$_cl" conserve_windows 2>/dev/null)"
+  if [ -n "$_cw" ]; then
+    u=""
+    for tok in $limits; do
+      for _w in $_cw; do
+        case "$tok" in
+          "$_w="*) _wv="${tok#*=}"
+            case "$_wv" in ''|*[!0-9.]*) ;; *)
+              { [ -z "$u" ] || awk -v a="$_wv" -v b="$u" 'BEGIN{exit !(a+0>b+0)}'; } && u="$_wv" ;;
+            esac ;;
+        esac
+      done
+    done
+  else
+    u=""
+  fi
   case "$u" in ''|*[!0-9.]*) printf '1.00'; return ;; esac
   awk -v u="$u" -v t="$t" 'BEGIN{
     if (t+0 >= 100 || u+0 < t+0) { printf "1.00"; exit }
@@ -6908,8 +7970,21 @@ _model_lanes() {
 #                       comparable / never wins on value", never as the cheapest lane.
 _lane_marginal_cost() {
   local lane="${1:-}" id="${2:-}" est price cost mult
-  case "$lane" in
-    or)
+  # Descriptor-first: marginal_class selects the cost shape (plan/metered/free; absent ->
+  # the -1 unknown sentinel). The residual case covers unported lanes AND the `gemini`
+  # token quirk: `gemini` resolves to the gi lane (metered), but the old arm priced that
+  # token as plan — gi cannot carry marginal_class=plan without mis-pricing its own
+  # canonical code, so the token is kept here.
+  local _ml _cls=""
+  _ml="$(_lane_by_token "$lane" 2>/dev/null)" && _cls="$(_lane_field "$_ml" marginal_class 2>/dev/null)"
+  if [ -z "$_cls" ]; then
+    case "$lane" in
+      dv|gemini)   _cls=plan ;;      # unported dv + the gemini token quirk above
+      *)           _cls=unknown ;;
+    esac
+  fi
+  case "$_cls" in
+    metered)
       est="${3:-1000}"
       case "$est" in ''|*[!0-9.]*) est="1000" ;; esac
       if [ -f "$OSRC_MODELS_JSON" ] && have jq; then
@@ -6919,7 +7994,7 @@ _lane_marginal_cost() {
       cost="$(awk -v e="$est" -v p="$price" 'BEGIN{printf "%g", e*p}')"
       printf '%s est\n' "$cost"
       ;;
-    cc|cx|dv|gm|warp|gemini)
+    plan)
       mult="$(_lane_conserve_mult "$lane" "$(_session_limits 2>/dev/null)" 2>/dev/null)"
       case "$mult" in ''|*[!0-9.-]*) mult="1.00" ;; esac
       if awk -v m="$mult" 'BEGIN{exit !(m+0 < 1.0)}'; then
@@ -6928,11 +8003,8 @@ _lane_marginal_cost() {
         printf '0 plan\n'
       fi
       ;;
-    local)
+    free)
       printf '0 free\n'
-      ;;
-    droid|cline|cursor)
-      printf -- '-1 unknown\n'
       ;;
     *)
       # Unknown lane: no basis to compare. Same unknown sentinel, never a zero that would win.
@@ -7003,7 +8075,8 @@ cmd_advise() {
   local alias resolved lane tier bench_line score price_in price_out cost_per_m value_ratio meets
   while IFS='|' read -r alias resolved lane tier; do
     [ -n "$alias" ] || continue
-    case "$lane" in gi|ci) continue ;; esac   # skip image lanes
+    # skip image lanes — descriptor image_lane=yes on each image lane.
+    if _lane_flag "$lane" image_lane; then continue; fi
     _model_denied "$resolved" && continue     # OSRC_MODEL_DENYLIST: never recommend a denied model
     total_count=$((total_count + 1))
     bench_line="$(_bench_lookup "$resolved" "$field")"
@@ -7037,20 +8110,22 @@ cmd_advise() {
       score="$(awk -v s="$score" -v m="$_cmult" 'BEGIN{printf "%.4f", s*m}')"
       case " $conserve_seen " in *" $lane "*) : ;; *)
         conserve_seen="$conserve_seen $lane"
-        local _clbl; case "$lane" in cc) _clbl="cc/Claude 5h" ;; cx) _clbl="cx/Codex" ;; *) _clbl="$lane" ;; esac
+        local _clbl; _clbl="$(_lane_field "$lane" conserve_label 2>/dev/null)"
+        [ -n "$_clbl" ] || _clbl="$lane"
         conserve_notes="${conserve_notes:+$conserve_notes; }$_clbl past conserve line -> score x$_cmult" ;;
       esac
     fi
     # Subscription lanes (cx/cc/dv/gm): cost is plan-limited, not per-token.
     # Set price to 0 BEFORE value ratio so subscription models rank by capability, not OR price.
-    case "$lane" in cx|cc|dv|gm) price_in="0"; price_out="0" ;; esac
+    # Descriptor plan_limited=yes, literal tail until dv ports.
+    if _lane_flag "$lane" plan_limited || case "$lane" in dv) true ;; *) false ;; esac; then price_in="0"; price_out="0"; fi
     # Value ratio = score / max(cost_per_m_input, 0.01). Zero-priced catalog models use a 0.01 floor.
     cost_per_m="$(awk -v p="$price_in" 'BEGIN{printf "%.6f", p*1000000}')"
     value_ratio="$(awk -v s="$score" -v c="$cost_per_m" 'BEGIN{if(c<0.01)c=0.01; printf "%.2f", s/c}')"
     meets=0
     awk -v s="$score" -v t="$threshold" 'BEGIN{exit (s+0 >= t+0) ? 0 : 1}' && meets=1
     # Display label for subscription lanes.
-    case "$lane" in cx|cc|dv|gm) cost_per_m="plan limits" ;; esac
+    if _lane_flag "$lane" plan_limited || case "$lane" in dv) true ;; *) false ;; esac; then cost_per_m="plan limits"; fi
     results="$results$alias|$resolved|$lane|$tier|$score|$cost_per_m|$value_ratio|$meets
 "
   done < <(_advise_candidate_rows "$field")
@@ -7084,16 +8159,17 @@ cmd_advise() {
         frontier_best_lane="$lane"; frontier_best_tier="$tier"
       }
     fi
-    case "$lane" in
-      cx|cc|dv|gm)
-        awk -v s="$score" -v b="$sub_best_score" 'BEGIN{exit (s+0 > b+0) ? 0 : 1}' && {
-          sub_best_score="$score"; sub_best_alias="$alias"; sub_best_resolved="$resolved"; sub_best_lane="$lane"
-        } ;;
-      *)
-        awk -v v="$vr" -v b="$paid_best_vr" 'BEGIN{exit (v+0 > b+0) ? 0 : 1}' && {
-          paid_best_vr="$vr"; paid_best_alias="$alias"; paid_best_resolved="$resolved"; paid_best_lane="$lane"
-        } ;;
-    esac
+    # Subscription lanes rank by score (cost is plan-limited, not per-token):
+    # descriptor plan_limited=yes, literal tail until dv ports.
+    if _lane_flag "$lane" plan_limited || case "$lane" in dv) true ;; *) false ;; esac; then
+      awk -v s="$score" -v b="$sub_best_score" 'BEGIN{exit (s+0 > b+0) ? 0 : 1}' && {
+        sub_best_score="$score"; sub_best_alias="$alias"; sub_best_resolved="$resolved"; sub_best_lane="$lane"
+      }
+    else
+      awk -v v="$vr" -v b="$paid_best_vr" 'BEGIN{exit (v+0 > b+0) ? 0 : 1}' && {
+        paid_best_vr="$vr"; paid_best_alias="$alias"; paid_best_resolved="$resolved"; paid_best_lane="$lane"
+      }
+    fi
   done < <(printf '%s\n' "$results")
 
   # Prefer capable-tier value unless the task explicitly needs the frontier.
@@ -8336,11 +9412,14 @@ _autodetach_should() {
 # result retrieval as `bg`). The cloud preack is already satisfied: _cloud_disclose ran BEFORE this
 # and set OSRC_CLOUD_ACKED=1 (route_delegate path), or _bg_cloud_preack acquires it here (second-
 # opinion path), so _bg_cloud_preack returns early and the ack propagates to the child/tmux pane.
+# Cloud consent comes FIRST, before ANY launch machinery below (the tmux probe included): a
+# non-interactive cloud run must fail at the CLOUD GATE, never at a missing-tmux error, so the
+# gate stays the first thing a cloud dispatch hits on every platform.
 _autodetach_run() {
   local _ar_verb="$1"; shift
+  _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
   # HEADLESS BG PATH (explicit opt-out). Also the path the bg re-entry tests exercise.
   if [ "${OSRC_REQUIRE_INTERACTIVE:-1}" != "1" ]; then
-    _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
     local id; id="$(_bg_launch "$_ar_verb" "$@")"
     [ -n "$id" ] || die "auto-detach: launch failed -- no job id was minted (nothing was started)."
     printf '>>> [auto-detach] non-interactive slow-lane run detached to bg to avoid a caller tool-timeout.\n' >&2
@@ -8354,7 +9433,6 @@ _autodetach_run() {
   # human can watch/steer it. Same machinery `session start` uses (new-session + send-keys). Never
   # silently fall back to headless: if tmux is genuinely unavailable, FAIL LOUDLY with the reason.
   have tmux || die "auto-detach: OSRC_REQUIRE_INTERACTIVE=1 but tmux is not installed ($( [ "$OSRC_PLATFORM" = "mac" ] && echo 'brew install tmux' || echo 'apt/dnf install tmux')). A non-interactive slow-lane run must NOT go headless. Set OSRC_REQUIRE_INTERACTIVE=0 to allow the headless bg path, or install tmux."
-  _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
   # Unique per-run session name (collision-safe for concurrent auto-detaches in the same directory;
   # the PWD-derived SESSION_NAME is one-per-dir). OUTSOURCERER_TMUX overrides SESSION_NAME at source
   # time, so the user steers via:  OUTSOURCERER_TMUX=<name> $0 session read | session send "..." | session stop
@@ -8623,6 +9701,11 @@ run_job() {
   # `failed` was recorded only as generic provider_error and the actual empty-output failure
   # vanished as soon as the transient supervisor message scrolled away.
   [ "$(cat "$jd/reason" 2>/dev/null || true)" = "empty-output" ] && _rsn="empty-output"
+  # Refine the generic provider_error bucket for the sandboxed-proxy TLS reject: delegate() already
+  # wrote its recognizable hint sentence into THIS job's out.log, so a job-scoped grep (no cross-job
+  # misattribution) lets the ledger/advise tell an environment/proxy failure apart from a real
+  # provider failure. Only refines provider_error -- never overrides timeout/watchdog/etc.
+  [ "$_rsn" = "provider_error" ] && grep -q 'devin TLS handshake failed against a local proxy' "$jd/out.log" 2>/dev/null && _rsn="proxy_tls"
   # Pass EVERY field explicitly — no reliance on exported env (which record_ledger no longer sets).
   record_outcome "$_oc" "$_rsn" "" "$id" "$lane" "$id2" "${OSRC_TASK_CLASS:-}" "$(_repo_key)"
   return "$sc"
@@ -8798,8 +9881,8 @@ _job_json() {
   if [ ! -f "$jd/meta.json" ]; then
     local _st _sa; _st="$(_reconcile_status "$id" 2>/dev/null || echo unknown)"
     _sa="$(cat "$jd/started_at" 2>/dev/null)"; case "$_sa" in ''|*[!0-9]*) _sa=null ;; esac
-    jq -n --arg id "$id" --arg status "$_st" --arg label "$lbl" --argjson started "${_sa:-null}" \
-      '{schema_version:"1", job_id:$id, label:(if $label=="" then null else $label end),
+    jq -n --arg id "$id" --arg status "$_st" --arg lbl "$lbl" --argjson started "${_sa:-null}" \
+      '{schema_version:"1", job_id:$id, label:(if $lbl=="" then null else $lbl end),
         provider:null, verb:null, shape:null, model:null, tier:null, effort:null,
         status:$status, exit:null, started:$started, cwd:null,
         progress:{last_marker:null, reads:0, writes:0, bash:0},
@@ -8820,10 +9903,10 @@ _job_json() {
   jq -n --slurpfile m "$jd/meta.json" \
     --arg status "$st" --argjson exit "${exitc:-null}" \
     --argjson reads "${r:-0}" --argjson writes "${w:-0}" --argjson bash "${b:-0}" \
-    --arg last "$last" --arg label "$lbl" --arg result_path "$rp" --arg log_path "$L" \
+    --arg last "$last" --arg lbl "$lbl" --arg result_path "$rp" --arg log_path "$L" \
     '($m[0] // {}) as $me | {
        schema_version:"1", job_id:($me.id // null),
-       label:(if $label=="" then ($me.label // null) else $label end),
+       label:(if $lbl=="" then ($me.label // null) else $lbl end),
        provider:($me.provider // null), verb:($me.verb // null), shape:($me.shape // null),
        model:($me.model // null), tier:($me.tier // null), effort:($me.effort // null),
        status:$status, exit:$exit, started:($me.started // null), cwd:($me.cwd // null),
@@ -9457,14 +10540,17 @@ cmd_cleanup() {
   [ -f "$wj" ] || wj="$OSRC_HOME/loops/$target/worktree.json"
   [ -f "$wj" ] || { echo "[outsourcerer] $target has no worktree to clean."; return 0; }
   have jq || die "cleanup needs jq"
-  local path branch dirty ahead base rp worktree_root
+  local path branch dirty ahead base rp
   path="$(jq -r '.path' "$wj")"; branch="$(jq -r '.branch' "$wj")"; base="$(jq -r '.base_sha // ""' "$wj")"
   # Never trust the serialized path: a lexical glob can be bypassed with
   # worktrees/../../..., so canonicalize and require strict containment first.
+  # Worktrees live at <repo>/.outsourcerer/worktrees/<id> (see _worktree_setup), NOT
+  # under $OSRC_HOME — anchor on the canonical path's own shape, with the trailing
+  # component bound to the id being cleaned so one job's receipt cannot point at
+  # another job's worktree.
   case "$path" in *'..'*) die "refusing to remove path containing '..': $path" ;; esac
   rp="$(cd "$path" 2>/dev/null && pwd -P)" || die "refusing to remove non-canonical worktree path: $path"
-  worktree_root="$(cd "$OSRC_HOME/worktrees" 2>/dev/null && pwd -P)" || die "refusing to resolve worktree root: $OSRC_HOME/worktrees"
-  case "$rp" in "$worktree_root"/*) path="$rp" ;; *) die "refusing to remove path outside worktree root: $path" ;; esac
+  case "$rp" in */.outsourcerer/worktrees/"$target") path="$rp" ;; *) die "refusing to remove path outside worktree root: $path" ;; esac
   # Re-read LIVE git state, not the job-completion snapshot: anything edited after the job (user, hook,
   # another process) must be seen, or --force could destroy it. Fall back to the json only if the worktree
   # is already gone.
@@ -9593,6 +10679,22 @@ cmd_crew() {
   _crew_integrate "$root" "$iwt" "$ibr" "$gid" "$crew_id" "$cdir" "$check" "$base_rc" "$bsig" "$base_sha" "$caller_branch" "$promote_ok"
 }
 
+# _crew_co_trailers <wt> <base> <branch> -> deduped Co-Authored-By trailer lines from the worker
+# branch's commits (base..branch), one per line. The integration squash writes ONE fresh commit, so
+# without this every human co-author trailer the worker harness wrote is silently laundered away.
+# Output feeds the squash -m verbatim (trailer block at the end, blank-line separated).
+_crew_co_trailers() {
+  # Harvest, then VALIDATE each trailer to a strict `Name <email>` shape before it reaches the
+  # squash `-m`: a bounded name (no angle brackets), an angle-bracketed email with an @ and a dot,
+  # end-anchored, and a total length cap. Only well-formed trailers pass through; anything else is
+  # dropped rather than copied verbatim into the commit.
+  git -C "$1" log --format='%B' "${2}..${3}" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*\(Co-Authored-By:[[:space:]]*[^[:space:]].*\)/\1/p' \
+    | grep -E '^Co-Authored-By: [^<>]{1,80} <[^<> ]+@[^<> ]+\.[^<> ]+>$' \
+    | awk 'length <= 140' \
+    | sort -uf
+}
+
 # _crew_integrate <root> <iwt> <ibr> <gid> <crew_id> <cdir> <check> <base_rc> <bsig> <base_sha> <caller_branch> <promote_ok>
 # The post-launch transaction: integrate each worker (squash -> scan -> grade -> keep/revert/skip),
 # ff-only promote from the caller worktree, selective cleanup. Split from the launch so it can be
@@ -9600,7 +10702,7 @@ cmd_crew() {
 _crew_integrate() {
   local root="$1" iwt="$2" ibr="$3" gid="$4" crew_id="$5" cdir="$6" check="$7" base_rc="$8" bsig="$9" base_sha="${10}" caller_branch="${11}" promote_ok="${12}"
   local gd; gd="$(_fanout_dir "$gid")"
-  local -a hooksoff=(-c "core.hooksPath=$cdir/nohooks" -c commit.gpgsign=false -c user.name=outsourcerer-crew -c user.email=crew@outsourcerer.local)
+  local -a hooksoff=(-c "core.hooksPath=$cdir/nohooks" -c commit.gpgsign=false -c user.name=outsourcerer-crew -c user.email=outsourcerer-crew@users.noreply.github.com)
   mkdir -p "$cdir/nohooks"
   local jid label idx=0 accepted=0 reverted=0 skipped=0
   while IFS="$(printf '\t')" read -r jid label; do
@@ -9650,9 +10752,13 @@ _crew_integrate() {
       printf '{"worker":"%s","verdict":"secret"}\n' "$label" >> "$cdir/verdicts.jsonl"
       skipped=$((skipped+1)); continue
     fi
-    # squash commit (hooks off + no gpgsign + explicit identity). A failed commit must NOT cascade:
-    # reset and skip so the next worker's pre-commit baseline stays correct.
-    if ! git -C "$iwt" "${hooksoff[@]}" commit -q -m "crew: $label" >/dev/null 2>&1; then
+    # squash commit (hooks off + no gpgsign + noreply identity). A failed commit must NOT cascade:
+    # reset and skip so the next worker's pre-commit baseline stays correct. The message carries the
+    # worker branch's deduped Co-Authored-By trailers so human attribution survives the squash.
+    local _sqmsg="crew: $label" _cotr
+    _cotr="$(_crew_co_trailers "$iwt" "$base_sha" "$wbr")"
+    [ -n "$_cotr" ] && _sqmsg="$_sqmsg"$'\n\n'"$_cotr"
+    if ! git -C "$iwt" "${hooksoff[@]}" commit -q -m "$_sqmsg" >/dev/null 2>&1; then
       git -C "$iwt" reset --hard "$pre" >/dev/null 2>&1 || true
       echo "[crew] $label: could not commit the integration squash — skipped, non-learnable." >&2
       record_outcome blocked provider_error "" "$jid" "$lane" "$model" "$tclass"
@@ -10262,16 +11368,19 @@ _so_resolve() {  # <model> -> "resolved_id|disp|tier" (mirrors run-verb routing)
     id="$model"; tlane=""; tier=""
   fi
   elane="$(_effective_lane "$tlane" "$PROVIDER" "$model" "1")"
+  # elane -> disp via the descriptor (disp field + disp_by_provider pairs); the case
+  # below is the unported-lane fallback, shrinking as each lane lands.
+  local _sl
+  if _sl="$(_lane_by_token "$elane" 2>/dev/null)" \
+     && { [ -n "$(_lane_field "$_sl" disp 2>/dev/null)" ] \
+       || [ -n "$(_lane_field "$_sl" disp_by_provider 2>/dev/null)" ]; }; then
+    disp="$(_lane_disp "$_sl" "$PROVIDER")"
+  else
   case "$elane" in
-    local) disp=local ;;
-    cx) disp=cxnative ;;
-    cc) disp=ccnative ;;
-    gm) disp=gmnative ;;
     dv) disp=devin ;;
-    or) case "$PROVIDER" in cc) disp=ccor ;; codex) disp=codexor ;; *) disp=ccor ;; esac ;;
-    droid|cursor|hermes|warp|cline|claudex|tokenrouter) disp="$elane" ;;
     *) disp="${tlane:-$PROVIDER}" ;;
   esac
+  fi
   if [ "$elane" = "dv" ] && [ "$PROVIDER" = "devin" ]; then
     local dvm; dvm="$(_devin_model_for "$model")"
     [ -n "$dvm" ] && id="$dvm" || disp=ccor
@@ -10771,9 +11880,15 @@ delegate_gmnative() {
     # same way it reports a slow one, and at the default 5m print-timeout that costs five minutes per
     # attempt to learn nothing. The distinguishing fact is that agy's own auth/model resolution
     # succeeded and only the generation never returned, which points at the backend, not the request.
-    local _aerr; _aerr="$(mktemp -t osrc-agy)"
+    # Portable template: `mktemp -t osrc-agy` is BSD-only — GNU mktemp rejects a template
+    # with no X's, leaving _aerr EMPTY, so the capture below never happened and the anchored
+    # retry grep matched nothing (the Ubuntu CI failure). Capture stderr SYNCHRONOUSLY too
+    # (redirect to a file, then replay): a process-substitution tee (2> >(tee "$_aerr" >&2))
+    # is still flushing when the retry grep runs, so the match can race the writer.
+    local _aerr; _aerr="$(mktemp "${TMPDIR:-/tmp}/osrc-agy.XXXXXX")"
     agy -p "$wrapped" ${aflag[@]+"${aflag[@]}"} --model "$atok" ${aeffflag[@]+"${aeffflag[@]}"} \
-        --print-timeout "${OSRC_AGY_PRINT_TIMEOUT:-5m}" 2> >(tee "$_aerr" >&2) || rc=$?
+        --print-timeout "${OSRC_AGY_PRINT_TIMEOUT:-5m}" 2> "$_aerr" || rc=$?
+    [ -s "$_aerr" ] && cat "$_aerr" >&2
     # Self-heal the effort/model mismatch: some agy builds treat a concrete id (e.g. `gemini-3.5-flash`)
     # as effort-less and hard-reject the --effort pair ("--effort is not supported for model ..."). The
     # model itself is valid; only the flag is wrong, so clearing the catalog (below) would be wrong and
@@ -10788,7 +11903,8 @@ delegate_gmnative() {
       printf '>>> [gemini] agy rejected --effort for "%s"; retrying once without it (the model runs at its own default).\n' "$atok" >&2
       aeffflag=(); rc=0; : > "$_aerr"
       agy -p "$wrapped" ${aflag[@]+"${aflag[@]}"} --model "$atok" \
-          --print-timeout "${OSRC_AGY_PRINT_TIMEOUT:-5m}" 2> >(tee "$_aerr" >&2) || rc=$?
+          --print-timeout "${OSRC_AGY_PRINT_TIMEOUT:-5m}" 2> "$_aerr" || rc=$?
+      [ -s "$_aerr" ] && cat "$_aerr" >&2
     fi
     if grep -qi 'timeout waiting for response' "$_aerr" 2>/dev/null; then
       printf '>>> [gemini] the keyless Antigravity lane accepted the request and never answered (model and login both resolved, so this is the Antigravity backend, not your prompt).\n' >&2
@@ -10865,7 +11981,7 @@ _claudex_up() {   # is a CLIProxyAPI answering with our token? (authenticated /v
   local url tok hdr; url="$(_claudex_url)"; tok="$(_claudex_token)"
   [ -n "$tok" ] || return 1
   mkdir -p "$OSRC_HOME" 2>/dev/null
-  hdr="$OSRC_HOME/.hdr.claudex.$$"; { umask 077; printf 'Authorization: Bearer %s\n' "$tok" > "$hdr"; } 2>/dev/null || return 1
+  hdr="$OSRC_HOME/.hdr.$$.claudex"; { umask 077; printf 'Authorization: Bearer %s\n' "$tok" > "$hdr"; } 2>/dev/null || return 1
   curl -fsS -m 4 -H @"$hdr" "$url/v1/models" >/dev/null 2>&1; local rc=$?
   rm -f "$hdr" 2>/dev/null
   return "$rc"
@@ -11371,11 +12487,17 @@ cmd_image() {
     if [ -n "$row" ]; then
       id="${row%%|*}"
       local lane; lane="${row#*|}"; lane="${lane%%|*}"
+      # lane -> image backend via the descriptor (image_backend field); the case below
+      # is the unported-lane fallback.
+      local _il _ib=""
+      _il="$(_lane_by_token "$lane" 2>/dev/null)" && _ib="$(_lane_field "$_il" image_backend 2>/dev/null)"
+      if [ -n "$_ib" ]; then
+        backend="$_ib"
+      else
       case "$lane" in
-        ci) backend="codex" ;;
-        gi) backend="gemini" ;;
         *) die "'$MODEL' ($id) is not an image-generation model. Try: gpt-image (codex, keyless), nano-banana (gemini), or pass a raw OpenRouter image id." ;;
       esac
+      fi
     else
       case "$MODEL" in
         gpt-image*|codex-image) backend="codex"; id="gpt-image-2" ;;
@@ -11396,7 +12518,12 @@ cmd_image() {
   fi
 
   local ttier; ttier="$(resolve_tier "$id" "")"
-  local _idisp; case "$backend" in codex) _idisp=cxnative ;; gemini) _idisp=gmnative ;; *) _idisp=codexor ;; esac
+  # backend -> disclosure vehicle via the descriptor (image_disp on the lane declaring
+  # image_backend=<backend>); the case below is the unported tail (default codexor).
+  local _idisp _ibl
+  _ibl="$(_lane_by_field image_backend "$backend" 2>/dev/null)" \
+    && _idisp="$(_lane_field "$_ibl" image_disp 2>/dev/null)"
+  [ -n "${_idisp:-}" ] || _idisp=codexor
   _cloud_disclose "$_idisp" "$id" "$prompt"
   case "$backend" in
     codex)      cmd_image_codex "$prompt" "$out" "$ttier" ;;
@@ -11615,10 +12742,17 @@ _perm_refuse_msg="edit target is under a harness-protected config dir (~/.claude
 # =============================================================================
 
 # _is_cloud_lane <disp> -> 0 if the resolved dispatch lane ships data off-machine, else 1.
+# Descriptor-first via _lane_by_disp (disp-vehicle context — provider names like
+# `cc`/`gemini` deliberately do NOT resolve here, preserving the session path's
+# current `*`-arm answer). The case below is the unported-lane fallback.
 _is_cloud_lane() {
+  local _l _v
+  if _l="$(_lane_by_disp "${1:-}" 2>/dev/null)"; then
+    _v="$(_lane_field "$_l" is_cloud 2>/dev/null)"
+    [ -n "$_v" ] && { [ "$_v" = "yes" ]; return; }
+  fi
   case "$1" in
-    ccor|codexor|ccnative|cxnative|gmnative|devin|droid|cursor|hermes|warp|cline|claudex) return 0 ;;
-    tokenrouter) return 0 ;;   # cloud gateway: prompt leaves the machine -> full cloud gate + secret-scan
+    devin) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -11699,7 +12833,7 @@ _secret_scan() {
     find "$PWD" -maxdepth "$_depth" \
                \( -name .git -o -name node_modules -o -name vendor -o -name .venv -o -name venv \
                   -o -name target -o -name dist -o -name build -o -name .terraform \) -prune -o \
-               -type f \( -name '.env' -o -name '.env.*' -o -name 'credentials' -o -name 'id_rsa' \
+               \( -type f -o -type l \) \( -name '.env' -o -name '.env.*' -o -name 'credentials' -o -name 'id_rsa' \
                   -o -name 'id_ed25519' \) -print > "$_sf" 2>"$_ef"
     local _fs=$?
     # A nonzero find rc is USUALLY routine traversal noise (a mode-000 or
@@ -11735,7 +12869,7 @@ $(cat "$tok" 2>/dev/null)"
   fi
   # Count distinct high-signal matches; do NOT retain the matched secret text (only a count is
   # surfaced downstream, so the raw credential fragments never live in a variable or reach stderr/logs).
-  OSRC_SECRET_HIT_COUNT="$(printf '%s\n' "$scan" | grep -Eoi 'OPENROUTER_API_KEY|sk-[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|AWS_SECRET[_A-Z]*|-----BEGIN [A-Z ]*PRIVATE KEY-----' 2>/dev/null | sort -u | grep -c . )"
+  OSRC_SECRET_HIT_COUNT="$(printf '%s\n' "$scan" | grep -Eoi '(^|[^A-Za-z0-9])(OPENROUTER_API_KEY|sk-[A-Za-z0-9._-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[0-9A-Za-z_]{20,}|AIza[0-9A-Za-z_-]{35}|AWS_SECRET[_A-Z]*|-----BEGIN [A-Z ]*PRIVATE KEY-----)' 2>/dev/null | sort -u | grep -c . )"
   OSRC_SECRET_HIT_COUNT="${OSRC_SECRET_HIT_COUNT:-0}"
   # (3) VALUE hard-block: a real high-entropy secret VALUE pasted into the prompt / --with
   # files (not merely a keyword like the bare name OPENROUTER_API_KEY, which appears in normal code
@@ -11744,7 +12878,7 @@ $(cat "$tok" 2>/dev/null)"
   # default. Opt out with OSRC_SECRET_ALLOW_VALUE=1 for the rare deliberate case. The value itself is
   # never printed (only the refusal). Reference secrets by NAME, not value, when delegating.
   if [ "${OSRC_SECRET_ALLOW_VALUE:-0}" != "1" ] \
-     && printf '%s\n' "$scan" | grep -Eq 'sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+     && printf '%s\n' "$scan" | grep -Eq '(^|[^A-Za-z0-9])(sk-[A-Za-z0-9._-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[0-9A-Za-z_]{20,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
     die "CLOUD GATE: a live secret VALUE (API key / token / private key) is in the prompt or a --with file — refusing the cloud route so it doesn't leave your machine. Reference the secret by NAME instead of pasting its value, or set OSRC_SECRET_ALLOW_VALUE=1 if you truly intend to send it."
   fi
 }
@@ -12502,20 +13636,20 @@ _fallback_is_transport() {
 # an uninstalled CLI costs nothing, and charging it against the bound would make the bound mean
 # "N minus however many lanes you don't have". Unknown lane codes (incl. image lanes) -> not ready.
 _fallback_lane_ready() {
-  local k=""
+  local k="" _fl _ff=""
+  # A lane marked DOWN (probe/transport verdict, self-healing TTL) is not a retry target — the whole
+  # point of the marker is that this lane cannot answer right now regardless of CLI/key presence.
+  # Checked BEFORE the descriptor delegation so a DOWN lane is refused even when it is ported (its
+  # fallback_ready_fn knows nothing about lane-down state; the marker is an orthogonal override).
+  _lane_down_active "$1" && return 1
+  # Descriptor-first: fallback_ready_fn owns a ported lane's plausibility check.
+  _fl="$(_lane_by_token "${1:-}" 2>/dev/null)" && _ff="$(_lane_field "$_fl" fallback_ready_fn 2>/dev/null)"
+  [ -n "$_ff" ] && { "$_ff"; return; }
   case "$1" in
     dv) have devin || return 1
         # Bounded login probe: delegate() hard-fails on a logged-out devin, which would end the
         # whole retry walk; screen it here instead. 5s cap so a wedged CLI can't stall the walk.
         _timeout 5 devin auth status 2>/dev/null | grep -qi "logged in" || return 1 ;;
-    cx) have codex || return 1 ;;
-    cc) have claude || return 1 ;;
-    gm) if have agy; then return 0; fi
-        have gemini || return 1
-        k="$(_extract_kv_value GEMINI_API_KEY)"; [ -n "$k" ] || k="$(_extract_kv_value GOOGLE_API_KEY)"
-        [ -n "$k" ] || return 1 ;;
-    or) k="$(_extract_kv_value OPENROUTER_API_KEY)"; [ -n "$k" ] || return 1
-        have claude || have codex || return 1 ;;
     tokenrouter) k="${TOKENROUTER_API_KEY:-}"; [ -n "$k" ] || k="$(_extract_kv_value TOKENROUTER_API_KEY)"
         [ -n "$k" ] || return 1 ;;
     *)  return 1 ;;
@@ -12564,18 +13698,23 @@ _advise_pick_model() {
 # Used to record each attempt as a resolved "model@lane" pair so the dedupe below compares what
 # really executed, not what an alias superficially looks like.
 _fallback_disp_lane() {
+  local _l
+  if _l="$(_lane_by_disp "${1:-}" 2>/dev/null)"; then printf '%s' "$_l"; return; fi
   case "$1" in
     devin)         printf 'dv' ;;
-    cxnative)      printf 'cx' ;;
-    ccnative)      printf 'cc' ;;
-    gmnative)      printf 'gm' ;;
-    ccor|codexor)  printf 'or' ;;
     *)             printf '%s' "$1" ;;
   esac
 }
 
 _fallback_provider_for_lane() {
-  case "$1" in dv) printf devin ;; cc|or) printf cc ;; cx) printf codex ;; gm) printf gemini ;; droid|cursor|hermes|warp|cline|tokenrouter) printf '%s' "$1" ;; *) return 1 ;; esac
+  local _l _v
+  if _l="$(_lane_by_token "${1:-}" 2>/dev/null)"; then
+    _v="$(_lane_field "$_l" fallback_provider 2>/dev/null)"
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+    # resolved-but-fieldless lanes (local/claudex/gi/ci) fall to the `*` arm -> rc1,
+    # same as today.
+  fi
+  case "$1" in dv) printf devin ;; *) return 1 ;; esac
 }
 
 # _fallback_effective <alias> <model> <lane> -> "model@lane" this candidate would ACTUALLY run as
@@ -12585,7 +13724,14 @@ _fallback_provider_for_lane() {
 # the dedupe compares surface names and can re-dispatch the exact engine+model that just failed,
 # burning a bounded attempt on a no-op hop.
 _fallback_effective() {
-  local alias="$1" model="$2" lane="$3" dvm
+  local alias="$1" model="$2" lane="$3" dvm _l _f
+  # Descriptor-first: a lane may declare fallback_reroute_fn (or's Devin dual-lane
+  # hop); it echoes "model@lane" when it reroutes, empty otherwise.
+  _l="$(_lane_by_token "$lane" 2>/dev/null)" && _f="$(_lane_field "$_l" fallback_reroute_fn 2>/dev/null)"
+  if [ -n "${_f:-}" ]; then
+    local _rr; _rr="$("$_f" "$alias" "$model")"
+    [ -n "$_rr" ] && { printf '%s' "$_rr"; return 0; }
+  fi
   if [ "$lane" = "or" ] && [ "${PROVIDER:-devin}" = "devin" ]; then
     dvm="$(_devin_model_for "$alias")"
     [ -n "$dvm" ] && { printf '%s@dv' "$dvm"; return 0; }
@@ -12676,11 +13822,20 @@ _route_resolution() {   # <dispatch-lane> <model>
   ROUTE_INTERACTION="cloud"
   ROUTE_EVIDENCE="provider=$PROVIDER model=$MODEL"
   ROUTE_FALLBACK_ORDER="$lane"
-  case "$lane" in
-    local) ROUTE_COST_CLASS=local; ROUTE_INTERACTION=local ;;
-    ccnative|cxnative|gmnative|devin|droid|cursor|hermes|warp|cline) ROUTE_COST_CLASS=limited ;;
-    ccor|codexor|claudex|tokenrouter) ROUTE_COST_CLASS=credits ;;
-    *) die "route resolution is ambiguous for lane '$lane'; refusing to launch" ;;
+  # disp-vehicle -> cost class via the descriptor (disp/disp_by_provider match only —
+  # see _lane_by_disp); the case below is the unported-lane fallback. A resolved lane
+  # with no cost_class (gi/ci image lanes) is still ambiguous and must die.
+  local _rl _rc=""
+  if _rl="$(_lane_by_disp "$lane" 2>/dev/null)"; then
+    _rc="$(_lane_field "$_rl" cost_class 2>/dev/null)"
+  fi
+  case "$_rc" in
+    local)          ROUTE_COST_CLASS=local;   ROUTE_INTERACTION=local ;;
+    limited|credits) ROUTE_COST_CLASS="$_rc" ;;
+    *) case "$lane" in
+         devin)           ROUTE_COST_CLASS=limited ;;
+         *) die "route resolution is ambiguous for lane '$lane'; refusing to launch" ;;
+       esac ;;
   esac
 }
 
@@ -12724,13 +13879,17 @@ _route_receipt() {
 }
 
 _route_provider_default_model() { # Provider-specific route identity, never parser state.
+  # Descriptor-first: --provider value -> its lane's default_model field (empty = the
+  # lane has no default — a bare run on such a lane dies at the requires--m guard instead).
+  # The case below is the unported-lane fallback.
+  local _l _v
+  if _l="$(_lane_by_provider "${1:-}" 2>/dev/null)"; then
+    _v="$(_lane_field "$_l" default_model 2>/dev/null)"
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+    return 1
+  fi
   case "$1" in
     devin) printf '%s' "$DEFAULT_MODEL" ;;
-    gemini|gm) printf 'gemini-flash-lite' ;;
-    local) printf 'local' ;;
-    cc|codex) printf 'z-ai/glm-5.2' ;;
-    claudex) printf 'gpt-5.6-sol' ;;
-    droid|cursor|hermes|warp|cline) printf '%s-default' "$1" ;;
     *) return 1 ;;
   esac
 }
@@ -12754,6 +13913,27 @@ _fb_rebuild_argv() {  # <_fb_next>
   _new+=(${REST[@]+"${REST[@]}"})
   ARGV=("${_new[@]}")
   return 0
+}
+
+# _gate_hop <disp> -> arm a ZERO-COST shortlist hop for a pre-dispatch gate skip (quota, lane-down).
+# Runs INSIDE route_delegate and shares its locals by dynamic scope (same contract as
+# _fb_rebuild_argv): appends the tried triple, lazy-loads _fb_cands once, picks the next untried
+# READY candidate and rebuilds ARGV pinned to it. rc0 = hop armed; the caller prints its own
+# gate-specific notice and `continue`s. rc1 = shortlist exhausted; the caller dies with its own
+# gate-specific message. On success it exports OSRC_FALLBACK_PINNED=1: we are now auto-SELECTING
+# the model, not honoring a user pin, and the rewritten argv carries `-m <candidate>` — without the
+# mark an auto-detached child (ORIG feeds _autodetach_run) would DIE "pinned choice" instead of
+# re-hopping if the candidate flips at-cap/down in the launch window. (The P3-a pin-inheritance edge.)
+_gate_hop() {
+  _fb_tried="$_fb_tried $MODEL $RESOLVED_ID ${RESOLVED_ID}@$(_fallback_disp_lane "${1:-?}")"
+  if [ "$_fb_loaded" -eq 0 ]; then _fb_loaded=1; _fb_cands="$(_fallback_shortlist "${REST[*]}")"; fi
+  local _fb_next
+  _fb_next="$(_fallback_pick "$_fb_tried" "$_fb_cands")"
+  if [ -n "$_fb_next" ] && _fb_rebuild_argv "$_fb_next"; then
+    export OSRC_FALLBACK_PINNED=1
+    return 0
+  fi
+  return 1
 }
 
 # Route a one-shot delegation. THE MODEL CHOOSES THE LANE: an alias/id in the table
@@ -12789,6 +13969,23 @@ route_delegate() {
     die "recursion guard: already delegating (OUTSOURCERER_DEPTH=$OUTSOURCERER_DEPTH >= OUTSOURCERER_MAX_DEPTH=$_max). A delegate must not re-delegate. Override with OUTSOURCERER_MAX_DEPTH=N."
   fi
   export OUTSOURCERER_DEPTH=$((OUTSOURCERER_DEPTH + 1))
+
+  # DELEGATE-COMMIT ATTRIBUTION (GH007): every delegate_* lane spawns its harness as a CHILD of this
+  # process, and a harness's `git commit` reads GIT_AUTHOR_*/GIT_COMMITTER_* env BEFORE repo config —
+  # so exporting a noreply identity here is the ONE enforcement point covering all lanes, fg and bg
+  # alike (bg/autodetach children re-enter route_delegate). Without it a delegate commit silently
+  # carries the operator's configured (often private) email and GitHub rejects the push. All-or-
+  # nothing: an operator who set ANY GIT_* identity env manages it themselves — we never override an
+  # explicit choice. OSRC_DELEGATE_GIT_IDENTITY=0 opts out entirely (e.g. a delegate SHOULD commit as
+  # the operator). Human attribution travels in commit trailers, not the author field: _crew_integrate
+  # preserves Co-Authored-By lines across the integration squash.
+  if [ "${OSRC_DELEGATE_GIT_IDENTITY:-1}" != "0" ] \
+     && [ -z "${GIT_AUTHOR_NAME:-}${GIT_AUTHOR_EMAIL:-}${GIT_COMMITTER_NAME:-}${GIT_COMMITTER_EMAIL:-}" ]; then
+    export GIT_AUTHOR_NAME="outsourcerer-delegate" \
+           GIT_AUTHOR_EMAIL="outsourcerer-delegate@users.noreply.github.com" \
+           GIT_COMMITTER_NAME="outsourcerer-delegate" \
+           GIT_COMMITTER_EMAIL="outsourcerer-delegate@users.noreply.github.com"
+  fi
 
   # Shortlist-fallback state. ARGV is the working argv: attempt 1 is the caller's argv verbatim;
   # a transport-failure retry rewrites it to pin the next shortlist candidate and loops back
@@ -12836,20 +14033,27 @@ route_delegate() {
 
   # LOCAL lane short-circuit: a model prefixed ollama:/lmstudio:/lms:/local[:...], or --provider local.
   # Local models aren't in the alias table (they're whatever the user has pulled), so route them here.
-  case "$PROVIDER:$MODEL" in
-    local:*|*:ollama:*|*:lmstudio:*|*:lms:*|*:local|*:local:*)
+  # Descriptor-driven via local's model_globs + providers fields. Both probes must
+  # resolve to the local LANE specifically — provider_is_lane alone would wrongly
+  # pull every engine provider in here.
+  local _sc_lane=""
+  _sc_lane="$(_lane_by_model_glob "$MODEL" 2>/dev/null)"; [ "$_sc_lane" = "local" ] || _sc_lane=""
+  [ -z "$_sc_lane" ] && { _sc_lane="$(_lane_by_provider "$PROVIDER" 2>/dev/null)"; [ "$_sc_lane" = "local" ] || _sc_lane=""; }
+  if [ -n "$_sc_lane" ]; then
       _route_resolution local "$MODEL"
       _route_requires_confirmation && _route_confirm
       _route_receipt
       [ "${OSRC_PREFLIGHT:-0}" = "1" ] && return 0
-      delegate_local "$tier"; return $? ;;
-  esac
+      delegate_local "$tier"; return $?
+  fi
 
   RESOLVED_ID="$MODEL"; RESOLVED_LANE=""; TTIER=""
   # DROID/CURSOR/HERMES engine lanes skip alias resolution entirely: the engine owns its model catalog
   # (incl. user-configured/BYOK models), so `-m glm` under --provider droid means DROID's "glm",
   # never our alias table's z-ai/glm-5.2. The skill adapts to the user's tools, not the reverse.
-  if [ "$MODEL_EXPLICIT" = "1" ] && [ "$PROVIDER" != "droid" ] && [ "$PROVIDER" != "cursor" ] && [ "$PROVIDER" != "hermes" ] && [ "$PROVIDER" != "warp" ] && [ "$PROVIDER" != "cline" ] && [ "$PROVIDER" != "tokenrouter" ]; then
+  # Descriptor-driven: owns_catalog=yes lanes skip the table (the literals below are the
+  # unported tail, deleted one per lane port).
+  if [ "$MODEL_EXPLICIT" = "1" ] && ! _provider_owns_catalog "$PROVIDER"; then
     local row rest2
     row="$(resolve_model_row "$MODEL")"
     if [ -n "$row" ]; then
@@ -12875,72 +14079,39 @@ route_delegate() {
   fi
 
   local disp="" _or_autoroute_note="" _or_credit_state=""
-  if [ "$PROVIDER" = "droid" ] || [ "$PROVIDER" = "cursor" ] || [ "$PROVIDER" = "hermes" ] || [ "$PROVIDER" = "warp" ] || [ "$PROVIDER" = "cline" ] || [ "$PROVIDER" = "tokenrouter" ]; then
+  local _pl_lane=""; _pl_lane="$(_lane_by_provider "$PROVIDER" 2>/dev/null)"
+  if _provider_engine_lane "$PROVIDER" >/dev/null 2>&1; then
     disp="$PROVIDER"
     # Fail FAST on a missing engine CLI -- before the cloud gate and before auto-detach would
     # otherwise bury this error inside a background job the user has to go dig out.
-    case "$disp" in
-      droid)  have droid || die "droid CLI not on PATH (Factory Droid lane). Install it using the official guide: https://docs.factory.ai/cli. Then run 'droid' once to log in." ;;
-      cursor) have cursor-agent || have agent || die "cursor-agent CLI not on PATH (Cursor lane). Install it using the official guide: https://cursor.com/docs/cli/installation. Then run 'cursor-agent login' once (or set CURSOR_API_KEY)." ;;
-      hermes) have hermes || die "hermes CLI not on PATH (Hermes agent lane). Install: https://github.com/NousResearch/hermes-agent  (then run 'hermes' once to configure). -m passes through verbatim; model catalog is yours to configure." ;;
-      warp)   have oz || die "oz CLI not on PATH (Warp lane). It ships INSIDE Warp.app at Contents/Resources/bin/oz — symlink it: ln -s '/Applications/Warp.app/Contents/Resources/bin/oz' ~/.local/bin/oz  (then 'oz login' once). -m passes through verbatim to 'oz model list'; use --harness via OSRC_WARP_HARNESS=claude|codex to host that harness instead of the default Oz one." ;;
-      cline)  have cline || die "cline CLI not on PATH (Cline lane). Install: npm i -g cline  (or see https://github.com/cline/cline), then set up cline: sign in to ClinePass (~\$9.99/mo for discounted open-weight models) or configure your own keys in ~/.cline. -m passes through verbatim to whatever provider/model cline is set to; the Tab tracks the spend." ;;
-      tokenrouter) _tr_load_key ;;  # no CLI to probe: the KEY is the dispatchability gate. Fail fast (pre-cloud-gate, pre-auto-detach) so a missing key is an instant pointer, not an error buried in a detached job.
-    esac
+    # Descriptor-driven: every engine lane's CLI/key gate lives in _lane_cli_gate
+    # (cli + cli_missing_hint + gate_fn fields on the descriptor).
+    _lane_cli_gate "$_pl_lane"
     # The engine CLI presence is the dispatchability gate for these lanes: the check above fails
     # fast (before the cloud gate and before auto-detach would mint a job), so a missing CLI never
     # becomes a phantom job that surfaces the failure inside a detached child the caller never reads.
     # With the CLI present, hermes dispatches for real via `hermes -z` in delegate_hermes.
-  elif [ "$PROVIDER" = "claudex" ]; then
-    # CLAUDEX: a ChatGPT-sub model (sol/terra/luna/gpt-5.5) inside the Claude Code HARNESS via the
-    # user's local CLIProxyAPI. Alias resolution DID run above (sol -> gpt-5.6-sol). Guardrails:
-    #  - Claude-subscription models are REFUSED here: routing Claude OAuth through a third-party
-    #    proxy breaks Anthropic's usage policy; the claude-native lane already serves them first-class.
-    #  - no -m defaults to gpt-5.6-sol (the model this lane exists for).
-    case "$RESOLVED_LANE" in
-      cc) die "-m $MODEL is a Claude-subscription model; routing it through a third-party proxy breaks Anthropic's usage policy. Drop --provider claudex and run -m $MODEL on the claude-native lane (same harness, fully legit)." ;;
-    esac
-    [ "$MODEL_EXPLICIT" = "1" ] || RESOLVED_ID="gpt-5.6-sol"
-    # Fail FAST (pre-cloud-gate, pre-auto-detach): a missing claude CLI or dead proxy must be an
-    # instant pointer, not an error buried inside a detached background job.
-    have claude || die "claudex lane needs the claude CLI on PATH."
-    [ -n "${OSRC_JOB_DIR:-}" ] || _claudex_up || die "claudex lane: no CLIProxyAPI answering at $(_claudex_url) (or no api-key found). This lane rides a proxy YOU install and log into: https://github.com/router-for-me/CLIProxyAPI (then cli-proxy-api --codex-login). Set OSRC_CLAUDEX_URL / OSRC_CLAUDEX_TOKEN if yours is elsewhere. Meanwhile -m ${RESOLVED_ID} runs fine on the codex-native lane (drop --provider)."
-    disp=claudex
+  elif [ -n "$_pl_lane" ] && [ -n "$(_lane_field "$_pl_lane" provider_fn 2>/dev/null)" ]; then
+    # A provider-level branch fn owns the whole route (claudex: Claude-sub refusal,
+    # gpt-5.6-sol default, fail-fast proxy probe, disp). Runs under dynamic scope.
+    "$(_lane_field "$_pl_lane" provider_fn)"
   elif [ "$MODEL_EXPLICIT" = "1" ] && [ -n "$RESOLVED_LANE" ]; then
+    # Descriptor-first: a ported lane routes via route_check_fn (conflict/image guards)
+    # then route_fn (or's dual-lane router) or its plain disp field. The case below is
+    # the unported-lane fallback, shrinking as each lane lands.
+    local _xl _xchk _xfn
+    if _xl="$(_lane_by_token "$RESOLVED_LANE" 2>/dev/null)" \
+       && { [ -n "$(_lane_field "$_xl" route_check_fn 2>/dev/null)" ] \
+         || [ -n "$(_lane_field "$_xl" route_fn 2>/dev/null)" ] \
+         || [ -n "$(_lane_field "$_xl" disp 2>/dev/null)" ]; }; then
+      _xchk="$(_lane_field "$_xl" route_check_fn 2>/dev/null)"; [ -n "$_xchk" ] && "$_xchk"
+      _xfn="$(_lane_field "$_xl" route_fn 2>/dev/null)"
+      if [ -n "$_xfn" ]; then "$_xfn"; else disp="$(_lane_disp "$_xl" "$PROVIDER")"; fi
+    else
     case "$RESOLVED_LANE" in
-      cx)  [ "$PROVIDER" = "cc" ] && die "gpt-5.6-* (Sol/Terra/Luna) is ChatGPT-backend-only; dispatching it via OpenRouter/cc 400s. Drop --provider and let '-m $MODEL' use the codex native lane (needs no OpenRouter key)."
-           disp=cxnative ;;
-      cc)  [ "$PROVIDER" = "codex" ] && die "$RESOLVED_ID is Claude-backend-only; it cannot run through Codex/OpenRouter. Drop --provider and let '-m $MODEL' use the claude native lane (uses your Claude subscription)."
-           disp=ccnative ;;
-      gm)  disp=gmnative ;;
-      gi)  die "'$MODEL' ($RESOLVED_ID) is an image-generation model, not a text-delegation lane. Use the image subcommand instead: $0 image -m $MODEL \"<prompt>\" [out.png]" ;;
-      ci)  die "'$MODEL' ($RESOLVED_ID) is an image-generation model, not a text-delegation lane. Use the image subcommand instead: $0 image -m $MODEL \"<prompt>\" [out.png]" ;;
       dv)  disp=devin ;;
-      or)  case "$PROVIDER" in
-             cc)    disp=ccor ;;
-             codex) disp=codexor ;;
-             *)     # availability-aware routing: default provider (devin) + an OpenRouter model that
-                    # Devin ALSO serves -> use the Devin lane instead of dying/forcing OpenRouter.
-                    # This is deterministic (keyed on _devin_model_for, not a live guess) and matches
-                    # the documented default: `glm`/`deepseek` are dual-lane and ride Devin by default.
-                    # It fixes `-m glm` hard-failing when the OpenRouter key is out of monthly quota.
-                    local _dvm; _dvm="$(_devin_model_for "$MODEL")"
-                    if [ -n "$_dvm" ]; then
-                      printf '>>> [route] -m %s is served by BOTH OpenRouter and Devin; using the Devin lane (%s) on the default provider. Force OpenRouter with --provider cc|codex.\n' "$MODEL" "$_dvm" >&2
-                      # Rewrite the model token in ORIG so the Devin lane runs the Devin id, not the OR alias.
-                      local _i; for _i in "${!ORIG[@]}"; do
-                        case "${ORIG[$_i]}" in -m|--model) [ $((_i+1)) -lt ${#ORIG[@]} ] && ORIG[$((_i+1))]="$_dvm" ;; esac
-                      done
-                      RESOLVED_ID="$_dvm"; disp=devin
-                    else
-                      # AUTO-ROUTE: an OpenRouter-only model the active provider cannot serve should
-                      # FOLLOW its lane automatically -- the SKILL promise is "the alias picks the lane;
-                      # no --provider needed." Route to the cc transport (Claude Code -> OpenRouter) and say so.
-                      _or_autoroute_note="-m $MODEL is an OpenRouter-only model; active provider ($PROVIDER) cannot serve it"
-                      PROVIDER=cc; disp=ccor
-                    fi ;;
-           esac ;;
     esac
+    fi
   else
     # no explicit -m (use provider default / chain) OR unknown id: route by --provider.
     # (auto-advise): when the caller pinned NO model, consult cmd_advise to pick one from the
@@ -12972,13 +14143,16 @@ route_delegate() {
         fi
       fi
     fi
+    # Provider-default dispatch via the descriptor (providers -> _lane_disp); the case
+    # below is the unported tail. `*` still dies loudly for a truly unknown provider.
+    if [ -n "$_pl_lane" ] && [ -n "$(_lane_field "$_pl_lane" disp 2>/dev/null)" ]; then
+      disp="$(_lane_disp "$_pl_lane" "$PROVIDER")"
+    else
     case "$PROVIDER" in
       devin) disp=devin ;;
-      cc)    disp=ccor ;;
-      codex) disp=codexor ;;
-      gemini|gm) disp=gmnative ;;
       *)     die "unknown provider '$PROVIDER' (use: devin|cc|codex|droid|cursor|hermes|warp|cline|claudex|local|tokenrouter)" ;;
     esac
+    fi
   fi
 
   # QUOTA GATE: skip a model that's at its declared daily cap BEFORE we announce/dispatch this route, so
@@ -12996,17 +14170,8 @@ route_delegate() {
     # happened), so it does NOT consume the attempt budget (_fb_used). Free-before-paid falls out of the
     # shortlist ranking; an exhausted shortlist stops with the reset time rather than dispatching at-cap.
     if _fallback_enabled && [ "$tier" = "auto" ]; then
-      _fb_tried="$_fb_tried $MODEL $RESOLVED_ID ${RESOLVED_ID}@$(_fallback_disp_lane "${disp:-?}")"
-      if [ "$_fb_loaded" -eq 0 ]; then _fb_loaded=1; _fb_cands="$(_fallback_shortlist "${REST[*]}")"; fi
-      local _fb_next _fb_alias _fb_mid _fb_lane
-      _fb_next="$(_fallback_pick "$_fb_tried" "$_fb_cands")"
-      if [ -n "$_fb_next" ] && _fb_rebuild_argv "$_fb_next"; then
-        # We are now auto-SELECTING the model, not honoring a user pin. The rewritten argv carries
-        # `-m <candidate>`, which would read as a user pin in an auto-detached child (ORIG feeds
-        # _autodetach_run); without this that child would DIE "pinned choice" instead of re-hopping if
-        # the candidate flips at-cap in the launch window. Marking hop-mode lets this process and its
-        # detached child keep hopping. (Fixes the P3-a auto-detach pin-inheritance edge.)
-        export OSRC_FALLBACK_PINNED=1
+      local _fb_alias _fb_mid _fb_lane
+      if _gate_hop "$disp"; then
         printf '>>> [quota] %s is %s on the %s lane; skipping to %s (lane %s) — no dispatch, so this skip is free of the attempt budget.\n' \
           "$RESOLVED_ID" "$_qreason" "${disp:-?}" "$_fb_alias" "$_fb_lane" >&2
         continue
@@ -13015,6 +14180,32 @@ route_delegate() {
     fi
     # Mutating tier or fallback disabled (unpinned): can't safely auto-hop; refuse with the reset time.
     die "-m $RESOLVED_ID is $_qreason on the ${disp:-?} lane, and auto-fallback isn't available for a '$tier' run. Wait for the reset or pass another -m."
+  fi
+
+  # LANE-DOWN GATE: skip a lane a recent probe/transport verdict marked DOWN (the marker primitives in
+  # the posture block — written by doctor's live probes and by delegate() when the sandboxed-proxy TLS
+  # signature confirms a lane-wide transport outage). Same fallthrough shape as the quota gate above:
+  # a pinned -m is refused LOUDLY and is never silently switched; an unpinned auto-tier run takes a
+  # zero-cost shortlist hop; anything else refuses while the marker lives. The marker is short-TTL and
+  # self-heals (default ${OSRC_LANE_DOWN_TTL:-300}s; `posture reset` clears early), so a stale verdict
+  # can only ever cost one bounded wait, never a permanent block. Order vs the -m pin is deliberate:
+  # the pin check fires FIRST inside this gate, so a known-down lane can never quietly eat an explicit
+  # user choice — the refusal names the lane, the marker, and every override path.
+  if _lane_down_active "$disp"; then
+    record_outcome blocked lane_down "" "" "$(_quota_lane_key "$disp")" "$RESOLVED_ID" 2>/dev/null || true
+    if [ "$_fb_user_pinned" = "1" ] && [ "${OSRC_FALLBACK_PINNED:-0}" != "1" ]; then
+      die "the ${disp:-?} lane is marked DOWN (recent probe/transport verdict; self-heals in ~${OSRC_LANE_DOWN_TTL:-300}s or run '$0 posture reset'). -m $RESOLVED_ID is a pinned choice, so I won't silently switch models. Pick another -m, or set OSRC_FALLBACK_PINNED=1 to auto-hop."
+    fi
+    if _fallback_enabled && [ "$tier" = "auto" ]; then
+      local _fb_alias _fb_mid _fb_lane
+      if _gate_hop "$disp"; then
+        printf '>>> [lane-down] the %s lane is marked DOWN (recent probe/transport verdict); skipping to %s (lane %s) — no dispatch, so this skip is free of the attempt budget.\n' \
+          "${disp:-?}" "$_fb_alias" "$_fb_lane" >&2
+        continue
+      fi
+      die "route resolved to the ${disp:-?} lane, which is marked DOWN, and no untried READY candidate remains. Wait ~${OSRC_LANE_DOWN_TTL:-300}s for the marker to self-heal, run '$0 posture reset', or pass -m for a lane that is up."
+    fi
+    die "the ${disp:-?} lane is marked DOWN (recent probe/transport verdict) and auto-fallback isn't available for a '$tier' run. Wait ~${OSRC_LANE_DOWN_TTL:-300}s, run '$0 posture reset', or pass another -m / --provider."
   fi
 
   # DENYLIST GATE: refuse before announcing a route that must not dispatch, same placement as the
@@ -13032,6 +14223,13 @@ route_delegate() {
   # A live zero balance is conclusive: stop before preflight or dispatch rather than announcing a
   # route which can only fail with 402. Unknown balances remain best-effort and preserve existing
   # behavior, but a numeric zero never becomes a phantom detached job.
+  # Descriptor-first: the vehicle's lane may declare credit_gate_fn (or's
+  # _or_credit_gate); the case below is the unported tail.
+  local _cg_lane _cg_fn=""
+  if _cg_lane="$(_lane_by_disp "$disp" 2>/dev/null)"; then _cg_fn="$(_lane_field "$_cg_lane" credit_gate_fn 2>/dev/null)"; fi
+  if [ -n "$_cg_fn" ]; then
+    "$_cg_fn"
+  else
   case "$disp" in
     ccor|codexor)
       _or_credit_state="$(or_credits 2>/dev/null)"
@@ -13042,11 +14240,22 @@ route_delegate() {
       [ -n "$_or_autoroute_note" ] && printf '>>> [route] %s — auto-routing to the OpenRouter lane (--provider cc; credit state: %s). Force codex with --provider codex.\n' "$_or_autoroute_note" "${_or_credit_state:-unavailable}" >&2
       ;;
   esac
+  fi
 
   # Devin's swe-1.7 is usable for read-only runs but has repeatedly failed write-enabled verbs.
   # Keep an explicit user choice intact, while making the limitation impossible to miss before a
   # mutating dispatch. A write-capable model/lane should be preferred for this work.
-  if [ "$disp" = "devin" ] && [ "$RESOLVED_ID" = "swe-1.7" ]; then
+  # Descriptor-first: a lane may declare warn_model/warn_verbs/warn_msg; the literal
+  # block below is the unported tail (retired when dv lands).
+  local _wl _wm=""
+  _wl="$(_lane_by_disp "$disp" 2>/dev/null)" && _wm="$(_lane_field "$_wl" warn_model 2>/dev/null)"
+  if [ -n "$_wm" ]; then
+    if [ "$_wm" = "$RESOLVED_ID" ]; then
+      case " $(_lane_field "$_wl" warn_verbs 2>/dev/null) " in
+        *" $verb "*) printf "$(_lane_field "$_wl" warn_msg)\n" "$verb" >&2 ;;
+      esac
+    fi
+  elif [ "$disp" = "devin" ] && [ "$RESOLVED_ID" = "swe-1.7" ]; then
     case "$verb" in
       edit|yolo|research)
         printf '>>> [route] WARNING: Devin swe-1.7 is not reliable for %s (write-enabled) jobs. Prefer a write-capable lane/model before dispatch; continuing only because this route was selected explicitly.\n' "$verb" >&2
@@ -13100,6 +14309,13 @@ route_delegate() {
   # The actual dispatch, wrapped so the FOREGROUND path is watchdog-guarded. Defined as a nested
   # fn so it still sees $disp/$tier/$ORIG (bash dynamic scope) when _fg_guard calls it.
   __osrc_fg_dispatch() {
+    # Descriptor-first: dispatch_by_disp pairs first (or's ccor/codexor split), then the
+    # lane's dispatch fn. The case below is the unported-lane fallback. The uniform
+    # call is `"$tier" + ORIG args`: delegate_cc/delegate_codex re-parse ORIG via
+    # _consume_flags; every other delegate_* takes only $1 and ignores the rest.
+    local _dl _df=""
+    if _dl="$(_lane_by_disp "$disp" 2>/dev/null)"; then _df="$(_lane_dispatch_fn "$_dl" "$disp" 2>/dev/null)"; fi
+    if [ -n "$_df" ]; then "$_df" "$tier" ${ORIG[@]+"${ORIG[@]}"}; return; fi
     case "$disp" in
       devin)
         if [ "$tier" = "autonomous" ]; then
@@ -13110,18 +14326,6 @@ route_delegate() {
           fi
           delegate "autonomous" "--sandbox" ${ORIG[@]+"${ORIG[@]}"}   # OS sandbox, see header
         else delegate "$tier" "" ${ORIG[@]+"${ORIG[@]}"}; fi ;;
-      ccor)     delegate_cc     "$tier" ${ORIG[@]+"${ORIG[@]}"} ;;
-      codexor)  delegate_codex  "$tier" ${ORIG[@]+"${ORIG[@]}"} ;;
-      cxnative) delegate_cxnative "$tier" ;;
-      ccnative) delegate_ccnative "$tier" ;;
-      gmnative) delegate_gmnative "$tier" ;;
-      droid)    delegate_droid    "$tier" ;;
-      cursor)   delegate_cursor   "$tier" ;;
-      hermes)   delegate_hermes   "$tier" ;;
-      warp)     delegate_warp     "$tier" ;;
-      cline)    delegate_cline    "$tier" ;;
-      tokenrouter) delegate_tokenrouter "$tier" ;;
-      claudex)  delegate_claudex  "$tier" ;;
     esac
   }
 
@@ -13835,12 +15039,11 @@ _session_infer_provider() {
   row="$(resolve_model_row "$MODEL" 2>/dev/null)"; rest="${row#*|}"
   [ -n "$row" ] && [ "$row" != "$rest" ] && lane="${rest%%|*}"
   [ -n "$lane" ] || lane="$(lane_from_name "$MODEL" 2>/dev/null)" || lane=""
-  case "$lane" in
-    cx) newp=codex ;;
-    cc) newp=cc ;;
-    gm) newp=gemini ;;
-    *)  return 0 ;;                                        # dv/or/engine/unknown -> keep the provider default
-  esac
+  # lane -> --provider token via the descriptor's session_provider field; the case
+  # below is the unported-lane fallback.
+  local _sipl
+  _sipl="$(_lane_by_token "$lane" 2>/dev/null)" && newp="$(_lane_field "$_sipl" session_provider 2>/dev/null)"
+  [ -n "$newp" ] || return 0     # lanes without session_provider -> keep the provider default
   if [ "$newp" != "$PROVIDER" ]; then
     printf '>>> [route] -m %s is a native %s-lane model; starting the %s session (the alias picks the lane). Override with --provider.\n' "$MODEL" "$lane" "$newp" >&2
     PROVIDER="$newp"
@@ -13889,120 +15092,17 @@ _session_launch_adapter() {
   local provider="${1:-$PROVIDER}" help_text="" chat_help="" cli="" de=""
   SESSION_LAUNCH=()
 
+  # Descriptor-first: a ported lane's session_fn owns the capability probe + launch
+  # vector. Session context resolves native_of first (codex->cx, claude->cc,
+  # gemini->gm — the provider token means the NATIVE lane here, not its dispatch
+  # transport), then the lane token; _lane_by_provider would wrongly send
+  # `codex`/`cc` to or. The case below is the unported-lane fallback.
+  local _sla_l _sla_fn=""
+  _sla_l="$(_lane_by_native "$provider" 2>/dev/null)" || _sla_l="$(_lane_by_token "$provider" 2>/dev/null)" || _sla_l=""
+  [ -n "$_sla_l" ] && _sla_fn="$(_lane_field "$_sla_l" session_fn 2>/dev/null)"
+  if [ -n "$_sla_fn" ]; then "$_sla_fn"; return; fi
+
   case "$provider" in
-    droid)
-      have droid || _session_launch_error "$provider" "droid is not on PATH"
-      help_text="$(_session_probe_help droid --help)" \
-        || _session_launch_error "$provider" "the local help probe failed or timed out"
-      printf '%s\n' "$help_text" | grep -Eqi 'interactive mode.*default|start.*interactive mode' \
-        || _session_launch_error "$provider" "help does not advertise an interactive mode"
-      printf '%s\n' "$help_text" | grep -Eqi 'exec.*non-interactive|exec.*noninteractively|exec.*scripts/automation' \
-        || _session_launch_error "$provider" "help does not distinguish interactive mode from one-shot exec"
-      printf '%s\n' "$help_text" | grep -Eqi -- '--auto.*low.*medium.*high' \
-        || _session_launch_error "$provider" "help does not advertise bounded interactive autonomy"
-      SESSION_LAUNCH=("droid" "--auto" "medium")
-      if [ -n "$EFFORT" ]; then
-        # VERIFIED against the live CLI (full `droid --help`, never truncated): the TOP-LEVEL
-        # `droid` documents `-r, --resume [sessionId]` (Resume a session), NOT reasoning effort.
-        # `-r, --reasoning-effort <level>` exists ONLY under `droid exec --help`. Same bug class
-        # as the --model leak: this launch was assembled from the EXEC flag set. Passing
-        # `droid --auto medium -r <effort>` does NOT set effort — it tries to RESUME a session
-        # named "<effort>" (off/none/low/medium/high, none of which is a real session id), finds
-        # none, and EXITS SILENTLY TO A BARE SHELL with exit code 0 and no error. That is how
-        # every droid interactive lane died invisibly tonight. Interactive droid has NO reasoning-
-        # effort flag, so an explicit --effort on a droid session is REFUSED loudly (not silently
-        # dropped — a dropped effort is how this stayed invisible), naming the verified reason
-        # and pointing at the exec/delegate path where `-r` does mean reasoning-effort. Do NOT
-        # re-add `-r` behind a probe.
-        _session_launch_error "$provider" "interactive droid has NO reasoning-effort flag in \`droid --help\` (verified against the live CLI: top-level \`-r, --resume [sessionId]\` means RESUME a session, not effort; \`-r, --reasoning-effort <level>\` exists ONLY under \`droid exec --help\`). \`droid --auto medium -r <effort>\` would try to RESUME a session named \"<effort>\", find none, and exit 0 to a bare shell with no error — an invisible non-start. Drop --effort to start interactive droid on its default reasoning, or use '$0 --provider droid run --effort <level> -m <model> \"task\"' (or bg/delegate) which sets effort via \`droid exec -r\`."
-      fi
-      if [ "$MODEL_EXPLICIT" = "1" ]; then
-        # VERIFIED against the live CLI (full `droid --help`, never truncated): the TOP-LEVEL
-        # `droid` documents NO model flag. Usage is `droid [options] [prompt...]`, so a `--model`
-        # token falls through into the PROMPT and the run proceeds on droid's DEFAULT model
-        # (claude-opus-5), silently billing Claude quota. `-m, --model <id>` exists ONLY under
-        # `droid exec --help`, which delegate_droid uses correctly (`droid exec -m <id>`).
-        # The previous comment claimed "interactive droid accepts --model too" — that was an
-        # unverified assertion (it said the probe was skipped because it was slow) and it was
-        # FALSE. Do NOT re-add the flag behind a probe: interactive droid has no model override,
-        # so a pinned-model interactive session is REFUSED loudly rather than billing on the
-        # default. The honest alternatives for a pinned-model droid run are the exec/delegate
-        # paths (run / delegate / bg), which pin via `droid exec -m`. Refusing here (rather than
-        # falling back to exec) is deliberate: `session start` is for a steerable interactive
-        # REPL, and a headless `droid exec` in a pane exits on completion and breaks the
-        # send/read contract — silently converting an interactive request to headless would be
-        # a different surprise. Name the lane, state the verified reason, point at exec.
-        _session_launch_error "$provider" "interactive droid has NO model override in \`droid --help\` (verified against the live CLI: \`-m, --model <id>\` exists ONLY under \`droid exec --help\`). A --model token falls through into the prompt and the run bills on droid's DEFAULT model (claude-opus-5). Drop -m to start interactive droid on its configured model, or use '$0 --provider droid run -m <model> \"task\"' (or bg/delegate) which pins via \`droid exec -m\`."
-      fi
-      ;;
-    cursor)
-      if have cursor-agent; then
-        cli="cursor-agent"
-      elif have agent; then
-        cli="agent"
-      else
-        _session_launch_error "$provider" "neither cursor-agent nor agent is on PATH"
-      fi
-      help_text="$(_session_probe_help "$cli" --help)" \
-        || _session_launch_error "$provider" "the local help probe failed or timed out"
-      if [ "$cli" = "agent" ]; then
-        printf '%s\n' "$help_text" | grep -qi 'cursor' \
-          || _session_launch_error "$provider" "the agent executable does not identify itself as Cursor"
-      fi
-      printf '%s\n' "$help_text" | grep -Eqi 'interactive (terminal|mode|session)|chat mode.*default|start.*chat mode' \
-        || _session_launch_error "$provider" "help does not advertise an interactive chat mode"
-      printf '%s\n' "$help_text" | grep -Eqi -- '--print.*non-interactive|-p.*non-interactive' \
-        || _session_launch_error "$provider" "help does not distinguish interactive chat from one-shot print mode"
-      SESSION_LAUNCH=("$cli")
-      if [ "$MODEL_EXPLICIT" = "1" ]; then
-        printf '%s\n' "$help_text" | grep -Eq -- '--model([ =]|$)' \
-          || _session_launch_error "$provider" "help does not advertise an interactive model override"
-        SESSION_LAUNCH+=("--model" "$MODEL")
-      fi
-      ;;
-    hermes)
-      have hermes || _session_launch_error "$provider" "hermes is not on PATH"
-      help_text="$(_session_probe_help hermes --help)" \
-        || _session_launch_error "$provider" "the local help probe failed or timed out"
-      chat_help="$(_session_probe_help hermes chat --help)" \
-        || _session_launch_error "$provider" "the local chat help probe failed or timed out"
-      printf '%s\n%s\n' "$help_text" "$chat_help" | grep -Eqi 'REPL|interactive (chat|mode|session)|chat.*interactive' \
-        || _session_launch_error "$provider" "help does not advertise an interactive REPL or chat"
-      printf '%s\n%s\n' "$help_text" "$chat_help" | grep -Eqi 'one-shot|non-interactive' \
-        || _session_launch_error "$provider" "help does not distinguish interactive chat from one-shot mode"
-      printf '%s\n' "$help_text" | grep -Eqi '(^|[[:space:]])chat([[:space:]]|$)' \
-        || _session_launch_error "$provider" "help does not advertise the chat command"
-      SESSION_LAUNCH=("hermes" "chat")
-      if [ "$MODEL_EXPLICIT" = "1" ]; then
-        printf '%s\n' "$chat_help" | grep -Eq -- '--model([ =]|$)' \
-          || _session_launch_error "$provider" "chat help does not advertise a model override"
-        SESSION_LAUNCH+=("--model" "$MODEL")
-      fi
-      ;;
-    cline)
-      # Cline's interactive REPL is bare `cline`; the one-shot/headless path is driven by --plan and
-      # --auto-approve (the same flags the delegate_cline lane uses). Probe help before launching so we
-      # only start an interactive session on a CLI that advertises an interactive mode distinct from
-      # headless one-shot, and (when -m is given) a model override — matching the bar droid/cursor/hermes
-      # already clear. A failed/timed-out probe or a missing capability falls through to the one-shot lane.
-      have cline || _session_launch_error "$provider" "cline is not on PATH"
-      help_text="$(_session_probe_help cline --help)" \
-        || _session_launch_error "$provider" "the local help probe failed or timed out"
-      printf '%s\n' "$help_text" | grep -Eqi 'interactive|plan mode|act mode|repl|chat' \
-        || _session_launch_error "$provider" "help does not advertise an interactive mode"
-      printf '%s\n' "$help_text" | grep -Eqi -- '--plan|--auto-approve|non-interactive|headless' \
-        || _session_launch_error "$provider" "help does not distinguish interactive mode from headless one-shot"
-      SESSION_LAUNCH=("cline")
-      if [ "$MODEL_EXPLICIT" = "1" ]; then
-        if printf '%s\n' "$help_text" | grep -Eq -- '--model([ =]|$)'; then
-          SESSION_LAUNCH+=("--model" "$MODEL")
-        elif printf '%s\n' "$help_text" | grep -Eq '(^|[[:space:],])-m([[:space:],]|$)'; then
-          SESSION_LAUNCH+=("-m" "$MODEL")
-        else
-          _session_launch_error "$provider" "help does not advertise an interactive model override"
-        fi
-      fi
-      ;;
     *)
       _session_launch_error "$provider" "no capability adapter is defined"
       ;;
@@ -14125,10 +15225,12 @@ _session_effort_validate() {
 }
 
 _session_resolved_model() { # <provider> <requested-model>
-  local provider="$1" model="$2" row
-  case "$provider" in
-    codex|cx) row="$(resolve_model_row "$model")"; [ -n "$row" ] && { printf '%s\n' "${row%%|*}"; return; } ;;
-  esac
+  local provider="$1" model="$2" row _srm_l _srm_f=""
+  # Descriptor-first: session_resolved_fn owns a ported lane's alias->id pass
+  # (session context resolves native_of then token, same as the launch adapter).
+  _srm_l="$(_lane_by_native "$provider" 2>/dev/null)" || _srm_l="$(_lane_by_token "$provider" 2>/dev/null)" || _srm_l=""
+  [ -n "$_srm_l" ] && _srm_f="$(_lane_field "$_srm_l" session_resolved_fn 2>/dev/null)"
+  if [ -n "$_srm_f" ]; then "$_srm_f" "$model"; return; fi
   printf '%s\n' "$model"
 }
 
@@ -14430,8 +15532,14 @@ _session_model_observe_cursor() { _session_model_observer_run cursor "$@"; }
 _session_model_observe_hermes() { _session_model_observer_run hermes "$@"; }
 _session_model_observe_gemini() { _session_model_observer_run gemini "$@"; }
 _session_model_observe() { # <lane> <endpoint> <session-id>
-  local lane="$1" endpoint="$2" session_id="$3"
-  case "$lane" in devin|dv) _session_model_observe_devin "$endpoint" "$session_id" ;; codex|cx) _session_model_observe_codex "$endpoint" "$session_id" ;; cc|claude) _session_model_observe_cc "$endpoint" "$session_id" ;; droid) _session_model_observe_droid "$endpoint" "$session_id" ;; cursor) _session_model_observe_cursor "$endpoint" "$session_id" ;; hermes) _session_model_observe_hermes "$endpoint" "$session_id" ;; gemini|gm) _session_model_observe_gemini "$endpoint" "$session_id" ;; *) printf 'unknown\n' ;; esac
+  # Descriptor-first: native context wins (provider-family tokens like codex->cx,
+  # claude->cc, gemini->gm, devin->dv via native_of), then lane tokens -> observe_fn.
+  # The case below is the unported-lane fallback.
+  local lane="$1" endpoint="$2" session_id="$3" _l _f=""
+  _l="$(_lane_by_native "$lane" 2>/dev/null)" || _l="$(_lane_by_token "$lane" 2>/dev/null)" || _l=""
+  [ -n "$_l" ] && _f="$(_lane_field "$_l" observe_fn 2>/dev/null)"
+  if [ -n "$_f" ]; then "$_f" "$endpoint" "$session_id"; return; fi
+  case "$lane" in devin|dv) _session_model_observe_devin "$endpoint" "$session_id" ;; *) printf 'unknown\n' ;; esac
 }
 _session_model_matches() { # <requested> <resolved> <observed>
   local requested="$1" resolved="$2" observed="$3"
@@ -14441,6 +15549,12 @@ _session_model_matches() { # <requested> <resolved> <observed>
 }
 _session_model_receipt_devin() { _external_receipt_verify "$1" "$2"; }
 _session_model_receipt() { # <lane> <pane> <restore-id>
+  # Descriptor-first (native context then lane token -> receipt_fn); the case below
+  # is the unported-lane fallback.
+  local _l _f=""
+  _l="$(_lane_by_native "$1" 2>/dev/null)" || _l="$(_lane_by_token "$1" 2>/dev/null)" || _l=""
+  [ -n "$_l" ] && _f="$(_lane_field "$_l" receipt_fn 2>/dev/null)"
+  if [ -n "$_f" ]; then "$_f" "$2" "$3"; return; fi
   case "$1" in devin|dv) _session_model_receipt_devin "$2" "$3" ;; *) printf 'unknown\n' ;; esac
 }
 _session_model_restore_devin() { # <pane> <model>
@@ -14644,18 +15758,13 @@ _model_pin_restore_allowed() { # <session-id> <generation>
 
 _session_relaunch_command() { # <provider> <model> <effort>
   local provider="$1" model="$2" effort="$3" cid tokens code_mode_host
+  # Descriptor-first: relaunch_fn owns a ported lane's relaunch vector
+  # (session context: native_of then lane token, same as the launch adapter).
+  local _rl_l _rl_f=""
+  _rl_l="$(_lane_by_native "$provider" 2>/dev/null)" || _rl_l="$(_lane_by_token "$provider" 2>/dev/null)" || _rl_l=""
+  [ -n "$_rl_l" ] && _rl_f="$(_lane_field "$_rl_l" relaunch_fn 2>/dev/null)"
+  if [ -n "$_rl_f" ]; then "$_rl_f" "$model" "$effort"; return; fi
   case "$provider" in
-    codex|cx)
-      cid="$(resolve_model_row "$model")"; cid="${cid%%|*}"; [ -n "$cid" ] || cid="$model"
-      _validate_model_token "$cid"
-      code_mode_host="$(_codex_code_mode_host_flag)" || return 1
-      printf 'codex -m %q -s workspace-write -c features.code_mode_host=%q -c model_reasoning_effort=%q' "$cid" "$code_mode_host" "$effort"
-      ;;
-    cc|claude)
-      tokens="$(_effort_thinking_tokens "$effort")"
-      [ -n "$tokens" ] || return 1
-      printf 'env MAX_THINKING_TOKENS=%q -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_EXECPATH claude --model %q' "$tokens" "$model"
-      ;;
     droid)
       # VERIFIED against the live CLI: interactive `droid` has NO reasoning-effort flag
       # (top-level `-r, --resume [sessionId]` means RESUME, not effort; `-r, --reasoning-effort`
@@ -14716,32 +15825,9 @@ _winpty_session() {
           # reasoning control this tool can set, so a requested --effort cannot be enforced here.
           [ -n "$EFFORT" ] && printf '>>> [effort] WARNING: --effort %s NOT applied to this Devin session — Devin'"'"'s interactive TUI has no reasoning control this tool can set; it runs at the TUI default. Set it in the TUI, or use `%s --provider devin run --effort %s ...` (exec honors -r).\n' "$EFFORT" "$0" "$EFFORT" >&2
           LAUNCH=("devin" "--model" "$MODEL" "--respect-workspace-trust" "false") ;;
-        codex|cx)
-          have codex || die "codex not on PATH (needed for a codex session)"
-          local crow cid; crow="$(resolve_model_row "$MODEL")"; cid="${crow%%|*}"; [ -n "$cid" ] || cid="$MODEL"
-          [ -n "$cid" ] && _validate_model_token "$cid"   # empty = codex default; don't die on no-model session
-          [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable codex codex --help
-          local _ccmh=(); _ccmh=("-c" "features.code_mode_host=$(_codex_code_mode_host_flag)")
-          LAUNCH=("codex" "-s" "workspace-write")
-          [ "$MODEL_EXPLICIT" = "1" ] && LAUNCH+=("-m" "$cid")
-          [ -n "$EFFORT" ] && LAUNCH+=("-c" "model_reasoning_effort=$EFFORT")
-          LAUNCH+=(${_ccmh[@]+"${_ccmh[@]}"}) ;;
-        cc|claude)
-          have claude || die "claude not on PATH (needed for a claude session)"
-          [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable cc claude --help
-          LAUNCH=("env" "-u" "CLAUDECODE" "-u" "CLAUDE_CODE_ENTRYPOINT" "-u" "CLAUDE_CODE_SESSION_ID" "-u" "CLAUDE_CODE_CHILD_SESSION" "-u" "CLAUDE_CODE_EXECPATH" "claude")
-          [ -n "$EFFORT" ] && LAUNCH=("env" "MAX_THINKING_TOKENS=$(_effort_thinking_tokens "$EFFORT")" "-u" "CLAUDECODE" "-u" "CLAUDE_CODE_ENTRYPOINT" "-u" "CLAUDE_CODE_SESSION_ID" "-u" "CLAUDE_CODE_CHILD_SESSION" "-u" "CLAUDE_CODE_EXECPATH" "claude")
-          [ "$MODEL_EXPLICIT" = "1" ] && LAUNCH+=("--model" "$MODEL") ;;
-        droid|cursor|hermes|cline)
+        codex|cx|droid|cursor|hermes|cline|gemini|gm|cc|claude)
           _session_launch_adapter "$PROVIDER"
           LAUNCH=("${SESSION_LAUNCH[@]}") ;;
-        gemini|gm)
-          local gveh="${OSRC_GEMINI_VEHICLE:-}"
-          if [ -z "$gveh" ]; then if have agy; then gveh=agy; elif have gemini; then gveh=gemini; else die "gemini session needs a CLI (install Antigravity 'agy' keyless, or gemini-cli + GEMINI_API_KEY)"; fi; fi
-          have "$gveh" || die "OSRC_GEMINI_VEHICLE=$gveh but '$gveh' not on PATH"
-          [ "$gveh" != "gemini" ] || _gm_load_key
-          [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable gemini "$gveh" --help
-          if [ "$MODEL_EXPLICIT" = "1" ]; then LAUNCH=("$gveh" "--model" "$MODEL"); else LAUNCH=("$gveh"); fi ;;
         *) die "session start: provider '$PROVIDER' not supported for interactive sessions (use --provider devin|codex|cc|droid|cursor|hermes|cline|gemini)" ;;
       esac
 
@@ -14931,34 +16017,9 @@ session() {
           # than running Low while the receipt implies otherwise, and name the paths that DO honor it.
           [ -n "$EFFORT" ] && printf '>>> [effort] WARNING: --effort %s NOT applied to this Devin session — Devin'"'"'s interactive TUI has no reasoning control this tool can set; it runs at the TUI default. Set it in the TUI, or use `%s --provider devin run --effort %s ...` (exec honors -r), or a lane that supports interactive effort.\n' "$EFFORT" "$0" "$EFFORT" >&2
           launch="devin --model '$MODEL' --respect-workspace-trust false" ;;   # single-quoted: a validated [1m]-style token must not glob-expand when send-keys hands it to the shell
-        codex|cx)
-          have codex || die "codex not on PATH (needed for a codex session)"
-          local crow cid; crow="$(resolve_model_row "$MODEL")"; cid="${crow%%|*}"; [ -n "$cid" ] || cid="$MODEL"
-          # The resolved codex model id is what enters the tmux command (empty = codex default).
-          [ -n "$cid" ] && _validate_model_token "$cid"
-          [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable codex codex --help
-          local ccmh=""; ccmh=" -c features.code_mode_host=$(_codex_code_mode_host_flag)"  # self-heal in the TUI too (bidirectional: =true overrides a stale config=false)
-          # No `--cd "$PWD"` -- tmux new-session already starts the pane in $PWD (-c "$PWD").
-          # Interpolating $PWD into this shell-command string was a directory-name injection vector
-          # (a dir named `x"; touch /tmp/pwn; #` would break out when send-keys hands it to the shell).
-          if [ "$MODEL_EXPLICIT" = "1" ]; then launch="codex -m '$cid' -s workspace-write$ccmh"; else launch="codex -s workspace-write$ccmh"; fi
-          [ -n "$EFFORT" ] && launch="$launch -c model_reasoning_effort=$EFFORT" ;;
-        cc|claude)
-          have claude || die "claude not on PATH (needed for a claude session)"
-          [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable cc claude --help
-          # strip nested Claude Code env so a nested interactive claude authenticates via OAuth (same fix as the -p lane)
-          if [ "$MODEL_EXPLICIT" = "1" ]; then launch="env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_EXECPATH claude --model '$MODEL'"; else launch="env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_EXECPATH claude"; fi
-          [ -n "$EFFORT" ] && launch="env MAX_THINKING_TOKENS=$(_effort_thinking_tokens "$EFFORT") $launch" ;;
-        droid|cursor|hermes|cline)
+        codex|cx|droid|cursor|hermes|cline|gemini|gm|cc|claude)
           _session_launch_adapter "$PROVIDER"
           launch="$(_session_shell_command "${SESSION_LAUNCH[@]}")" ;;
-        gemini|gm)
-          local gveh="${OSRC_GEMINI_VEHICLE:-}"
-          if [ -z "$gveh" ]; then if have agy; then gveh=agy; elif have gemini; then gveh=gemini; else die "gemini session needs a CLI (install Antigravity 'agy' keyless, or gemini-cli + GEMINI_API_KEY)"; fi; fi
-          have "$gveh" || die "OSRC_GEMINI_VEHICLE=$gveh but '$gveh' not on PATH"
-          [ "$gveh" != "gemini" ] || _gm_load_key
-          [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable gemini "$gveh" --help
-          if [ "$MODEL_EXPLICIT" = "1" ]; then launch="$gveh --model '$MODEL'"; else launch="$gveh"; fi ;;
         *) die "session start: provider '$PROVIDER' not supported for interactive sessions (use --provider devin|codex|cc|droid|cursor|hermes|cline|gemini)" ;;
       esac
       # Use has-session to avoid killing a concurrent session.
@@ -15720,7 +16781,8 @@ doctor() {
       case "$_trcode" in
         200) echo "    tokenrouter liveness: RESPONDS — gateway answering at $(_tr_base_url), key accepted (probed just now)" ;;
         401|403) echo "    tokenrouter liveness: KEY REJECTED (HTTP $_trcode) — TOKENROUTER_API_KEY is missing/invalid/expired. Fix the key in ~/.env." ;;
-        000) echo "    tokenrouter liveness: NOT ANSWERING at $(_tr_base_url) (timeout/unreachable). Treat as DOWN, not ready." ;;
+        000) _lane_down_mark tokenrouter   # close the doctor->dispatch loop: dispatch skips it while the TTL lives
+             echo "    tokenrouter liveness: NOT ANSWERING at $(_tr_base_url) (timeout/unreachable). Treat as DOWN, not ready." ;;
         *) echo "    tokenrouter liveness: UNCLEAR (HTTP $_trcode) — gateway reachable but returned an unexpected status." ;;
       esac
     fi
@@ -15803,11 +16865,13 @@ doctor() {
     _dstate="$(_devin_probe_classify "$_drc" "$_dpt")"
     case "$_dstate" in
       up)
+        _lane_down_clear dv   # authoritative probe answered: drop any still-unexpired down marker
         echo "  Devin GLM (free): UP — glm-5-2 plan-included probe answered within ${OSRC_DEVIN_PROBE_SECS:-30}s" ;;
       paid-tier-exhausted)
         echo "  Devin GLM (free): NOT MARKED DOWN — probe returned a paid-tier quota signal, which cannot gate glm-5-2/swe-1-7"
         echo "  Devin paid tier: EXHAUSTED; free tier (glm-5-2, swe-1-7) still available" ;;
       down-timeout)
+        _lane_down_mark dv   # close the doctor->dispatch loop: the dispatch gate skips a marked lane
         echo "  Devin GLM (free): GENUINELY DOWN — glm-5-2 probe timed out after ${OSRC_DEVIN_PROBE_SECS:-30}s after orphan reap preflight" ;;
       *)
         echo "  Devin GLM (free): UNCONFIRMED (bounded probe rc=$_drc, did not time out) — not reporting the free lane unavailable without a timed-out probe" ;;

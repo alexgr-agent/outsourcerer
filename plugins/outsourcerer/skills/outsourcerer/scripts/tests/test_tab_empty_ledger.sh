@@ -15,25 +15,31 @@ pass=0; fail=0
 ok()  { echo "PASS: $1"; pass=$((pass+1)); }
 bad() { echo "FAIL: $1"; fail=$((fail+1)); }
 
-# 1. missing ledger: empty-Tab message (already worked; keep it that way)
+# 1. missing ledger: empty-Tab message, and NO "== The Tab ==" banner (the banner printed
+#    before the empty check was the garbled papercut on the empty-but-existing path).
 out="$(OSRC_HOME="$TMP" HOME="$TMP" bash "$SRC" tab 2>&1)"; rc=$?
 case "$out" in *"The Tab is empty"*) ok "missing ledger prints the empty-Tab message" ;; *) bad "missing ledger: $out" ;; esac
+case "$out" in *"== The Tab"*) bad "missing ledger still prints the Tab banner: $out" ;; *) ok "missing ledger prints no Tab banner" ;; esac
 
-# 2. empty-but-existing ledger: the reported crash
+# 2. empty-but-existing ledger: the reported crash, and the garbled banner-then-empty render
 : > "$TMP/ledger.jsonl"
 out="$(OSRC_HOME="$TMP" HOME="$TMP" bash "$SRC" tab 2>&1)"; rc=$?
 case "$out" in *"arithmetic syntax error"*|*"syntax error in expression"*) bad "zero-length ledger still crashes tab: $out" ;; *) ok "zero-length ledger does not crash tab" ;; esac
 case "$out" in *"The Tab is empty"*) ok "zero-length ledger prints the empty-Tab message" ;; *) bad "zero-length ledger did not print the empty-Tab message: $out" ;; esac
+case "$out" in *"== The Tab"*) bad "zero-length ledger still prints the Tab banner (garbled render): $out" ;; *) ok "zero-length ledger prints no Tab banner (clean render)" ;; esac
 [ "$rc" -eq 0 ] && ok "tab exits 0 on an empty ledger" || bad "tab exited $rc on an empty ledger"
 
 # 3. whitespace-only ledger (a stray newline) behaves the same
 printf '\n\n' > "$TMP/ledger.jsonl"
 out="$(OSRC_HOME="$TMP" HOME="$TMP" bash "$SRC" tab 2>&1)"
 case "$out" in *"The Tab is empty"*) ok "whitespace-only ledger is an empty Tab" ;; *) bad "whitespace-only ledger: $out" ;; esac
+case "$out" in *"== The Tab"*) bad "whitespace-only ledger still prints the Tab banner: $out" ;; *) ok "whitespace-only ledger prints no Tab banner" ;; esac
 
-# 4. one real row still tabulates (the fix must not hide a populated Tab)
+# 4. one real row still tabulates (the fix must not hide a populated Tab). The banner MUST
+#    appear here — it is the populated render, empty cases render minus the rows.
 printf '{"ts":"2026-09-03T00:00:00Z","provider":"antigravity-agy","lane":"gm","model":"gemini-3.8-flash","verb":"run","cost_usd":"0.000000"}\n' > "$TMP/ledger.jsonl"
 out="$(OSRC_HOME="$TMP" HOME="$TMP" bash "$SRC" tab 2>&1)"
+case "$out" in *"== The Tab"*) ok "a populated ledger still prints the Tab banner" ;; *) bad "populated ledger dropped the Tab banner: $out" ;; esac
 case "$out" in *"runs recorded          : 1"*) ok "a populated ledger still tabulates (1 run)" ;; *) bad "populated ledger output wrong: $out" ;; esac
 case "$out" in *Antigravity*) ok "the subscription lane is still attributed" ;; *) bad "lane attribution missing" ;; esac
 
