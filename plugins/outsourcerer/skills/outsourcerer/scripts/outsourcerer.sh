@@ -2798,7 +2798,7 @@ _state_lock_acquire() {
   _STATE_LOCK_KIND=""
   if command -v flock >/dev/null 2>&1; then
     [ ! -L "$lock" ] || return 1
-    exec 9>>"$lock" 2>/dev/null || return 1
+    { exec 9>>"$lock"; } 2>/dev/null || return 1
     flock -w 5 9 2>/dev/null || { exec 9>&-; return 1; }
     _STATE_LOCK_KIND="flock"
     return 0
@@ -3317,7 +3317,7 @@ _endpoint_mutation_lock() { # <pane>; held until _endpoint_mutation_unlock
   _ENDPOINT_MUTATION_KIND=""
   if [ "${OSRC_FORCE_MKDIR_LOCK:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
     [ ! -L "$lock" ] || return 1
-    exec 7>>"$lock" 2>/dev/null || return 1
+    { exec 7>>"$lock"; } 2>/dev/null || return 1
     flock -w 5 7 2>/dev/null || { exec 7>&-; return 1; }
     _ENDPOINT_MUTATION_KIND="flock"
     return 0
@@ -4330,7 +4330,7 @@ _heartbeat_election_acquire() { # <lock> <pid> <pid-start>
   local lock="$1" pid="$2" pid_start="$3" owner old_pid old_start live rc record grace lage corpse
   if [ "${OSRC_FORCE_MKDIR_ELECTION:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
     [ ! -L "$lock.flock" ] || return 1
-    exec 8>"$lock.flock" 2>/dev/null || return 1
+    { exec 8>"$lock.flock"; } 2>/dev/null || return 1
     flock -w 5 8 2>/dev/null || { exec 8>&-; return 1; }
     _HEARTBEAT_ELECTION_KIND=flock
     return 0
@@ -8338,9 +8338,12 @@ _autodetach_should() {
 # opinion path), so _bg_cloud_preack returns early and the ack propagates to the child/tmux pane.
 _autodetach_run() {
   local _ar_verb="$1"; shift
+  # Cloud consent comes FIRST, before ANY launch machinery (the tmux probe included): a
+  # non-interactive cloud run must fail at the CLOUD GATE, never at a missing-tmux error,
+  # so the gate stays the first thing a cloud dispatch hits on every platform.
+  _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
   # HEADLESS BG PATH (explicit opt-out). Also the path the bg re-entry tests exercise.
   if [ "${OSRC_REQUIRE_INTERACTIVE:-1}" != "1" ]; then
-    _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
     local id; id="$(_bg_launch "$_ar_verb" "$@")"
     [ -n "$id" ] || die "auto-detach: launch failed -- no job id was minted (nothing was started)."
     printf '>>> [auto-detach] non-interactive slow-lane run detached to bg to avoid a caller tool-timeout.\n' >&2
@@ -8354,7 +8357,6 @@ _autodetach_run() {
   # human can watch/steer it. Same machinery `session start` uses (new-session + send-keys). Never
   # silently fall back to headless: if tmux is genuinely unavailable, FAIL LOUDLY with the reason.
   have tmux || die "auto-detach: OSRC_REQUIRE_INTERACTIVE=1 but tmux is not installed ($( [ "$OSRC_PLATFORM" = "mac" ] && echo 'brew install tmux' || echo 'apt/dnf install tmux')). A non-interactive slow-lane run must NOT go headless. Set OSRC_REQUIRE_INTERACTIVE=0 to allow the headless bg path, or install tmux."
-  _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
   # Unique per-run session name (collision-safe for concurrent auto-detaches in the same directory;
   # the PWD-derived SESSION_NAME is one-per-dir). OUTSOURCERER_TMUX overrides SESSION_NAME at source
   # time, so the user steers via:  OUTSOURCERER_TMUX=<name> $0 session read | session send "..." | session stop
@@ -10771,9 +10773,15 @@ delegate_gmnative() {
     # same way it reports a slow one, and at the default 5m print-timeout that costs five minutes per
     # attempt to learn nothing. The distinguishing fact is that agy's own auth/model resolution
     # succeeded and only the generation never returned, which points at the backend, not the request.
-    local _aerr; _aerr="$(mktemp -t osrc-agy)"
+    # Portable template: `mktemp -t osrc-agy` is BSD-only — GNU mktemp rejects a template
+    # with no X's, leaving _aerr EMPTY, so the capture below never happened and the anchored
+    # retry grep matched nothing (the Ubuntu CI failure). Capture stderr SYNCHRONOUSLY too
+    # (redirect to a file, then replay): a process-substitution tee (2> >(tee "$_aerr" >&2))
+    # is still flushing when the retry grep runs, so the match can race the writer.
+    local _aerr; _aerr="$(mktemp "${TMPDIR:-/tmp}/osrc-agy.XXXXXX")"
     agy -p "$wrapped" ${aflag[@]+"${aflag[@]}"} --model "$atok" ${aeffflag[@]+"${aeffflag[@]}"} \
-        --print-timeout "${OSRC_AGY_PRINT_TIMEOUT:-5m}" 2> >(tee "$_aerr" >&2) || rc=$?
+        --print-timeout "${OSRC_AGY_PRINT_TIMEOUT:-5m}" 2> "$_aerr" || rc=$?
+    [ -s "$_aerr" ] && cat "$_aerr" >&2
     # Self-heal the effort/model mismatch: some agy builds treat a concrete id (e.g. `gemini-3.5-flash`)
     # as effort-less and hard-reject the --effort pair ("--effort is not supported for model ..."). The
     # model itself is valid; only the flag is wrong, so clearing the catalog (below) would be wrong and
@@ -10788,7 +10796,8 @@ delegate_gmnative() {
       printf '>>> [gemini] agy rejected --effort for "%s"; retrying once without it (the model runs at its own default).\n' "$atok" >&2
       aeffflag=(); rc=0; : > "$_aerr"
       agy -p "$wrapped" ${aflag[@]+"${aflag[@]}"} --model "$atok" \
-          --print-timeout "${OSRC_AGY_PRINT_TIMEOUT:-5m}" 2> >(tee "$_aerr" >&2) || rc=$?
+          --print-timeout "${OSRC_AGY_PRINT_TIMEOUT:-5m}" 2> "$_aerr" || rc=$?
+      [ -s "$_aerr" ] && cat "$_aerr" >&2
     fi
     if grep -qi 'timeout waiting for response' "$_aerr" 2>/dev/null; then
       printf '>>> [gemini] the keyless Antigravity lane accepted the request and never answered (model and login both resolved, so this is the Antigravity backend, not your prompt).\n' >&2
