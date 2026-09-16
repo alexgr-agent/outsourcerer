@@ -2,6 +2,46 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.12.3
+
+On a long Devin Pro session the **shared daily plan quota** can be exhausted, which blocks every
+plan-included model (glm/swe/kimi) at once. Outsourcerer modeled only the paid ACU pool, so it read
+that exhaustion as a "mis-gate, not a real limit" and pointed you back at the same dead lane.
+
+### Fixed
+
+- **Devin's plan-included daily/weekly quota is now modeled as a real, shared, exhaustible bucket**,
+  distinct from the paid ACU pool. On a genuine daily/weekly exhaustion, Outsourcerer marks the whole
+  `dv` lane down until Devin's own stated reset and steers **off** Devin (OpenRouter via `--provider
+  cc`, or a native lane), instead of the old dead-end "retry on glm/swe" advice. The reset time is
+  parsed from Devin's "resets in 11h26m" / "resets at 09:00 UTC" wording, never guessed.
+- **The dead `devin usage` call is guarded.** The current Devin CLI has no `usage` subcommand; every
+  hint now points at the dashboard (`app.devin.ai/settings/usage`) instead of a command that errors.
+- **`advise` no longer recommends a pure-reasoning model for edit-run-verify work.** Such tasks now
+  classify as agentic, and Kimi K3's near-frontier scoring bump is reasoning-shaped only, so it stops
+  floating to #1 on edit/agentic jobs (a hard pure-reasoning task still picks it).
+
+### Added
+
+- **Zero-write watchdog.** A live-but-writeless delegated run (a model burning its budget on reasoning
+  without touching a file) is now surfaced as `no-progress-writes` past `OSRC_NOPROGRESS_SECS` (default
+  600), for mutating verbs only; read-only and text-only lanes are exempt. Surface-only unless
+  `OSRC_NOPROGRESS_KILL_SECS` is set. Catches the reasoning-budget burn that motivated this release.
+- **Per-session Devin-plan dispatch meter.** Warns past `OSRC_DEVIN_PLAN_JOBS_WARN` (default 8) that
+  glm/swe/kimi/deepseek share one daily bucket, so heavy stacking is visible before it runs out.
+- **glm-5.3 family incl. `glm-5.3-flash-high`** in the model table, bench map, and Devin resolver;
+  `advise` prefers the cheaper capable variant within a family (flash-high over -high) unless
+  `--effort max`. `OSRC_ADVISE_VARIANT_PREF=0` disables the preference.
+- Three new test suites (`test_devin_plan_quota`, `test_nowrite_watchdog`, `test_advise_task_shape`).
+
+### Scope
+
+- The plan-limit detection and lane-down-until-reset are **Devin-specific** in this release. The
+  general "any subscription harness (Warp, Droid, Cursor, Cline, native) hits its own plan limit and
+  fails the work over to another harness you have" mechanism is future work. Proactive conservation
+  (Claude / ChatGPT windows) and read-only transport-fallback already exist and are unchanged; the
+  zero-write watchdog and the `advise` routing changes are lane-agnostic.
+
 ## 0.11.1
 
 ### Fixed

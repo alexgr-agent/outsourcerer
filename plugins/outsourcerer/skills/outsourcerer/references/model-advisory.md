@@ -28,11 +28,20 @@ The prompt is lowercased and matched against pipe-separated keyword phrases for 
 The category with the most distinct keyword hits wins. Ties break: code > reasoning > agentic >
 creative > simple. Default (no keyword hits): simple.
 
+**Task-shape rule (blended).** Before the tally, a prompt with at least one `code` hit AND two or
+more `agentic` hits classifies as **agentic**. "Edit X to fix the bug, run the test suite, verify"
+describes multi-step tool use (edit, run, observe, iterate), not one code operation; under
+most-hits-wins it tied 2:2 and code won the tie, so it was scored on `coding_index` and a
+reasoning-heavy model floated to #1 for a job that is all about turning tools quickly. The agentic
+keyword list carries the edit-run-verify signals for this: `run the tests`, `run the test suite`,
+`run tests`, `make the tests pass`, `verify the fix`, `iterate until`, `edit and run`,
+`fix and verify`, `then verify`.
+
 | Category | Keywords (sample) | Benchmark field | Threshold |
 |---|---|---|---|
 | code | function, class method, bug, fix, refactor, implement, compile, error, stack trace, debug, unit test, api endpoint, sql query, regex, algorithm, code review, pull request, merge conflict, lint, docker, kubernetes | `coding_index` | 60 |
 | reasoning | analyze, compare, evaluate, assess, critique, reason, prove, derive, tradeoff, implication, consequence, strategy, architect, design system, decision, justify, deduce, infer, mathematical, proof, logical | `intelligence_index` | 45 |
-| agentic | agent, tool use, tool call, multi-step, autonomous, execute command, run shell, file system, web search, browser, orchestrat, workflow, pipeline, subagent, delegate, parallel, fanout | `agentic_index` | 35 |
+| agentic | agent, tool use, tool call, multi-step, autonomous, execute command, run shell, file system, web search, browser, orchestrat, workflow, pipeline, subagent, delegate, parallel, fanout, run the tests, run the test suite, make the tests pass, verify the fix, iterate until, edit and run, fix and verify | `agentic_index` | 35 |
 | creative | write a story, write a blog, write an article, essay, creative, generate content, copywriting, headline, tagline, brand voice, narrative, storytelling, poem, screenplay, dialogue | `intelligence_index` | 45 |
 | simple | (no keyword hits) | `intelligence_index` | 0 (no floor) |
 
@@ -51,8 +60,11 @@ For each model in the alias table (`OSRC_MODEL_TABLE`), the advisory:
    agentic tasks, intelligence_index for everything else) and pricing (prompt + completion
    per token).
 3. Applies the task difficulty, requested effort, capability tier, and local outcome history to
-   the benchmark score. Capable models receive a value preference; Kimi K3 receives a hard-work
-   near-frontier adjustment; explicit frontier requirements outweigh those adjustments.
+   the benchmark score. Capable models receive a value preference; explicit frontier requirements
+   outweigh every adjustment. **Kimi K3's near-frontier adjustment (+20) is reasoning-shaped only:**
+   it applies to a `hard` task in the `reasoning` category, never to `code`/`agentic` work. Kimi's
+   edge is deep analysis; its long pure-reasoning bursts are the wrong shape for edit-run-verify,
+   where the old any-hard-task bump floated it to #1 (score 80) and cost two zero-write burns.
 4. Calculates the **value ratio** = score / max(cost_per_m_input, 0.01). Free models (cost=0)
    are floored to $0.01/M so they rank high but don't dominate infinitely.
 5. Subscription lanes (cx/cc/dv/gm) have their price set to $0 BEFORE the value ratio
@@ -65,6 +77,25 @@ The recommendation is the capable-tier model with the best value ratio among mod
 threshold. A frontier is selected when effort is `max` or the task explicitly requires frontier
 handling. If neither preferred cohort clears the threshold, selection falls back to the best
 qualifying subscription or paid candidate, then the highest score overall.
+
+**Variant preference (cheaper capable variant within a family).** Devin ships families as
+effort/size variants (`glm-5-3-high`, `glm-5-3-flash-high`, `deepseek-v4-pro-max`). When two
+variants of ONE family both clear the threshold, the lighter one is recommended: a light member
+(`flash`/`lightning`/`mini`/`lite`) always beats a full-size one, and within that the effort rung
+closest to the requested `--effort` wins (so at `--effort high`, `glm-5.3-flash-high` beats
+`glm-5.3-high`, and beats bare `glm-5.3-flash`). Heavier siblings stay listed as
+`OK (lighter sibling preferred)` and, in `--json`, carry `lighter_sibling_preferred: true` and
+leave the shortlist's top group. This is a shape rule, never a price (prices rot); on plan lanes
+the cost column is a flat "plan limits", so this weight is also the tiebreak between candidates
+with identical value ratios (proxy scores tie constantly), replacing the old table-order
+accident. Off at `--effort max`, when the task requires the frontier, or with
+`OSRC_ADVISE_VARIANT_PREF=0`.
+
+Devin's GLM-5.3 family is in the table with Devin's real ids: `glm-5.3`/`glm-5-3` -> `glm-5-3`,
+`glm-5.3-high` -> `glm-5-3-high`, `glm-5.3-flash` -> `glm-5-3-flash`, `glm-5.3-flash-high` ->
+`glm-5-3-flash-high` (all `dv`, capable). Their benchmark mapping points at `z-ai/glm-5.3` /
+`z-ai/glm-5.3-flash`; until OpenRouter lists them they score via the tier proxy like kimi/swe, and
+`advise --refresh` picks up real scores the day they appear.
 
 ### 4. Graceful degradation
 
@@ -159,3 +190,7 @@ the cheapest option. Use `estimate` when you already know the model and want a c
 - **Subscription lane cost is qualitative**: subscription models (cx/cc/dv/gm) show "$0 (plan)"
   because the user pays plan limits, not per-token. The value ratio treats them as free, which
   is correct for the user's wallet but doesn't account for plan-limit exhaustion.
+- **Tier proxy is calibrated on `intelligence_index`**: an unbenchmarked `capable` model scores a
+  proxy of 50, which exceeds a benchmarked capable model's REAL `agentic_index` (glm-5.2: 43.1).
+  On agentic tasks, unbenchmarked capable models therefore outrank benchmarked ones. A field-aware
+  proxy is the fix; until then, `advise --refresh` (more live rows) narrows the gap.

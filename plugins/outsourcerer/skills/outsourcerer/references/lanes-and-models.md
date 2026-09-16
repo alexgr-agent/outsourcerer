@@ -28,6 +28,10 @@ ChatGPT / Claude subscription auth, so they are premium and are **never** auto-e
 | `deepseek` | `deepseek/deepseek-v4-pro` | OpenRouter | **capable** | strongest cheap lane, pro reasoning flagship |
 | any other OpenRouter id | itself | OpenRouter | by cached price, then name | see tiers below |
 | `glm-5.2` under `--provider devin` | Devin's id | devin | table/name | Devin path unchanged |
+| `glm-5.3` / `glm-5-3` | `glm-5-3` (Devin family; effort rungs `-low/-high/-max`) | devin | **capable** | GLM-5.3 full-size; plan-included |
+| `glm-5.3-high` | `glm-5-3-high` | devin | **capable** | GLM-5.3 at the high rung |
+| `glm-5.3-flash` | `glm-5-3-flash` (Devin family; rungs `-low/-high/-max`) | devin | **capable** | lighter GLM-5.3; `advise` prefers this family over full-size 5.3 below `--effort max` |
+| `glm-5.3-flash-high` | `glm-5-3-flash-high` | devin | **capable** | the cheaper capable variant `advise` recommends for agentic/edit work at `--effort high` |
 | `swe` / `swe-1.7` | `swe-1.7` | devin | **capable** | Devin's own SWE agent model (open-weight/free-lane class) |
 | `swe-1.7-lightning` | itself | devin | mid | faster/cheaper SWE variant |
 | `kimi` | `kimi-k3` | devin / droid / warp | **capable** | near-frontier hard-work lane; provider-specific dispatch resolves the accepted K3 id |
@@ -284,7 +288,10 @@ The free/cheap lane on Devin **shifts frequently**. To see what is selectable *r
 ```
 
 Recommendation rules:
-- Default to **`glm-5.2`** unless the user asks otherwise (it currently does not draw the user's Devin usage limits).
+- Default to **`glm-5.2`** unless the user asks otherwise. It is **plan-included** on Devin: it does
+  not spend the paid ACU balance, but on Pro it DOES draw on the shared **daily plan quota** (see the
+  note below). For agentic/edit work `advise` now prefers **`glm-5.3-flash-high`** (lighter, same
+  capability class) when it is available.
 - **Cheap ≠ dumb.** `glm-5.2`/`hy3`/`deepseek-v4-pro` are the **`capable`** tier: frontier capability
   at budget price (~Opus-4.8 class). They are valid for high-stakes reasoning, security review, and
   deep judgment, not just grunt work. See `effort-and-tiers.md`. Pair them with `--effort high`/`max`
@@ -303,4 +310,17 @@ Recommendation rules:
 
 ## Notes
 
-- GLM and other open-weight models currently do **not** noticeably draw the user's Devin hourly limits; this is the reason GLM is the default. This can change, see the model cost note.
+- **Devin has TWO pools, and the plan-included models are NOT free of limits.** The paid **ACU
+  balance** (what "0% remaining / 402 / payment required" refers to) does not gate a plan-included
+  model (`glm*`, `swe*`, `kimi*`, `deepseek*` on Devin): a paid-balance refusal against one of them
+  is a Devin-side mis-gate. But the **plan-included daily/weekly quota** is real, shared, and
+  exhaustible: on Pro, every plan-included model draws on ONE daily bucket, and when Devin says
+  "Your daily usage quota has been exhausted … resets in 11h26m" ALL of them are blocked at once
+  until that reset. Outsourcerer reads that refusal (`_devin_plan_quota_exhausted`), takes the whole
+  `dv` lane down for Devin's stated window (a labeled estimate, default 1h via
+  `OSRC_DEVIN_PLAN_DOWN_TTL`, when Devin gives no parseable reset), and points OFF Devin (OpenRouter
+  via `--provider cc -m glm|deepseek`, or a native lane), never at another Devin plan model. The
+  current devin CLI exposes no quota read; the live figure is at https://app.devin.ai/settings/usage.
+  `brief`/`status` show a proactive meter, "N Devin plan jobs today", with a WARN past
+  `OSRC_DEVIN_PLAN_JOBS_WARN` (default 8): routing advice only, never a block. The older claim that
+  GLM does not draw Devin limits described the ACU pool only; do not read it as "unlimited".

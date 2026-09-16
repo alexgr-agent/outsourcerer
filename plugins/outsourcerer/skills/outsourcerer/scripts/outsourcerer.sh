@@ -147,7 +147,7 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 # Version identifier. Single source of truth; bump the rightmost
 # number for patch releases. `doctor` and `--version` both read this.
-OSRC_VERSION="0.12.2"
+OSRC_VERSION="0.12.3"
 DEFAULT_MODEL="${OUTSOURCERER_MODEL:-glm-5.2}"
 
 # ---- platform detection (mac | linux | windows-gitbash). Windows = Git Bash / MSYS2, NO WSL
@@ -487,6 +487,11 @@ deepseek|deepseek/deepseek-v4-pro|or|capable
 deepseek/deepseek-v4-pro|deepseek/deepseek-v4-pro|or|capable
 glm-5.2|glm-5.2|dv|capable
 glm-5-2|glm-5.2|dv|capable
+glm-5.3|glm-5-3|dv|capable
+glm-5-3|glm-5-3|dv|capable
+glm-5.3-high|glm-5-3-high|dv|capable
+glm-5.3-flash|glm-5-3-flash|dv|capable
+glm-5.3-flash-high|glm-5-3-flash-high|dv|capable
 swe|swe-1.7|dv|capable
 swe-1.7|swe-1.7|dv|capable
 swe-1-7|swe-1.7|dv|capable
@@ -846,6 +851,9 @@ parse_model() {
 _devin_model_for() {
   case "$1" in
     glm|z-ai/glm-5.2|glm-5.2|glm-5-2) printf 'glm-5.2' ;;
+    glm-5.3|glm-5-3|z-ai/glm-5.3) printf 'glm-5-3' ;;
+    glm-5.3-flash|glm-5-3-flash|z-ai/glm-5.3-flash) printf 'glm-5-3-flash' ;;
+    glm-5.3-*) printf 'glm-5-3-%s' "${1#glm-5.3-}" ;;   # glm-5.3-high / glm-5.3-flash-high -> Devin's dashed variant uid
     swe|swe-1.7|swe-1-7) printf 'swe-1.7' ;;
     deepseek|deepseek/deepseek-v4-pro|deepseek-v4-pro) printf 'deepseek-v4-pro-%s' "$(_deepseek_effort_suffix)" ;;
     kimi|kimi-k3) printf 'kimi-k3' ;;
@@ -949,7 +957,7 @@ _devin_resolve_dynamic() {
 # free-tier models must run regardless of the paid-quota display.
 _devin_is_free_model() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-    glm|glm-5.2|glm-5-2|z-ai/glm-5.2|swe|swe-1.7|swe-1-7|swe-1.7-lightning|deepseek|deepseek-v4-pro|deepseek/deepseek-v4-pro|kimi|kimi-k3) return 0 ;;
+    glm|glm-5.2|glm-5-2|z-ai/glm-5.2|glm-5.3*|glm-5-3*|z-ai/glm-5.3*|swe|swe-1.7|swe-1-7|swe-1.7-lightning|deepseek|deepseek-v4-pro|deepseek/deepseek-v4-pro|kimi|kimi-k3) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -987,6 +995,153 @@ _devin_quota_refusal_line() {
   local esc; esc="$(printf '\033')"   # strip ANSI (F3) so the surfaced wording is clean to copy into the regex
   grep -iE "$_DEVIN_QUOTA_RE" "$f" 2>/dev/null | head -1 | tr -d '\r' \
     | sed -E "s/${esc}\\[[0-9;]*[A-Za-z]//g; s/^[[:space:]]+//" | cut -c1-200
+}
+
+# Devin has TWO pools and _DEVIN_QUOTA_RE models only one: the PAID ACU balance. The other is the
+# PLAN-INCLUDED daily/weekly quota. On Pro, glm/swe/kimi all draw on ONE exhaustible daily bucket, and
+# when it is spent Devin refuses with "Your daily usage quota has been exhausted" (plus a "resets in/at
+# ..." phrase and the app.devin.ai/settings/usage URL). That refusal is a REAL block of every
+# plan-included model at once, not a mis-gate. Kept separate from _DEVIN_QUOTA_RE so the free-tier
+# failure branch can tell "shared daily bucket spent" from "paid balance cited against a free model"
+# and print the honest message for each. Context-anchored like its sibling: the daily/weekly qualifier
+# must sit beside the quota noun, followed by a spent verb or a reset phrase; a bare "quota exhausted"
+# stays the ACU family's business. Only ever consulted after a Devin run already FAILED (rc != 0).
+# Gap after the quota noun is tight ({0,16}) on purpose: real Devin wording puts the verb right on the
+# noun ("quota has been exhausted", "quota reached"), so a wide window only invited false matches like
+# "daily quota is fine, but the disk exhausted". A verbose refusal is still caught by the
+# second branch below (it carries the "resets in/at" phrase Devin always prints on a real exhaustion).
+_DEVIN_PLAN_QUOTA_RE='(daily|weekly)[[:space:]]+((usage|plan)[[:space:]]+)?(quota|limit|allowance)([[:space:]]+(has[[:space:]]+been|is|was))?[^.]{0,16}(exhausted|reached|depleted|exceeded|used)|(daily|weekly)[[:space:]]+((usage|plan)[[:space:]]+)?(quota|limit|allowance)[^.]{0,80}resets?[[:space:]]+(in|at)[[:space:]]'
+# _devin_plan_quota_exhausted <errfile> -> rc0 if the captured Devin stderr says the shared DAILY/WEEKLY
+# plan quota is spent (blocks glm/swe/kimi together). Check this BEFORE _devin_quota_refusal: the daily
+# wording also trips the ACU family ("quota ... exhausted"), and the ACU verdict would be the wrong one.
+_devin_plan_quota_exhausted() {
+  local f="${1:-}"; [ -n "$f" ] && [ -s "$f" ] || return 1
+  grep -qiE "$_DEVIN_PLAN_QUOTA_RE" "$f" 2>/dev/null
+}
+# _devin_plan_quota_line <errfile> -> Devin's first matching line, ANSI-stripped and trimmed (same
+# self-resolving-telemetry role as _devin_quota_refusal_line: the real wording tightens the regex).
+_devin_plan_quota_line() {
+  local f="${1:-}"; [ -n "$f" ] && [ -s "$f" ] || return 0
+  local esc; esc="$(printf '\033')"
+  grep -iE "$_DEVIN_PLAN_QUOTA_RE" "$f" 2>/dev/null | head -1 | tr -d '\r' \
+    | sed -E "s/${esc}\\[[0-9;]*[A-Za-z]//g; s/^[[:space:]]+//" | cut -c1-200
+}
+# _devin_plan_quota_reset_phrase <errfile> -> Devin's own "resets in 11h26m" / "resets at 09:00 UTC"
+# fragment (<=50 chars after the verb), or empty when the refusal carried none. TEXT ONLY: it feeds the
+# user message, never a timer. Parsing it into the lane-down TTL belongs to the pre-flight/reset work.
+_devin_plan_quota_reset_phrase() {
+  local f="${1:-}"; [ -n "$f" ] && [ -s "$f" ] || return 0
+  local esc; esc="$(printf '\033')"
+  tr -d '\r' < "$f" 2>/dev/null | sed -E "s/${esc}\\[[0-9;]*[A-Za-z]//g" \
+    | grep -oiE 'resets?[[:space:]]+(in|at)[[:space:]]+[^.,;)]{1,50}' | head -1 | sed -E 's/[[:space:]]+$//'
+}
+# _devin_plan_quota_reset_secs <phrase> -> seconds until the reset Devin STATED, or empty when the phrase
+# is not parseable. Devin's reset is not machine-readable from the CLI, so this is the one place a real
+# reset time can come from, and it must never be guessed: unparseable -> empty -> the caller labels its
+# fallback an estimate. Two shapes:
+#   DURATION  "resets in 11h26m" / "in 2 hours 5 minutes" / "in 45 min" / "in 3 days" / "in 11:26:00"
+#   CLOCK     "resets at 09:00 UTC" / "at 2026-09-22 00:00 UTC" / "at 5:30 pm"
+# A clock with no date is the NEXT occurrence (today if still ahead, else tomorrow), read as UTC when the
+# phrase says UTC/GMT/Z and as local time otherwise. The absolute-date form tries BSD `date -j -f` then
+# GNU `date -d`. Anything outside (0, 8 days] is treated as unparseable so a mangled banner can never
+# pin a lane down for a month.
+_devin_plan_quota_reset_secs() {
+  local p; p="$(printf '%s' "${1:-}" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+  [ -n "$p" ] || return 0
+  local now secs=""; now="$(date +%s)"
+  case "$p" in
+    *"reset in "*|*"resets in "*|*"resetting in "*)
+      local body="${p#*in }" total=0 hit=0 n u
+      if printf '%s' "$body" | grep -qE '^[[:space:]]*[0-9]{1,3}:[0-9]{2}(:[0-9]{2})?([^0-9:]|$)'; then
+        local c h rest m s=0; c="$(printf '%s' "$body" | grep -oE '[0-9]{1,3}:[0-9]{2}(:[0-9]{2})?' | head -1)"
+        h="${c%%:*}"; rest="${c#*:}"; m="${rest%%:*}"; case "$rest" in *:*) s="${rest#*:}" ;; esac
+        total=$(( 10#$h*3600 + 10#$m*60 + 10#$s )); hit=1
+      else
+        while read -r n u; do
+          [ -n "$n" ] && [ -n "$u" ] || continue
+          case "$u" in
+            d|day|days)                total=$(( total + 10#$n*86400 )); hit=1 ;;
+            h|hr|hrs|hour|hours)       total=$(( total + 10#$n*3600 ));  hit=1 ;;
+            m|min|mins|minute|minutes) total=$(( total + 10#$n*60 ));    hit=1 ;;
+            s|sec|secs|second|seconds) total=$(( total + 10#$n ));       hit=1 ;;
+          esac
+        # Tokenize as <number><unit-word> pairs with NO trailing boundary in the match: a `-o` grep
+        # that also matched the next char would eat the first digit of "26m" in "11h26m" (-> "6m").
+        # Unknown unit words fall through the case above and are ignored.
+        done < <(printf '%s' "$body" | grep -oE '[0-9]+[[:space:]]*[a-z]+' \
+                   | sed -E 's/^([0-9]+)[[:space:]]*([a-z]+)$/\1 \2/')
+      fi
+      [ "$hit" = "1" ] && secs="$total" ;;
+    *"reset at "*|*"resets at "*|*"resetting at "*)
+      local body="${p#*at }" utc=0 target=""
+      case "$body" in *utc*|*gmt*|*[0-9]z*) utc=1 ;; esac
+      if printf '%s' "$body" | grep -qE '[0-9]{4}-[0-9]{2}-[0-9]{2}[ t][0-9]{2}:[0-9]{2}'; then
+        local dt; dt="$(printf '%s' "$body" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}[ t][0-9]{2}:[0-9]{2}' | head -1 | tr 't' ' ')"
+        if [ "$utc" = "1" ]; then
+          target="$(date -u -j -f '%Y-%m-%d %H:%M' "$dt" +%s 2>/dev/null || date -u -d "$dt" +%s 2>/dev/null)" || target=""
+        else
+          target="$(date -j -f '%Y-%m-%d %H:%M' "$dt" +%s 2>/dev/null || date -d "$dt" +%s 2>/dev/null)" || target=""
+        fi
+      elif printf '%s' "$body" | grep -qE '(^|[^0-9:])[0-9]{1,2}:[0-9]{2}([^0-9:]|$)'; then
+        local c h m ds; c="$(printf '%s' "$body" | grep -oE '(^|[^0-9:])[0-9]{1,2}:[0-9]{2}' | head -1 | grep -oE '[0-9]{1,2}:[0-9]{2}')"
+        h="${c%%:*}"; m="${c#*:}"
+        case "$body" in
+          *pm*) [ "$((10#$h))" -lt 12 ] && h=$(( 10#$h + 12 )) ;;
+          *am*) [ "$((10#$h))" -eq 12 ] && h=0 ;;
+        esac
+        if [ "$utc" = "1" ]; then ds="$(_quota_day_start utc)"; else ds="$(_quota_day_start local)"; fi
+        target=$(( ds + 10#$h*3600 + 10#$m*60 ))
+        [ "$target" -le "$now" ] && target=$(( target + 86400 ))
+      fi
+      case "$target" in ''|*[!0-9]*) ;; *) secs=$(( target - now )) ;; esac ;;
+  esac
+  case "$secs" in ''|*[!0-9-]*) return 0 ;; esac
+  [ "$secs" -gt 0 ] && [ "$secs" -le $(( 8*86400 )) ] || return 0
+  printf '%s' "$secs"
+}
+# _devin_plan_quota_block <errfile> <model> <scope-clause> <switch-lanes-advice>
+# The one honest response to a spent plan bucket, shared by the free-tier and paid failure branches:
+#   1. say the SHARED daily/weekly quota is exhausted (period read from Devin's own line), with Devin's
+#      stated reset when it gave one, else the dashboard URL (the current devin CLI has no quota read);
+#   2. surface Devin's exact wording (telemetry for tightening the detector);
+#   3. take the WHOLE dv lane down (the bucket is shared, so this is lane-scoped, not model-scoped) so
+#      the dispatch gate + fallback shortlist stop feeding it. The TTL is Devin's OWN stated reset when
+#      the refusal carried a parseable one (+60s of slack so the lane comes back after, not before, the
+#      bucket refills), never a hardcoded clock. Only when Devin gave nothing parseable does it fall back
+#      to a conservative ESTIMATE (OSRC_DEVIN_PLAN_DOWN_TTL, default 3600s) and SAYS so: long enough to
+#      stop the bleed, short enough that a wrong guess self-heals; `posture reset` clears early. The
+#      reason is recorded beside the marker so brief/status and the gate can name it;
+#   4. reconcile a declared daily cap with reality (no-op unless a cap is declared, same as the ACU path).
+# The advice it prints is the caller's, and it must point OFF Devin: another Devin plan model would just
+# fail on the same empty bucket.
+_devin_plan_quota_block() {
+  local f="${1:-}" model="${2:-}" scope="${3:-}" advice="${4:-}"
+  local _pq_line _pq_reset _pq_secs="" _pq_period="DAILY" _pq_ttl="${OSRC_DEVIN_PLAN_DOWN_TTL:-3600}"
+  case "$_pq_ttl" in ''|*[!0-9]*) _pq_ttl=3600 ;; esac
+  _pq_line="$(_devin_plan_quota_line "$f")"
+  printf '%s' "$_pq_line" | grep -qi 'weekly' && _pq_period="WEEKLY"
+  _pq_reset="$(_devin_plan_quota_reset_phrase "$f")"
+  [ -n "$_pq_reset" ] && _pq_secs="$(_devin_plan_quota_reset_secs "$_pq_reset")"
+  if [ -n "$_pq_secs" ]; then
+    # Devin stated a parseable reset: that IS the lane-down window (plus slack), and the message says
+    # Devin's words plus the local clock time they resolve to. No estimate language.
+    _pq_ttl=$(( _pq_secs + 60 ))
+    _pq_reset="Devin says it $_pq_reset (that is $(_epoch_local $(( $(date +%s) + _pq_secs )) ) local)."
+  elif [ -n "$_pq_reset" ]; then
+    _pq_reset="Devin says it $_pq_reset — I could not parse that into a time, so the lane-down window below is an estimate; the live figure is at https://app.devin.ai/settings/usage."
+  else
+    _pq_reset="Devin gave no reset time in this refusal; the live figure is at https://app.devin.ai/settings/usage."
+  fi
+  printf '>>> [devin plan quota] Devin'\''s shared %s plan quota is exhausted — this blocks ALL plan-included models (glm/swe/kimi), %s. %s %s\n' "$_pq_period" "$scope" "$_pq_reset" "$advice" >&2
+  [ -n "$_pq_line" ] && printf '>>> [devin plan quota] Devin'\''s exact wording (for tightening this detector): %s\n' "$_pq_line" >&2
+  _lane_down_mark dv "$_pq_ttl" "plan quota exhausted" || true
+  if [ -n "$_pq_secs" ]; then
+    printf '>>> [devin plan quota] dv lane marked DOWN for %s, until Devin'\''s stated reset (clear early with: %s posture reset). Dispatch + fallback skip Devin until then.\n' "$(_fmt_secs_human "$_pq_ttl")" "$0" >&2
+  else
+    printf '>>> [devin plan quota] dv lane marked DOWN for ~%s (an ESTIMATE: no parseable reset, and the devin CLI exposes none; override OSRC_DEVIN_PLAN_DOWN_TTL, clear early with: %s posture reset). Dispatch + fallback skip Devin until then.\n' "$(_fmt_secs_human "$_pq_ttl")" "$0" >&2
+  fi
+  _quota_note_refusal dv "$model" 2>/dev/null || true
+  return 0
 }
 
 # POST-HOC (classify) prose gate for the two regexes above. _DEVIN_QUOTA_RE treats a BARE 402/429
@@ -1641,6 +1796,16 @@ delegate() {
   # and does not gate a free-tier model. Say so up front so a "0%" line is never misread as a block.
   local _dv_free=0; _devin_is_free_model "$MODEL" && _dv_free=1
   [ "$_dv_free" = "1" ] && printf '>>> [free-tier] "%s" runs on Devin'\''s plan-included tier — a paid ACU / "0%% remaining" figure in Devin'\''s output is a separate balance and does NOT gate it.\n' "$MODEL" >&2
+  # Proactive plan meter at the dispatch site: past the soft threshold, say (once per dispatch) that the
+  # shared daily bucket is being drained hard. Routing advice only — a user-driven job is never blocked
+  # here; the enforceable gate is the lane-down marker the FIRST real exhaustion writes.
+  if [ "$_dv_free" = "1" ]; then
+    local _dv_n _dv_warn="${OSRC_DEVIN_PLAN_JOBS_WARN:-8}"; case "$_dv_warn" in ''|*[!0-9]*) _dv_warn=8 ;; esac
+    _dv_n="$(_devin_plan_jobs_today)"
+    if [ "$_dv_warn" -gt 0 ] && [ "$_dv_n" -ge "$_dv_warn" ]; then
+      printf '>>> [devin plan meter] WARN: %s Devin plan jobs already today (threshold OSRC_DEVIN_PLAN_JOBS_WARN=%s) — glm/swe/kimi/deepseek share ONE daily bucket that resets on Devin'\''s clock, not ours. Consider routing grind to OpenRouter (--provider cc -m glm|deepseek), a native lane, or local. Not blocking this run.\n' "$_dv_n" "$_dv_warn" >&2
+    fi
+  fi
   # --respect-workspace-trust false: headless delegation must not die on Devin's untrusted-workspace
   # prompt (a blocking prompt no `-p` run can answer -> the job fails with "Refusing to run in an
   # untrusted workspace"). The interactive `session` lane already passes this for the same reason;
@@ -1699,19 +1864,41 @@ delegate() {
     else
       _fallback="It is Devin-only (no OpenRouter sibling), so switch lanes."
     fi
-    if [ -n "$_dverr" ] && _devin_quota_refusal "$_dverr"; then
-      printf '>>> [free-tier BLOCKED-IN-ERROR] Devin refused free-tier "%s" citing a paid ACU/quota/billing limit — that balance does NOT gate a plan-included model, so this is a Devin-side mis-gate, not a real limit here. %s Check Devin'\''s own plan with: devin usage.\n' "$MODEL" "$_fallback" >&2
+    if [ -n "$_dverr" ] && _devin_plan_quota_exhausted "$_dverr"; then
+      # The SHARED plan bucket is spent — a real block, not a mis-gate. The "same model on
+      # OpenRouter" fallback is the right OFF-Devin hop for glm/deepseek; SWE/Kimi are Devin-only,
+      # so name the OpenRouter grind lane + native lanes instead. Never another Devin plan model.
+      local _pq_off
+      if [ -n "$_or_alias" ]; then
+        _pq_off="Switch lanes OFF Devin: the same model runs on OpenRouter — --provider cc -m $_or_alias (funded/cash lane) — or use a native lane (Claude Code / Codex / Gemini) for judgment work."
+      else
+        _pq_off="Switch lanes OFF Devin: \"$MODEL\" is Devin-only, so route grind to OpenRouter (--provider cc -m glm | -m deepseek) or a native lane (Claude Code / Codex / Gemini) for judgment work."
+      fi
+      _devin_plan_quota_block "$_dverr" "$MODEL" "not just \"$MODEL\"" "$_pq_off"
+    elif [ -n "$_dverr" ] && _devin_quota_refusal "$_dverr"; then
+      # NOT the plan bucket: a PAID ACU/billing signature cited against a plan-included model. That
+      # message is correct only here — a paid balance genuinely does not gate a free model.
+      printf '>>> [free-tier BLOCKED-IN-ERROR] Devin refused free-tier "%s" citing a paid ACU/quota/billing limit — that balance does NOT gate a plan-included model, so this is a Devin-side mis-gate, not a real limit here. %s Check Devin'\''s plan usage at https://app.devin.ai/settings/usage.\n' "$MODEL" "$_fallback" >&2
       local _qline; _qline="$(_devin_quota_refusal_line "$_dverr")"
       [ -n "$_qline" ] && printf '>>> [free-tier] Devin'\''s exact wording (for tightening this detector): %s\n' "$_qline" >&2
     elif [ -z "$_dverr" ]; then
-      printf '>>> [free-tier] if that was a plan/quota refusal, note "%s" is free-tier and should not be gated by a paid balance. %s Check Devin'\''s own plan with: devin usage.\n' "$MODEL" "$_fallback" >&2
+      printf '>>> [free-tier] if that was a plan/quota refusal, note "%s" is free-tier and should not be gated by a paid balance — unless Devin said the DAILY/WEEKLY plan quota is exhausted, which is a real block of every plan-included model. %s Check Devin'\''s plan usage at https://app.devin.ai/settings/usage.\n' "$MODEL" "$_fallback" >&2
     fi
   fi
-  if [ "$rc" -ne 0 ] && [ "$_dv_free" = "0" ] && [ -n "$_dverr" ] && _devin_quota_refusal "$_dverr"; then
-    printf '>>> [devin quota] paid Devin models exhausted; free tier (glm-5-2, swe-1-7) still available. Retry on one of those plan-included models.\n' >&2
-    # Reconcile a declared daily cap with reality: a real refusal means this model is spent until the
-    # next reset, even if our ledger count hasn't reached the cap. No-op unless a cap is declared.
-    _quota_note_refusal dv "$MODEL" 2>/dev/null || true
+  if [ "$rc" -ne 0 ] && [ "$_dv_free" = "0" ] && [ -n "$_dverr" ]; then
+    if _devin_plan_quota_exhausted "$_dverr"; then
+      # Gate on WHICH signature matched. A daily/weekly-plan exhaustion means the plan-included models
+      # are spent too (same bucket), so "free tier still available" would send the user straight back
+      # into the empty quota. Say so, take the lane down, and point OFF Devin.
+      _devin_plan_quota_block "$_dverr" "$MODEL" "including the free-tier ones you would otherwise fall back to, so do NOT retry them" \
+        "Switch lanes OFF Devin: OpenRouter (--provider cc -m glm | -m deepseek) for grind, or a native lane (Claude Code / Codex / Gemini) for judgment work."
+    elif _devin_quota_refusal "$_dverr"; then
+      # A pure ACU/paid block: the free-tier-still-available line IS valid here (separate pool).
+      printf '>>> [devin quota] paid Devin models exhausted; free tier (glm-5-2, swe-1-7) still available. Retry on one of those plan-included models.\n' >&2
+      # Reconcile a declared daily cap with reality: a real refusal means this model is spent until the
+      # next reset, even if our ledger count hasn't reached the cap. No-op unless a cap is declared.
+      _quota_note_refusal dv "$MODEL" 2>/dev/null || true
+    fi
   fi
   [ -n "$_dverr" ] && rm -f "$_dverr" 2>/dev/null
   # record a foreground ledger row for the Devin lane (plan lane -> $0 cash, lane=dv). The bg
@@ -3629,6 +3816,54 @@ _quota_used_today() {  # <lanekey> <model> <reset> -> integer count (0 if none /
          ] | length' "$OSRC_LEDGER" 2>/dev/null)"
   case "$n" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$n" ;; esac
 }
+# ---- DEVIN PLAN METER (proactive, no quota API) --------------------------------------------------
+# The current devin CLI cannot report plan usage, so the only pre-flight signal we own is our own
+# dispatch count. Derived from ledger.jsonl like _quota_used_today (no parallel counter): dv-lane rows
+# since the UTC day start, countable verbs, summed over the PLAN-INCLUDED models only (glm/swe/kimi/
+# deepseek share ONE daily bucket; a paid model on Devin draws ACU, not that bucket). The model set is
+# the canonical _devin_is_free_model predicate applied in bash to jq's per-model tally, so the list
+# cannot drift. The window is the UTC quota DAY rather than a "session": ledger rows carry no session
+# key, and the daily bucket is what this meter exists to protect.
+_devin_plan_jobs_today() {  # -> integer (0 if no ledger / no jq)
+  [ -f "$OSRC_LEDGER" ] || { printf 0; return; }
+  have jq || { printf 0; return; }
+  local start today total=0 m n; start="$(_quota_day_start utc)"; today="$(date +%Y-%m-%d)"
+  while IFS=$'\t' read -r m n; do
+    [ -n "$m" ] || continue
+    _devin_is_free_model "$m" || continue
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    total=$(( total + n ))
+  done < <(jq -Rrn --argjson start "$start" --arg today "$today" --arg noncount "$OSRC_QUOTA_NONCOUNT_VERBS" '
+       ($noncount | split(" ")) as $nc
+       | [ inputs | fromjson? // empty
+           | objects
+           | select( (((.lane // .provider) // "") | tostring) as $l | ($l == "dv" or $l == "devin") )
+           | select((.verb // "") as $v | ($nc | index($v)) | not)
+           | select( ((.epoch | numbers) // null) as $e
+                     | if $e != null then ($e >= $start) else ((.ts // "") | startswith($today)) end )
+           | ((.model // "") | tostring) ]
+       | group_by(.) | map("\(.[0])\t\(length)") | .[]' "$OSRC_LEDGER" 2>/dev/null)
+  printf '%s' "$total"
+}
+# _devin_plan_meter_line [quiet] -> the meter for brief/status. `quiet` prints nothing when the count
+# is 0 and the lane is up (status stays terse for non-Devin users). Past OSRC_DEVIN_PLAN_JOBS_WARN
+# (default 8; 0 disables) it adds a one-line WARN. Routing advice only: nothing here blocks a job.
+_devin_plan_meter_line() {
+  local n warn="${OSRC_DEVIN_PLAN_JOBS_WARN:-8}" down=0 line
+  case "$warn" in ''|*[!0-9]*) warn=8 ;; esac
+  n="$(_devin_plan_jobs_today)"
+  _lane_down_active dv && down=1
+  [ "${1:-}" = "quiet" ] && [ "$n" = "0" ] && [ "$down" = "0" ] && return 0
+  line="devin plan  : $n Devin plan job$([ "$n" = "1" ] || printf s) today (UTC quota day; glm/swe/kimi/deepseek share ONE daily bucket)"
+  if [ "$down" = "1" ]; then
+    line="$line — dv lane DOWN ($(_lane_down_reason dv)) for another $(_lane_down_remaining dv); dispatch + fallback skip Devin until then. Live figure: https://app.devin.ai/settings/usage"
+  fi
+  printf '%s\n' "$line"
+  if [ "$warn" -gt 0 ] && [ "$n" -ge "$warn" ]; then
+    printf 'WARN        : heavy Devin-plan use today (%s jobs, threshold OSRC_DEVIN_PLAN_JOBS_WARN=%s) — every dispatch drains the shared daily bucket. Route mechanical/parallel grind to OpenRouter (--provider cc -m glm|deepseek), a native lane, or local. Routing advice only; nothing is blocked.\n' "$n" "$warn"
+  fi
+}
+
 # Exhausted-until marker (posture cache). A real quota refusal writes the next-reset epoch here; the
 # gate treats a future marker as authoritative "at cap" even when the derived count is under. Strict
 # direction only (posture contract): forces at-cap, never forces available. Expired markers self-purge.
@@ -3656,13 +3891,40 @@ _quota_marker_active() {  # <lanekey> <model> -> rc0 if an unexpired marker exis
 # down, not one model. Strict direction only (forces skip, never forces "up"), mirroring the quota
 # marker's posture contract; expired markers self-purge value-matched. TTL is short so a transient
 # outage heals on its own with no manual reset (override via OSRC_LANE_DOWN_TTL, default 300s).
-_lane_down_mark() {  # <lane-or-disp> [ttl-secs]
+# A third arg names WHY (e.g. "plan quota exhausted"); it lives beside the marker as `<lane>.down-reason`
+# so the gate refusal, brief and status can say what took the lane down and for how long, instead of
+# the generic "probe/transport verdict" + a fixed 300s that is wrong for a day-long quota window. No
+# reason -> any stale reason file is dropped so a later transport outage is never labeled a quota block.
+_lane_down_mark() {  # <lane-or-disp> [ttl-secs] [reason]
   local lane; lane="$(_quota_lane_key "$1")"
   [ -n "$lane" ] && [ "$lane" != "?" ] || return 0
   local ttl="${2:-${OSRC_LANE_DOWN_TTL:-300}}"
   case "$ttl" in ''|*[!0-9]*) ttl=300 ;; esac
   local until; until="$(( $(date +%s) + ttl ))"
+  if [ -n "${3:-}" ]; then _posture_set "$lane" "down-reason" "$3" 2>/dev/null || true
+  else rm -f "$OSRC_POSTURE_DIR/$lane.down-reason" 2>/dev/null; fi
   _posture_set "$lane" "down" "$until"
+}
+_lane_down_reason() {  # <lane-or-disp> -> the recorded reason, or the generic transport wording
+  local lane v; lane="$(_quota_lane_key "$1")"
+  v="$(_posture_get "$lane" "down-reason" 2>/dev/null)"
+  printf '%s' "${v:-recent probe/transport verdict}"
+}
+_lane_down_remaining() {  # <lane-or-disp> -> human time left on the down marker ("11h27m"), or the default TTL if unreadable
+  local lane v now; lane="$(_quota_lane_key "$1")"
+  v="$(_posture_get "$lane" "down" 2>/dev/null)"; now="$(date +%s)"
+  case "$v" in ''|*[!0-9]*) printf '~%ss' "${OSRC_LANE_DOWN_TTL:-300}"; return ;; esac
+  if [ "$v" -gt "$now" ]; then _fmt_secs_human $(( v - now )); else printf '0s'; fi
+}
+_fmt_secs_human() {  # <secs> -> 3d2h / 11h26m / 26m / 45s
+  local s="${1:-0}"; case "$s" in ''|*[!0-9]*) s=0 ;; esac
+  if   [ "$s" -ge 86400 ]; then printf '%sd%sh' $(( s/86400 )) $(( s%86400/3600 ))
+  elif [ "$s" -ge 3600 ];  then printf '%sh%02dm' $(( s/3600 )) $(( s%3600/60 ))
+  elif [ "$s" -ge 60 ];    then printf '%sm' $(( s/60 ))
+  else printf '%ss' "$s"; fi
+}
+_epoch_local() {  # <epoch> -> local "YYYY-MM-DD HH:MM" (BSD `date -r`, then GNU `date -d @`)
+  date -r "$1" +'%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" +'%Y-%m-%d %H:%M' 2>/dev/null || printf 'epoch %s' "$1"
 }
 _lane_down_active() {  # <lane-or-disp> -> rc0 if an unexpired down marker exists (self-purges)
   local lane; lane="$(_quota_lane_key "$1")"
@@ -3683,7 +3945,7 @@ _lane_down_active() {  # <lane-or-disp> -> rc0 if an unexpired down marker exist
 _lane_down_clear() {  # <lane-or-disp>
   local lane; lane="$(_quota_lane_key "$1")"
   [ -n "$lane" ] && [ "$lane" != "?" ] || return 0
-  rm -f "$OSRC_POSTURE_DIR/$lane.down" 2>/dev/null
+  rm -f "$OSRC_POSTURE_DIR/$lane.down" "$OSRC_POSTURE_DIR/$lane.down-reason" 2>/dev/null
 }
 
 # Mark <model> on <lane> exhausted until the next reset, from a REAL provider quota refusal. No-op
@@ -4876,6 +5138,7 @@ _fleet_classify() { # <raw-status> [age] [worked] [alive] [waiting-for] [session
       if [ "$age" -gt "$stall" ]; then printf 'unresponsive?'; else printf 'working'; fi ;;
     idle) printf 'idle' ;;
     running|launching|stalled\?|exploring\?) printf 'working' ;;
+    no-progress-writes) printf 'unresponsive?' ;;   # alive but write-free past OSRC_NOPROGRESS_SECS: needs a steer, surface it
     done|done?) printf 'completed' ;;
     blocked|permission-blocked) printf 'blocked' ;;
     failed|timeout|wedged|canceled|interrupted) printf 'dead' ;;
@@ -5742,7 +6005,7 @@ _heartbeat_active_work() {
       # start-time liveness; READ-ONLY so this hot-path scan never mutates job state as a side effect
       # (the flip happens under the normal status/result reconcile paths, not inside the heartbeat).
       status="$(OSRC_RECONCILE_READ_ONLY=1 _reconcile_status "$(basename "$jd")" 2>/dev/null || cat "$jd/status" 2>/dev/null || true)"
-      case "$status" in launching|running|exploring?|stalled?) return 0 ;; esac
+      case "$status" in launching|running|exploring?|stalled?|no-progress-writes) return 0 ;; esac
     done
   fi
   # Interactive `session start` sessions are not jobs — they live in the session registry, not
@@ -7490,6 +7753,9 @@ cmd_brief() {
   fi
   [ -z "$limits" ] && printf 'tip         : %s tap install  — one-time statusline tap; makes limit-awareness automatic (no token-optimizer needed)\n' "$0"
   _conserve_reco "$limits" "$lanes"
+  # Devin plan meter: the one pre-flight signal we own for the shared daily bucket (see the meter
+  # block). Full line whenever devin is installed; otherwise only when there is something to say.
+  if have devin; then _devin_plan_meter_line; else _devin_plan_meter_line quiet; fi
   if mode="$(_mode_read)"; then printf 'driving mode : %s — %s\n' "$mode" "$(_mode_meaning "$mode")"
   else printf -- '---\n'; _mode_menu; fi
   # Self-heal the Devin skills mirror. `brief` runs at session start on EVERY host, so this closes the
@@ -7526,6 +7792,10 @@ gpt-5.6-terra|openai/gpt-5.6-terra
 gpt-5.6-luna|openai/gpt-5.6-luna
 gpt-5.5|openai/gpt-5.5
 glm-5.2|z-ai/glm-5.2
+glm-5-3|z-ai/glm-5.3
+glm-5-3-high|z-ai/glm-5.3
+glm-5-3-flash|z-ai/glm-5.3-flash
+glm-5-3-flash-high|z-ai/glm-5.3-flash
 "
 # Symbolic Gemini family aliases map to the NEWEST google/gemini-<ver>-<family> slug in the cached
 # OpenRouter catalog, so a benchmark lookup for gemini-flash follows the release train instead of a
@@ -7543,7 +7813,7 @@ _gemini_bench_slug() {
 # Task classification keywords, pipe-separated phrases. Category with most hits wins; default: simple.
 _TASK_KW_CODE='function|class method|bug|fix|refactor|implement|compile|error|stack trace|debug|unit test|api endpoint|sql query|regex|algorithm|data structure|code review|pull request|merge conflict|lint|type error|import|module|package|deploy|ci/cd|docker|kubernetes'
 _TASK_KW_REASONING='analyze|compare|evaluate|assess|critique|reason|prove|derive|tradeoff|trade-off|implication|consequence|strategy|architect|design system|decision|justify|deduce|infer|formal|mathematical|proof|logical'
-_TASK_KW_AGENTIC='agent|tool use|tool call|multi-step|autonomous|execute command|run shell|file system|web search|browser|orchestrat|workflow|pipeline|subagent|delegate|parallel|fanout'
+_TASK_KW_AGENTIC='agent|tool use|tool call|multi-step|autonomous|execute command|run shell|file system|web search|browser|orchestrat|workflow|pipeline|subagent|delegate|parallel|fanout|run the tests|run the test suite|run tests|make the tests pass|verify the fix|iterate until|edit and run|fix and verify|then verify'
 _TASK_KW_CREATIVE='write a story|write a blog|write an article|essay|creative|generate content|copywriting|headline|tagline|brand voice|narrative|storytelling|poem|screenplay|dialogue'
 
 # Good-enough thresholds per category (benchmark index minimum).
@@ -7607,6 +7877,12 @@ _classify_task() {
   agentic="$(printf '%s' "$lc" | grep -oE "$_TASK_KW_AGENTIC" 2>/dev/null | wc -l | tr -d ' ')"
   creative="$(printf '%s' "$lc" | grep -oE "$_TASK_KW_CREATIVE" 2>/dev/null | wc -l | tr -d ' ')"
   code="${code:-0}"; reasoning="${reasoning:-0}"; agentic="${agentic:-0}"; creative="${creative:-0}"
+  # TASK-SHAPE FIT (blended rule): a prompt that carries BOTH code hits and at least two agentic hits
+  # ("edit X to fix the bug, run the test suite, verify") describes multi-step tool use — edit, run,
+  # observe, iterate — not one code operation. Under most-hits-wins it tied on code (fix/bug vs
+  # pipeline/run-the-tests) and code won the tie, so advise scored it on coding_index and let a
+  # reasoning-heavy model float to #1 for a job that is all about turning tools quickly. Agentic first.
+  if [ "$code" -ge 1 ] && [ "$agentic" -ge 2 ]; then printf 'agentic'; return; fi
   local best=simple best_n=0
   [ "$code" -gt "$best_n" ] && { best=code; best_n=$code; }
   [ "$reasoning" -gt "$best_n" ] && { best=reasoning; best_n=$reasoning; }
@@ -7750,16 +8026,52 @@ _frontier_needed() {
 # _score <base> <tier> <category> <effort> <difficulty> <model> -> selection score.
 # Capable models get a value preference, Kimi K3 gets a hard-work near-frontier adjustment, and an
 # explicit frontier requirement outweighs both. Benchmark and history remain the base evidence.
+# The Kimi adjustment is REASONING-SHAPED ONLY: it used to fire on every hard non-creative task, which
+# floated kimi to #1 (score 80) for an edit-run-verify job — where its long pure-reasoning bursts are
+# exactly the wrong shape (the 2026-09-15 incident: two ~17-min zero-write burns). Kimi's edge is deep
+# analysis; a hard reasoning task still lets it win, a hard code/agentic task does not.
 _score() {
   local base="$1" tier="$2" category="$3" effort="$4" difficulty="$5" model="$6"
   awk -v s="$base" -v t="$tier" -v c="$category" -v e="$effort" -v d="$difficulty" -v m="$model" '
     BEGIN {
       if (t == "capable") s += 8
       if (t == "capable" && (e == "high" || e == "xhigh")) s += 2
-      if (m == "kimi-k3" && d == "hard" && c != "creative") s += 20
+      if (m == "kimi-k3" && d == "hard" && c == "reasoning") s += 20
       if (e == "max" && t == "frontier") s += 30
       printf "%.4f", s
     }'
+}
+
+# ---- VARIANT PREFERENCE (cheaper capable variant within a family) ---------------------------------
+# Devin ships families as effort/size variants (glm-5-3-high, glm-5-3-flash-high, deepseek-v4-pro-max).
+# When two variants of ONE family both clear the task threshold, the lighter one is the better
+# recommendation unless the caller asked for max effort or the task requires the frontier: same
+# capability class, less quota draw. On plan lanes cost is a flat "plan limits", so value-ratio cannot
+# separate them; this weight is the tiebreaker that makes flash-high beat high. Never a price (prices
+# rot); a shape rule. OSRC_ADVISE_VARIANT_PREF=0 disables.
+# _variant_family <resolved-id> -> family key: provider prefix dropped, '.'->'-', size/effort suffixes
+# stripped repeatedly (glm-5-3-flash-high -> glm-5-3; glm-5.2 -> glm-5-2; deepseek-v4-pro-max -> deepseek-v4-pro).
+_variant_family() {
+  local id prev=""; id="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr '.' '-')"; id="${id##*/}"
+  while [ "$id" != "$prev" ]; do
+    prev="$id"
+    id="$(printf '%s' "$id" | sed -E 's/-(none|minimal|low|medium|high|xhigh|max|1m|flash|lightning|mini|lite|turbo)$//')"
+  done
+  printf '%s' "$id"
+}
+# _variant_weight <resolved-id> <effort> -> smaller = preferred. Two parts: a LIGHT family member
+# (flash/lightning/mini/lite) scores 0, a full-size one 10, so light always beats full-size; plus the
+# distance between the variant's effort rung and the REQUESTED effort (none/low=0, medium=1, high=2,
+# xhigh/max=3; an un-rung family id counts as distance 1), so at --effort high the -high rung of the
+# light member wins over its bare id and over every full-size rung.
+_variant_weight() {
+  local id w=10 rung=-1 target=2 d; id="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr '.' '-')"; id="${id##*/}"
+  case "$id" in *-flash|*-flash-*|*-lightning|*-lightning-*|*-mini|*-mini-*|*-lite|*-lite-*) w=0 ;; esac
+  id="${id%-1m}"
+  case "$id" in *-none|*-minimal|*-low) rung=0 ;; *-medium) rung=1 ;; *-high) rung=2 ;; *-xhigh|*-max) rung=3 ;; esac
+  case "${2:-}" in minimal|low|none) target=0 ;; medium) target=1 ;; high) target=2 ;; xhigh|max) target=3 ;; esac
+  if [ "$rung" -lt 0 ]; then d=1; else d=$(( rung - target )); [ "$d" -lt 0 ] && d=$(( -d )); fi
+  printf '%s' $(( w + d ))
 }
 
 # _lane_conserve_mult <lane> <limits-line> -> a score multiplier in [0.90,1.00] that GENTLY deprioritizes
@@ -8150,32 +8462,68 @@ cmd_advise() {
     awk -v s="$score" -v t="$threshold" 'BEGIN{exit (s+0 >= t+0) ? 0 : 1}' && meets=1
     # Display label for subscription lanes.
     if _lane_flag "$lane" plan_limited || case "$lane" in dv) true ;; *) false ;; esac; then cost_per_m="plan limits"; fi
-    results="$results$alias|$resolved|$lane|$tier|$score|$cost_per_m|$value_ratio|$meets
+    results="$results$alias|$resolved|$lane|$tier|$score|$cost_per_m|$value_ratio|$meets|0
 "
   done < <(_advise_candidate_rows "$field")
+
+  # VARIANT PREFERENCE pass (see _variant_weight): among capable rows that MEET the threshold, find each
+  # family's lightest variant (per lane); every heavier sibling gets pref=1 = "a lighter sibling
+  # qualifies", which keeps it out of capable_best contention below (it stays listed, labeled). Off at
+  # effort=max or when the task requires the frontier — then the heavier rung is the point.
+  local variant_pref=1 fam_min="" _vf _vw _vmin _vrows=""
+  { [ "$selection_effort" = "max" ] || [ "$frontier_needed" = "1" ] || [ "${OSRC_ADVISE_VARIANT_PREF:-1}" = "0" ]; } && variant_pref=0
+  if [ "$variant_pref" = "1" ]; then
+    while IFS='|' read -r alias resolved lane tier score cost vr meets _pref; do
+      [ -n "$alias" ] && [ "$meets" = "1" ] && [ "$tier" = "capable" ] || continue
+      _vf="$(_variant_family "$resolved")|$lane"; _vw="$(_variant_weight "$resolved" "$selection_effort")"
+      _vmin="$(printf '%s\n' "$fam_min" | awk -F'|' -v k="$_vf" '($1"|"$2)==k{print $3; exit}')"
+      if [ -z "$_vmin" ]; then fam_min="$fam_min$_vf|$_vw
+"
+      elif [ "$_vw" -lt "$_vmin" ]; then fam_min="$(printf '%s\n' "$fam_min" | awk -F'|' -v k="$_vf" -v w="$_vw" '($1"|"$2)==k{print $1"|"$2"|"w; next} NF{print}')
+"
+      fi
+    done < <(printf '%s\n' "$results")
+    while IFS='|' read -r alias resolved lane tier score cost vr meets _pref; do
+      [ -n "$alias" ] || continue
+      if [ "$meets" = "1" ] && [ "$tier" = "capable" ]; then
+        _vf="$(_variant_family "$resolved")|$lane"; _vw="$(_variant_weight "$resolved" "$selection_effort")"
+        _vmin="$(printf '%s\n' "$fam_min" | awk -F'|' -v k="$_vf" '($1"|"$2)==k{print $3; exit}')"
+        [ -n "$_vmin" ] && [ "$_vw" -gt "$_vmin" ] && _pref=1
+      fi
+      _vrows="$_vrows$alias|$resolved|$lane|$tier|$score|$cost|$vr|$meets|$_pref
+"
+    done < <(printf '%s\n' "$results")
+    results="$_vrows"
+  fi
 
   # Pick recommendation in two cohorts to avoid subscription lanes dominating value ratio.
   # Subscription lanes (cx/cc/dv/gm): ranked by score (cost is plan-limited, not comparable to per-token).
   # Paid lanes (or/codex): ranked by value ratio (score / cost_per_m).
   # Prefer subscription if it meets threshold; else best paid by value ratio; else highest score overall.
   local rec_alias="" rec_resolved="" rec_lane="" rec_tier="" rec_reason=""
-  local capable_best_alias="" capable_best_resolved="" capable_best_lane="" capable_best_tier="" capable_best_vr=-1
+  local capable_best_alias="" capable_best_resolved="" capable_best_lane="" capable_best_tier="" capable_best_vr=-1 capable_best_w=999
   local frontier_best_alias="" frontier_best_resolved="" frontier_best_lane="" frontier_best_tier="" frontier_best_score=-1
   local sub_best_alias="" sub_best_resolved="" sub_best_lane="" sub_best_score=-1
   local paid_best_alias="" paid_best_resolved="" paid_best_lane="" paid_best_vr=-1
   local any_best_alias="" any_best_resolved="" any_best_lane="" any_best_score=-1
-  while IFS='|' read -r alias resolved lane tier score cost vr meets; do
+  while IFS='|' read -r alias resolved lane tier score cost vr meets _pref; do
     [ -n "$alias" ] || continue
     # Track highest score overall (fallback when nothing meets threshold).
     awk -v s="$score" -v b="$any_best_score" 'BEGIN{exit (s+0 > b+0) ? 0 : 1}' && {
       any_best_score="$score"; any_best_alias="$alias"; any_best_resolved="$resolved"; any_best_lane="$lane"
     }
     [ "$meets" = "1" ] || continue
-    if [ "$tier" = "capable" ]; then
-      awk -v v="$vr" -v b="$capable_best_vr" 'BEGIN{exit (v+0 > b+0) ? 0 : 1}' && {
-        capable_best_vr="$vr"; capable_best_alias="$alias"; capable_best_resolved="$resolved"
+    if [ "$tier" = "capable" ] && [ "${_pref:-0}" != "1" ]; then
+      # Equal value ratios are the NORM on plan lanes (flat "plan limits" cost, tier-proxy scores), so
+      # a strict `>` alone let TABLE ORDER pick the winner among ties. Tiebreak on the variant weight
+      # instead (lower = lighter/cheaper quota draw, rung closest to the requested effort): the same
+      # rule that ranks siblings within a family, applied across families when value is identical.
+      local _cw; _cw="$(_variant_weight "$resolved" "$selection_effort")"
+      if awk -v v="$vr" -v b="$capable_best_vr" 'BEGIN{exit (v+0 > b+0) ? 0 : 1}' \
+         || { awk -v v="$vr" -v b="$capable_best_vr" 'BEGIN{exit (v+0 == b+0) ? 0 : 1}' && [ "$_cw" -lt "$capable_best_w" ]; }; then
+        capable_best_vr="$vr"; capable_best_w="$_cw"; capable_best_alias="$alias"; capable_best_resolved="$resolved"
         capable_best_lane="$lane"; capable_best_tier="$tier"
-      }
+      fi
     fi
     if [ "$tier" = "frontier" ]; then
       awk -v s="$score" -v b="$frontier_best_score" 'BEGIN{exit (s+0 > b+0) ? 0 : 1}' && {
@@ -8269,23 +8617,29 @@ cmd_advise() {
   # required, and everything below threshold follows by score, so shortlist[0] IS
   # the recommendation. Ordering only: this ranks candidates, it never asserts any of them will succeed.
   local _sl="" _slg _slp
-  while IFS='|' read -r alias resolved lane tier score cost vr meets; do
+  while IFS='|' read -r alias resolved lane tier score cost vr meets _pref; do
     [ -n "$alias" ] || continue
     if [ "$frontier_needed" = "1" ]; then
       case "$meets:$tier" in 1:frontier) _slg=0; _slp="$score" ;; 1:capable) _slg=1; _slp="$vr" ;; *) _slg=2; _slp="$score" ;; esac
     else
       case "$meets:$tier" in 1:capable) _slg=0; _slp="$vr" ;; 1:*) _slg=1; _slp="$score" ;; *) _slg=2; _slp="$score" ;; esac
     fi
-    _sl="$_sl$_slg|$_slp|$alias|$resolved|$lane|$meets|$score|$vr
+    # A demoted heavier variant (a lighter sibling qualifies) leaves the top group so shortlist[0] is
+    # never a row the recommendation itself passed over; it joins the "meets, not preferred" group.
+    [ "${_pref:-0}" = "1" ] && [ "$_slg" = "0" ] && { _slg=1; _slp="$score"; }
+    # Tertiary sort key = variant weight, the same tiebreak the recommendation uses. Plan-lane ties
+    # (flat cost, proxy scores) are common; without it shortlist[0] could be a different row than the
+    # recommendation whenever the top group tied on value.
+    _sl="$_sl$_slg|$_slp|$alias|$resolved|$lane|$meets|$score|$vr|${_pref:-0}|$(_variant_weight "$resolved" "$selection_effort")
 "
   done < <(printf '%s\n' "$results")
   # group asc, then the group-appropriate primary desc. -s (stable) so ties keep input (table) order,
   # matching the picker's first-wins on equal score/ratio — this is what makes shortlist[0] == the pick.
-  local _sl_sorted; _sl_sorted="$(printf '%s' "$_sl" | grep -v '^$' | sort -s -t'|' -k1,1n -k2,2rn)"
+  local _sl_sorted; _sl_sorted="$(printf '%s' "$_sl" | grep -v '^$' | sort -s -t'|' -k1,1n -k2,2rn -k10,10n)"
   local shortlist_json="[]"
   if have jq; then
     shortlist_json="$(printf '%s\n' "$_sl_sorted" \
-      | jq -R 'select(length>0)|split("|")|{alias:.[2],model:.[3],lane:.[4],meets:(.[5]=="1"),score:(.[6]|tonumber?),value_ratio:(.[7]|tonumber?)}' 2>/dev/null \
+      | jq -R 'select(length>0)|split("|")|{alias:.[2],model:.[3],lane:.[4],meets:(.[5]=="1"),score:(.[6]|tonumber?),value_ratio:(.[7]|tonumber?),lighter_sibling_preferred:(.[8]=="1")}' 2>/dev/null \
       | jq -s '.' 2>/dev/null)"
     [ -n "$shortlist_json" ] || shortlist_json="[]"
   fi
@@ -8336,13 +8690,15 @@ cmd_advise() {
     fi
     echo
     echo "--- all candidates (sorted by value ratio, >> = recommended) ---"
-    printf '%s\n' "$results" | sort -t'|' -k7 -rn | while IFS='|' read -r alias resolved lane tier score cost vr meets; do
+    printf '%s\n' "$results" | sort -t'|' -k7 -rn | while IFS='|' read -r alias resolved lane tier score cost vr meets _pref; do
       [ -n "$alias" ] || continue
-      local mark="  "
+      local mark="  " verdict
       [ "$alias" = "$rec_alias" ] && mark=">>"
+      if [ "$meets" != "1" ]; then verdict='below threshold'
+      elif [ "${_pref:-0}" = "1" ]; then verdict='OK (lighter sibling preferred)'
+      else verdict=OK; fi
       printf '%s %-16s %-28s lane=%-3s score=%-5s $/M=%-14s ratio=%-7s %s\n' \
-        "$mark" "$alias" "$resolved" "$lane" "$score" "$cost" "$vr" \
-        "$([ "$meets" = "1" ] && echo OK || echo 'below threshold')"
+        "$mark" "$alias" "$resolved" "$lane" "$score" "$cost" "$vr" "$verdict"
     done
     echo
     echo "Run with:  $0 run -m $rec_alias --effort $selection_effort \"$task\""
@@ -8575,6 +8931,20 @@ _job_made_writes() {
   [ -n "$hit" ]
 }
 
+# _lane_text_only <lane-code> -> rc0 for TEXT-delegation lanes (no autonomous tool exec, the deliverable
+# is the model's text, never a file): local (Ollama/LM Studio/llama.cpp) and tokenrouter. The zero-write
+# watchdog must never flag these — "wrote nothing" is their normal, successful shape. Agentic lanes
+# (dv/or-via-cc-or-codex/cc/cx/gm and the engine lanes) write files for a mutating verb and are eligible.
+# Unknown/empty lane -> NOT text-only (same posture as the existing exploring? guard, which flags by verb
+# alone); OSRC_TEXT_LANES adds lane codes (space-separated) without a code change.
+_lane_text_only() {
+  local l="${1:-}" x
+  [ -n "$l" ] || return 1
+  case "$l" in local|tokenrouter) return 0 ;; esac
+  for x in ${OSRC_TEXT_LANES:-}; do [ "$l" = "$x" ] && return 0; done
+  return 1
+}
+
 # Positive initialization proof for the supervisor. A line is accepted only
 # when it can be real agent/model output: semantic progress, a structured
 # assistant/model event, or non-empty plain model text. Launcher disclosure,
@@ -8694,6 +9064,31 @@ _supervise() {
   local mutating=0; case "$verb" in edit|research|yolo) mutating=1 ;; esac
   local nww="${OSRC_NOWRITE_WARN:-180}"
   local nww_kill="${OSRC_NOWRITE_KILL:-$nww}"
+  # ZERO-WRITE WATCHDOG (progress, not silence). Every timer above measures SILENCE: byte growth,
+  # idle, the exploring? kill arm (idle >= nww_kill). A model that streams reasoning tokens for 15
+  # minutes while writing nothing keeps the log growing and trips none of them — the incident: a
+  # delegate burned its whole output budget twice on pure reasoning with zero files, flagged
+  # exploring? at 3 min but never bounded, and was only swapped by hand ~35 min in. This arm tracks
+  # the NO-WRITE AGE instead: time since .startmark with still zero qualifying writes while alive.
+  #   - past OSRC_NOPROGRESS_SECS (default 600; 0 disables) the job enters the DISTINCT state
+  #     `no-progress-writes` — not stalled? (it is talking), not wedged (it is alive) — so status/
+  #     heartbeat/the orchestrator see a live-but-unproductive burn and can steer or swap it;
+  #   - it is SURFACE-ONLY by default. Only an explicit OSRC_NOPROGRESS_KILL_SECS (unset/0 = off) hard-
+  #     bounds it like a stall, and only while still write-free. A legitimately thinking model is
+  #     never killed early by default; the goal is to make the zero-write burn visible in ~10 min.
+  #   - WRITE-EXPECTING verbs only: edit/yolo (their deliverable IS a file). `run`/`explore` are
+  #     read-only and `research` is an output-deliverable verb (the exploring? guard already treats a
+  #     write-free research job with fresh output as healthy) — none of them is ever flagged. TEXT-
+  #     delegation lanes (local/tokenrouter, see _lane_text_only) never write by design: exempt.
+  #   - a qualifying write (same _job_made_writes primitive, structured tool call OR a file newer than
+  #     .startmark) clears the state back to running; the check runs each poll only while flagged.
+  local nowrite_secs="${OSRC_NOPROGRESS_SECS:-600}" nowrite_kill="${OSRC_NOPROGRESS_KILL_SECS:-0}"
+  case "$nowrite_secs" in ''|*[!0-9]*) nowrite_secs=600 ;; esac
+  case "$nowrite_kill" in ''|*[!0-9]*) nowrite_kill=0 ;; esac
+  local _jlane=""; [ -f "$jd/meta.json" ] && _jlane="$(jq -r '.lane // ""' "$jd/meta.json" 2>/dev/null)"
+  local write_expecting=0; case "$verb" in edit|yolo) write_expecting=1 ;; esac
+  _lane_text_only "$_jlane" && write_expecting=0
+  [ "$nowrite_secs" -gt 0 ] || write_expecting=0
   # A live process is not proof that the delegate reached its first model turn. SessionStart hooks
   # and parked cloud lanes can leave the child alive forever with only our disclosure header in the
   # log. Give initialization its own short, lane-agnostic deadline; after any real delegate output,
@@ -8726,6 +9121,7 @@ _supervise() {
         # is real progress and clears the flag, exactly as a write would. Without this a healthy
         # write-free research job stayed stuck on exploring? and was primed for the kill arm below.
         exploring?) { [ "$verb" = "research" ] || _job_made_writes "$jd" "$_jcwd"; } && echo running > "$jd/status" ;;
+        no-progress-writes) _job_made_writes "$jd" "$_jcwd" && echo running > "$jd/status" ;;
       esac
     fi
     idle=$(( now - last_change )); age=$(( now - t0 ))
@@ -8747,11 +9143,44 @@ _supervise() {
         echo "exploring?" > "$jd/status"
         echo "[outsourcerer] WARN job $(basename "$jd"): ${age}s on a mutating verb ($verb) with ZERO file writes — likely exploring, not producing. It will be stopped after ${nww_kill}s with no writes and no output growth. Only an actual FILE WRITE clears this (progress output alone does not) — give it a tighter 'write file X now' target, or re-run read-only work under 'run'/'explore', which is not subject to this guard." >&2; }
     fi
+    # ZERO-WRITE WATCHDOG arm (see the setup comment above). Order: clear-on-write first, so a job that
+    # wrote a file while SILENT (no log growth, so the growth-branch clear above never ran) is not
+    # left flagged; then flag; then the opt-in bound. `age` is the no-write age: .startmark is stamped
+    # at t0 and a qualifying write is exactly what clears the state, so while flagged the two coincide.
+    if [ "$write_expecting" = "1" ] && [ "$(cat "$jd/status" 2>/dev/null)" = "no-progress-writes" ] \
+       && _job_made_writes "$jd" "$_jcwd"; then
+      echo running > "$jd/status"
+      echo "[outsourcerer] job $(basename "$jd"): first file write landed after ${age}s — no-progress-writes cleared." >&2
+    fi
+    if [ "$write_expecting" = "1" ] && [ "$age" -ge "$nowrite_secs" ]; then
+      case "$(cat "$jd/status" 2>/dev/null)" in
+        running|exploring?)
+          if ! _job_made_writes "$jd" "$_jcwd"; then
+            echo "no-progress-writes" > "$jd/status"
+            printf '%s\n' "$age" > "$jd/nowrite_age" 2>/dev/null || true
+            if [ "$nowrite_kill" -gt 0 ]; then
+              echo "[outsourcerer] WARN job $(basename "$jd"): ALIVE and streaming for ${age}s on a write-expecting verb ($verb) with ZERO file writes — a live-but-unproductive burn, not a stall. State: no-progress-writes. It will be stopped at ${nowrite_kill}s if still write-free (OSRC_NOPROGRESS_KILL_SECS). Steer it to a concrete 'write file X now' target, swap the model, or cancel it." >&2
+            else
+              echo "[outsourcerer] WARN job $(basename "$jd"): ALIVE and streaming for ${age}s on a write-expecting verb ($verb) with ZERO file writes — a live-but-unproductive burn, not a stall. State: no-progress-writes. Not killing it (set OSRC_NOPROGRESS_KILL_SECS to bound this); steer it to a concrete 'write file X now' target, swap the model, or cancel it." >&2
+            fi
+          fi ;;
+      esac
+    fi
+    if [ "$write_expecting" = "1" ] && [ "$nowrite_kill" -gt 0 ] && [ "$age" -ge "$nowrite_kill" ] \
+       && [ "$(cat "$jd/status" 2>/dev/null)" = "no-progress-writes" ] \
+       && ! _job_made_writes "$jd" "$_jcwd"; then
+      echo wedged > "$jd/status"
+      printf 'no-progress-writes-timeout:%ss\n' "$age" > "$jd/reason" 2>/dev/null || true
+      echo "[outsourcerer] job $(basename "$jd") stayed alive for ${age}s with ZERO file writes on a write-expecting verb ($verb); stopped at the OSRC_NOPROGRESS_KILL_SECS=${nowrite_kill}s bound. Re-run with a tighter write target or a different model." >&2
+      _kill_job "$jd" "$pid"; echo 125 > "$jd/exit"; return 125
+    fi
     # Once marked exploring, a fresh output line buys the delegate another exploration window, but
     # neither reading nor an old warning can keep it alive forever. The same content check used for
-    # the warning proves it has still made no write before applying the real stall-kill.
-    if [ "$mutating" = "1" ] && [ "$(cat "$jd/status" 2>/dev/null)" = "exploring?" ] \
-       && [ "$idle" -ge "$nww_kill" ] \
+    # the warning proves it has still made no write before applying the real stall-kill. The same
+    # silence bound applies once the job has moved on to no-progress-writes (a superset state: still
+    # write-free), so the new state is never LESS bounded than exploring? was.
+    if [ "$mutating" = "1" ] && [ "$idle" -ge "$nww_kill" ] \
+       && { [ "$(cat "$jd/status" 2>/dev/null)" = "exploring?" ] || [ "$(cat "$jd/status" 2>/dev/null)" = "no-progress-writes" ]; } \
        && ! _job_made_writes "$jd" "$_jcwd"; then
       echo wedged > "$jd/status"
       printf 'exploring-timeout\n' > "$jd/reason" 2>/dev/null || true
@@ -9769,10 +10198,10 @@ _reconcile_status() {
   #   (b) the SUPERVISOR (watchdog) is still running AND is likewise still our process — it will
   #       reconcile the delegate itself.
   # Falls back to a bare kill -0 for legacy jobs that predate the pid_start/supervisor_pid files.
-  # Also covers stalled?/exploring?: those are still-running states, and a job killed while flagged
-  # would otherwise keep that flag forever because nothing writes a terminal status for it.
+  # Also covers stalled?/exploring?/no-progress-writes: those are still-running states, and a job killed
+  # while flagged would otherwise keep that flag forever because nothing writes a terminal status for it.
   case "$st" in
-    running|stalled\?|exploring\?)
+    running|stalled\?|exploring\?|no-progress-writes)
       local _jpid _spid _alive=0 _live_stime _saved_stime
       _jpid="$(cat "$jd/pid" 2>/dev/null)"
       if [ -n "$_jpid" ] && kill -0 "$_jpid" 2>/dev/null; then
@@ -9808,7 +10237,7 @@ _reconcile_status() {
         # verdict, so a genuinely-successful job is never mislabeled `interrupted` (lost update).
         local _now_st; _now_st="$(cat "$jd/status" 2>/dev/null || echo running)"
         case "$_now_st" in
-          running|stalled\?|exploring\?)
+          running|stalled\?|exploring\?|no-progress-writes)
             [ "${OSRC_RECONCILE_READ_ONLY:-0}" = "1" ] || {
               echo interrupted > "$jd/status" 2>/dev/null
               [ -s "$jd/reason" ] || printf 'interrupted:dead-running-job\n' > "$jd/reason" 2>/dev/null || true
@@ -9881,6 +10310,12 @@ _status_line() {
     _w="${acts#*W}"; _w="${_w%% *}"; case "$_w" in ''|*[!0-9]*) _w=1 ;; esac
     [ "$_w" = "0" ] && [ "$agenum" -gt "${OSRC_NOWRITE_WARN:-180}" ] && [ "$st" = "running" ] && flag=" !exploring(0-writes)" ;;
   esac
+  # The supervisor's zero-write watchdog state carries its own no-write age (jobs/<id>/nowrite_age) so
+  # the operator sees "alive, talking, wrote nothing for N s" at a glance, distinct from a stall.
+  if [ "$st" = "no-progress-writes" ]; then
+    local _nwa; _nwa="$(cat "$jd/nowrite_age" 2>/dev/null)"; case "$_nwa" in ''|*[!0-9]*) _nwa="$agenum" ;; esac
+    flag=" !no-writes(${_nwa}s,alive)"
+  fi
   # Durable NOT-ARMED marker (bg launch arm failure), RE-EVALUATED on every render (hardening):
   # the marker alone would keep the flag visible forever, including after a later arm succeeded
   # by a path that never touches this job's marker (`heartbeat start`, a session finalize). So the
@@ -10292,6 +10727,7 @@ cmd_status() {
   fi
   if [ -n "$id" ]; then _status_line "$id"; return; fi
   [ -d "$OSRC_JOBS" ] || { echo "no jobs yet."; return 0; }
+  _devin_plan_meter_line quiet   # Devin plan meter (+ lane-down notice) — silent when 0 and the lane is up
   printf '%-22s %-8s %-6s %-16s %-12s %s\n' JOB STATE AGE MODEL ACTS "LAST"
   local d t0 now shown=0 total
   t0=$(date +%s)
@@ -10898,7 +11334,7 @@ cmd_gc() {
     # clobbered to a bogus `interrupted` (a lost update that misreported a good job as failed). The
     # reconciler checks both pids and re-reads before flipping, so it can only reap a truly-dead job.
     case "$st" in
-      running|stalled\?|exploring\?|launching) st="$(_reconcile_status "$(basename "$d")" 2>/dev/null || echo "$st")" ;;
+      running|stalled\?|exploring\?|no-progress-writes|launching) st="$(_reconcile_status "$(basename "$d")" 2>/dev/null || echo "$st")" ;;
     esac
     case "$st" in done|'done?'|failed|blocked|timeout|wedged|canceled|permission-blocked|interrupted) ;;
       *) skipped=$((skipped+1)); continue ;;
@@ -14218,18 +14654,18 @@ route_delegate() {
   if _lane_down_active "$disp"; then
     record_outcome blocked lane_down "" "" "$(_quota_lane_key "$disp")" "$RESOLVED_ID" 2>/dev/null || true
     if [ "$_fb_user_pinned" = "1" ] && [ "${OSRC_FALLBACK_PINNED:-0}" != "1" ]; then
-      die "the ${disp:-?} lane is marked DOWN (recent probe/transport verdict; self-heals in ~${OSRC_LANE_DOWN_TTL:-300}s or run '$0 posture reset'). -m $RESOLVED_ID is a pinned choice, so I won't silently switch models. Pick another -m, or set OSRC_FALLBACK_PINNED=1 to auto-hop."
+      die "the ${disp:-?} lane is marked DOWN ($(_lane_down_reason "$disp"); self-heals in $(_lane_down_remaining "$disp") or run '$0 posture reset'). -m $RESOLVED_ID is a pinned choice, so I won't silently switch models. Pick another -m, or set OSRC_FALLBACK_PINNED=1 to auto-hop."
     fi
     if _fallback_enabled && [ "$tier" = "auto" ]; then
       local _fb_alias _fb_mid _fb_lane
       if _gate_hop "$disp"; then
-        printf '>>> [lane-down] the %s lane is marked DOWN (recent probe/transport verdict); skipping to %s (lane %s) — no dispatch, so this skip is free of the attempt budget.\n' \
-          "${disp:-?}" "$_fb_alias" "$_fb_lane" >&2
+        printf '>>> [lane-down] the %s lane is marked DOWN (%s, %s left); skipping to %s (lane %s) — no dispatch, so this skip is free of the attempt budget.\n' \
+          "${disp:-?}" "$(_lane_down_reason "$disp")" "$(_lane_down_remaining "$disp")" "$_fb_alias" "$_fb_lane" >&2
         continue
       fi
-      die "route resolved to the ${disp:-?} lane, which is marked DOWN, and no untried READY candidate remains. Wait ~${OSRC_LANE_DOWN_TTL:-300}s for the marker to self-heal, run '$0 posture reset', or pass -m for a lane that is up."
+      die "route resolved to the ${disp:-?} lane, which is marked DOWN ($(_lane_down_reason "$disp")), and no untried READY candidate remains. Wait $(_lane_down_remaining "$disp") for the marker to self-heal, run '$0 posture reset', or pass -m for a lane that is up."
     fi
-    die "the ${disp:-?} lane is marked DOWN (recent probe/transport verdict) and auto-fallback isn't available for a '$tier' run. Wait ~${OSRC_LANE_DOWN_TTL:-300}s, run '$0 posture reset', or pass another -m / --provider."
+    die "the ${disp:-?} lane is marked DOWN ($(_lane_down_reason "$disp")) and auto-fallback isn't available for a '$tier' run. Wait $(_lane_down_remaining "$disp"), run '$0 posture reset', or pass another -m / --provider."
   fi
 
   # DENYLIST GATE: refuse before announcing a route that must not dispatch, same placement as the
@@ -16224,7 +16660,7 @@ _unwatched_jobs() {
     [ -d "$jd" ] || continue
     id="$(basename "$jd")"
     st="$(cat "$jd/status" 2>/dev/null || echo '?')"
-    case "$st" in running|launching|"stalled?"|"exploring?") ;; *) continue ;; esac
+    case "$st" in running|launching|"stalled?"|"exploring?"|no-progress-writes) ;; *) continue ;; esac
     seen="$(cat "$jd/last_seen" 2>/dev/null)"
     case "$seen" in ''|*[!0-9]*) seen="$(cat "$jd/started_at" 2>/dev/null)" ;; esac
     case "$seen" in ''|*[!0-9]*) continue ;; esac
@@ -16900,13 +17336,27 @@ doctor() {
       *)
         echo "  Devin GLM (free): UNCONFIRMED (bounded probe rc=$_drc, did not time out) — not reporting the free lane unavailable without a timed-out probe" ;;
     esac
-    _du="$(_timeout "${OSRC_DEVIN_USAGE_SECS:-10}" devin usage 2>&1)" || _durc=$?
-    if [ "$_dstate" != "paid-tier-exhausted" ]; then
-      if [ "$(_devin_probe_classify "$_durc" "$_du")" = "paid-tier-exhausted" ]; then
-        echo "  Devin paid tier: EXHAUSTED; free tier (glm-5-2, swe-1-7) still available"
-      else
-        echo "  Devin paid tier: no exhaustion signal detected (bounded usage check; free-tier verdict is independent)"
+    # The current devin CLI has NO `usage` subcommand ("'usage' is neither a known subcommand nor an
+    # existing path"), so the old unconditional call failed every time and fell into the "no
+    # exhaustion signal" line — a dead command reported as a clean bill. Feature-detect it instead:
+    # a bounded `devin help`, captured to a variable first (a `| grep -q` pipeline under pipefail
+    # would return grep's early-exit SIGPIPE as a false negative), then look for an INDENTED
+    # line-leading `usage` entry, which is how subcommands are listed and which skips the
+    # "Usage: devin [OPTIONS]" header. A future CLI that re-adds `usage` is picked up automatically;
+    # until then say plainly that the plan/ACU figure lives on the web dashboard.
+    local _dhelp=""
+    _dhelp="$(_timeout "${OSRC_DEVIN_USAGE_SECS:-10}" devin help 2>/dev/null)" || true
+    if printf '%s\n' "$_dhelp" | grep -qwE '^[[:space:]]+usage'; then
+      _du="$(_timeout "${OSRC_DEVIN_USAGE_SECS:-10}" devin usage 2>&1)" || _durc=$?
+      if [ "$_dstate" != "paid-tier-exhausted" ]; then
+        if [ "$(_devin_probe_classify "$_durc" "$_du")" = "paid-tier-exhausted" ]; then
+          echo "  Devin paid tier: EXHAUSTED; free tier (glm-5-2, swe-1-7) still available"
+        else
+          echo "  Devin paid tier: no exhaustion signal detected (bounded usage check; free-tier verdict is independent)"
+        fi
       fi
+    elif [ "$_dstate" != "paid-tier-exhausted" ]; then
+      echo "  Devin paid tier: not machine-readable (this devin CLI has no 'usage' subcommand); plan quota + ACU balance are at https://app.devin.ai/settings/usage"
     fi
   else
     echo "  Devin GLM (free): UNCONFIRMED — bounded auth status did not report logged in"

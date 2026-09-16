@@ -45,9 +45,17 @@ fi
 refresh_benchmarks() { return 1; }
 high_json="$(cmd_advise --json --effort high "implement a multi-step authentication refactor with tests and debug failures" 2>&1)"
 ck "advise records selection effort" "$(printf '%s' "$high_json" | jq -r '.effort')" "high"
-ck "advise picks Kimi for hard work" "$(printf '%s' "$high_json" | jq -r '.recommendation.alias')" "kimi"
-ck "advise returns a valid Devin model" "$(printf '%s' "$high_json" | jq -r '.recommendation.model')" "kimi-k3"
-ck "advise marks Kimi capable" "$(printf '%s' "$high_json" | jq -r '.recommendation.tier')" "capable"
+# Kimi's near-frontier bump is REASONING-shaped only (task-shape fix, 2026-09-16): a hard CODE/agentic
+# job must not float kimi to #1 — its long reasoning bursts are the wrong shape for edit-run-verify.
+# The pick is a capable plan-lane model that is not kimi; a hard REASONING task still picks kimi.
+_hard_pick="$(printf '%s' "$high_json" | jq -r '.recommendation.alias')"
+case "$_hard_pick" in kimi|kimi-k3|kimi-k2.7) bad "advise picked Kimi for hard CODE work ($_hard_pick); the bump must be reasoning-only" ;;
+  *) ok "advise does not pick Kimi for hard code work (pick: $_hard_pick)" ;; esac
+ck "advise returns a valid Devin model" "$(printf '%s' "$high_json" | jq -r '.recommendation.lane')" "dv"
+ck "advise marks the pick capable" "$(printf '%s' "$high_json" | jq -r '.recommendation.tier')" "capable"
+reason_json="$(cmd_advise --json --effort high "analyze and evaluate the tradeoffs of the two architectures, assess the implications, critique the strategy and justify the decision" 2>&1)"
+ck "advise picks Kimi for hard REASONING work" "$(printf '%s' "$reason_json" | jq -r '.recommendation.alias')" "kimi"
+ck "advise returns Kimi's Devin id" "$(printf '%s' "$reason_json" | jq -r '.recommendation.model')" "kimi-k3"
 
 max_json="$(cmd_advise --json --effort max "implement a multi-step authentication refactor with tests and debug failures" 2>&1)"
 ck "max-effort advise picks frontier tier" "$(printf '%s' "$max_json" | jq -r '.recommendation.tier')" "frontier"

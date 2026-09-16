@@ -31,8 +31,25 @@ escalate one tier up or do it yourself. Stall/kill/timeout windows: budget 90/24
 mid 150/420/1800s, frontier 300/900/3600s (override with `OSRC_STALL_WARN`/`OSRC_STALL_KILL`/`OSRC_TIMEOUT`).
 
 **Job states** you'll see in `status`/`watch`: `launching` (detached, worker coming up) → `running` →
-a terminal state. Terminals: `done` · `done?` · `blocked` · `permission-blocked` · `interrupted` ·
-`timeout` · `wedged` · `failed` · `canceled`. Two need distinct handling:
+a terminal state. Non-terminal flags while alive: `stalled?` (output silence past the stall warn),
+`exploring?` (mutating verb, zero writes past `OSRC_NOWRITE_WARN`, default 180s), and
+`no-progress-writes` (see the zero-write watchdog below). Terminals: `done` · `done?` · `blocked` ·
+`permission-blocked` · `interrupted` · `timeout` · `wedged` · `failed` · `canceled`. Three need
+distinct handling:
+- **`no-progress-writes` (alive, talking, wrote nothing).** The stall timers measure SILENCE, so a
+  model that streams reasoning for 15 minutes while writing no file trips none of them (incident:
+  two ~17-min zero-write burns on an edit task, swapped by hand ~35 min in). The **zero-write
+  watchdog** tracks the no-write AGE instead: for a **write-expecting verb** (`edit`/`yolo`) that is
+  alive and has produced no qualifying write (structured Write/Edit tool call, or a file newer than
+  the job's `.startmark`) past `OSRC_NOPROGRESS_SECS` (default 600s; 0 disables), the job enters this
+  DISTINCT state, not `stalled?` (it is talking), not `wedged` (it is alive). `status` renders
+  `!no-writes(<age>s,alive)`; the fleet/heartbeat view surfaces it as MAYBE STUCK. It is
+  **surface-only by default**: nothing is killed unless you set `OSRC_NOPROGRESS_KILL_SECS`, which then
+  bounds a still-writeless job like a stall (`wedged`, reason `no-progress-writes-timeout:<age>s`,
+  exit 125). A qualifying write clears it back to `running`. Never flagged: read-only verbs
+  (`run`/`explore`), `research` (its deliverable is output, not a file), and text-delegation lanes
+  (`local`, `tokenrouter`; extend with `OSRC_TEXT_LANES`). Next step when you see it: steer the
+  delegate to a concrete "write file X now" target, swap the model, or cancel; do not just wait.
 - **`permission-blocked` (exit 3, NOT the same as `blocked`).** A headless delegate hit a wall it can't
   confirm interactively — repeated permission/sandbox denials, or a **devin print-mode hang**: in print
   mode (`-p`) devin can't answer a tool-exec-requires-confirmation prompt, so it rejects the tool and
@@ -174,7 +191,9 @@ talk to the user; this is *how* to run the plumbing once they've said yes.)
 - Surface the model used, the printed **tier**, and (for premium/native models) the cost implication.
 - Dispatch anything expected to exceed ~60s as `bg`, then poll `status <id>` on your own cadence
   (every 30-60s). Read `result <id>` only when state is `done`/`blocked`; never read `logs` into
-  your context unless diagnosing a wedge. `stalled?` = keep waiting but say so; `wedged`/`timeout`
+  your context unless diagnosing a wedge. `stalled?` = keep waiting but say so; `no-progress-writes`
+  = alive but write-free past the threshold, steer it to a concrete write target or swap the model
+  (it will NOT be killed for you unless `OSRC_NOPROGRESS_KILL_SECS` is set); `wedged`/`timeout`
   = report the last progress line, then escalate one tier up or do it yourself (never auto-retry a
   mutating verb against a half-mutated tree).
 - Treat `done?` (exit 0, no `OSRC::DONE`) as unverified: check the output before presenting.
