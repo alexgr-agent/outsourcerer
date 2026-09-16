@@ -82,6 +82,12 @@ rs ""                           EMPTY "empty"
 
 # === (c) exhaustion -> dv lane down for Devin's window, reason recorded, advice OFF Devin ============
 _quota_note_refusal() { :; }   # ledger reconcile is a declared-cap no-op; keep this test about the lane
+# The block now PROBES a sibling free model before deciding (probe-then-decide, see
+# test_devin_plan_quota_probe.sh). This section pins the CONFIRMED path, so the fake devin on PATH
+# refuses every model with the daily wording; it also keeps the real devin CLI out of the test.
+FB="$TMP/fakebin"; mkdir -p "$FB"
+printf '#!/usr/bin/env bash\nprintf "Error: Your daily usage quota has been exhausted. It resets in 11h26m.\\n" >&2; exit 1\n' > "$FB/devin"
+chmod +x "$FB/devin"; export PATH="$FB:$PATH"
 _lane_down_clear dv
 _before=$(date +%s)
 _out="$(_devin_plan_quota_block "$FX/daily" glm-5.2 'not just "glm-5.2"' 'Switch lanes OFF Devin: --provider cc -m glm (OpenRouter) or a native lane.' 2>&1)"
@@ -95,7 +101,9 @@ printf '%s' "$_out" | grep -q 'Devin says it resets in 11h26m' && ok "block: quo
 printf '%s' "$_out" | grep -qi 'estimate' && bad "block: labeled an estimate although Devin's reset parsed" || ok "block: no estimate language when the reset parsed"
 printf '%s' "$_out" | grep -q 'mis-gate' && bad "block: still prints the ACU mis-gate wording" || ok "block: ACU mis-gate wording absent"
 printf '%s' "$_out" | grep -q 'Switch lanes OFF Devin' && ok "block: caller's OFF-Devin advice printed" || bad "block: advice missing"
-printf '%s' "$_out" | grep -qE 'swe-1-7|glm-5-2\)|Retry on one of those plan-included' && bad "block: recommends another Devin plan model" || ok "block: no Devin plan model recommended"
+# The probe lines legitimately NAME the sibling model they asked (that is the verification, not a
+# recommendation); every other line must still steer clear of Devin plan models.
+printf '%s' "$_out" | grep -v '\] probe:' | grep -qE 'swe-1-7|glm-5-2\)|Retry on one of those plan-included' && bad "block: recommends another Devin plan model" || ok "block: no Devin plan model recommended"
 # Weekly + unparseable reset -> lane still down, but the window is a LABELED estimate.
 _lane_down_clear dv
 printf 'Error: weekly usage quota exhausted, resets at soon.\n' > "$FX/weekly-vague"

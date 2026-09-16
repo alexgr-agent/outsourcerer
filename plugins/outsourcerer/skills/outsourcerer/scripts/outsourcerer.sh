@@ -147,7 +147,7 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 # Version identifier. Single source of truth; bump the rightmost
 # number for patch releases. `doctor` and `--version` both read this.
-OSRC_VERSION="0.12.3"
+OSRC_VERSION="0.13.0"
 DEFAULT_MODEL="${OUTSOURCERER_MODEL:-glm-5.2}"
 
 # ---- platform detection (mac | linux | windows-gitbash). Windows = Git Bash / MSYS2, NO WSL
@@ -773,6 +773,69 @@ _devin_free_probe() {
     devin --model "$model" --permission-mode auto --respect-workspace-trust false -p PONG </dev/null
 }
 
+# _lane_free_probe <lane> [model] -> prints exactly one of: answered | limit-refused | unreachable
+# A BOUNDED, minimal real request against a lane's free / plan-included model, used to VERIFY a limit
+# refusal before anything is marked down. A refusal from ONE model does not prove the lane is dead:
+# the 0.12.3 over-block assumed every Devin model shared the exhausted bucket and forbade retrying
+# any of them; this probe is the check that replaces that assumption. Wall-clock cap via _timeout
+# (OSRC_LANE_PROBE_SECS, default = the doctor probe's OSRC_DEVIN_PROBE_SECS / 30s), so a failure
+# path can never hang on it. Verdicts:
+#   limit-refused  the probe's output carries a daily/weekly plan-quota refusal, or it FAILED with a
+#                  paid-quota / rate-limit signature: the model is being refused by a limit right now
+#   answered       the request completed (rc 0) with no limit refusal: the model is usable
+#   unreachable    timeout (124), CLI missing, or any other non-limit failure: nothing proven either way
+# The captured output is left at $(_lane_probe_file <lane>) — PID-scoped like .dverr.$$, so two
+# concurrent probes on the same lane (fanout, parallel bg jobs) never clobber each other — so the
+# caller can quote the lane's exact wording. Recipes: dv = a real bounded request; cx/cc = the lane's own plan meter (confirms only,
+# see _lane_meter_saturated). Any other lane prints `unreachable` and returns 2 so a caller can tell "no
+# recipe" from a real non-answer; those get a real recipe only where one is cheap and safe.
+_lane_probe_file() { printf '%s/.lane-probe.%s.%s.out' "$OSRC_HOME" "${1:-unknown}" "$$"; }
+_lane_free_probe() {
+  local lane model out="" rc=0 secs="${OSRC_LANE_PROBE_SECS:-${OSRC_DEVIN_PROBE_SECS:-30}}"
+  lane="$(_lane_plan_key "${1:-}")"
+  case "$secs" in ''|*[!0-9]*) secs=30 ;; esac
+  case "$lane" in
+    dv) ;;
+    cx|cc)
+      # Meter-backed recipe: the lane's own plan meter (Codex rollout rate_limits / Claude statusline
+      # tap) at >=100% CONFIRMS a limit without spending a request. A meter cannot prove a request
+      # would answer, so anything else is `unreachable` (inconclusive, rc0), never `answered`.
+      if _mkdir_private "$OSRC_HOME" >/dev/null 2>&1; then
+        out="$(_lane_probe_file "$lane")"; _session_limits > "$out" 2>/dev/null || :; chmod 600 "$out" 2>/dev/null
+      fi
+      if _lane_meter_saturated "$lane"; then printf 'limit-refused'; else printf 'unreachable'; fi
+      return 0 ;;
+    *) printf 'unreachable'; return 2 ;;
+  esac
+  if _mkdir_private "$OSRC_HOME" >/dev/null 2>&1; then
+    out="$(_lane_probe_file "$lane")"
+    : > "$out" 2>/dev/null && chmod 600 "$out" 2>/dev/null || out=""
+  fi
+  model="${2:-${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}}"
+  if ! have devin; then
+    [ -n "$out" ] && printf 'devin CLI not on PATH\n' > "$out"
+    printf 'unreachable'; return 0
+  fi
+  _timeout "$secs" devin --model "$model" --permission-mode auto --respect-workspace-trust false -p PONG \
+    </dev/null > "${out:-/dev/null}" 2>&1 || rc=$?
+  if [ -n "$out" ] && { _devin_plan_quota_exhausted "$out" || { [ "$rc" -ne 0 ] && _devin_quota_refusal "$out"; }; }; then
+    printf 'limit-refused'; return 0
+  fi
+  if [ "$rc" -eq 0 ]; then printf 'answered'; return 0; fi
+  printf 'unreachable'; return 0
+}
+# _devin_plan_probe_model <refused-model> -> the free model to probe after a plan-quota refusal. The
+# default probe model (OSRC_DEVIN_PROBE_MODEL, glm-5-2) unless THAT is the model Devin just refused,
+# in which case the alternate plan-included model (OSRC_DEVIN_PROBE_MODEL_ALT, swe-1-7) is used:
+# re-asking the refused model proves nothing about the "shared bucket" claim, a sibling does.
+_devin_plan_probe_model() {
+  local refused probe alt
+  refused="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr '._' '--')"
+  probe="${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}"; alt="${OSRC_DEVIN_PROBE_MODEL_ALT:-swe-1-7}"
+  if [ "$(printf '%s' "$probe" | tr '[:upper:]' '[:lower:]' | tr '._' '--')" = "$refused" ]; then probe="$alt"; fi
+  printf '%s' "$probe"
+}
+
 # Required before every Devin launch path. Reaping comes before even auth status,
 # because an orphaned model process can wedge all CLI subcommands. Availability
 # reporting is handled separately by the mandatory bounded GLM probe in doctor.
@@ -1092,6 +1155,17 @@ _devin_plan_quota_reset_secs() {
         if [ "$utc" = "1" ]; then ds="$(_quota_day_start utc)"; else ds="$(_quota_day_start local)"; fi
         target=$(( ds + 10#$h*3600 + 10#$m*60 ))
         [ "$target" -le "$now" ] && target=$(( target + 86400 ))
+      elif printf '%s' "$body" | grep -qE '^[[:space:]]*[0-9]{1,2}[[:space:]]*(am|pm)([^a-z]|$)'; then
+        # Bare hour + meridian ("at 3pm (America/Santiago)", Claude Code's shape). A named zone in the
+        # parenthesis is the CLI's own locale, i.e. this machine's, so it is read as local time.
+        local h ds; h="$(printf '%s' "$body" | grep -oE '^[[:space:]]*[0-9]{1,2}' | tr -d '[:space:]')"
+        case "$body" in
+          *pm*) [ "$((10#$h))" -lt 12 ] && h=$(( 10#$h + 12 )) ;;
+          *am*) [ "$((10#$h))" -eq 12 ] && h=0 ;;
+        esac
+        if [ "$utc" = "1" ]; then ds="$(_quota_day_start utc)"; else ds="$(_quota_day_start local)"; fi
+        target=$(( ds + 10#$h*3600 ))
+        [ "$target" -le "$now" ] && target=$(( target + 86400 ))
       fi
       case "$target" in ''|*[!0-9]*) ;; *) secs=$(( target - now )) ;; esac ;;
   esac
@@ -1100,23 +1174,36 @@ _devin_plan_quota_reset_secs() {
   printf '%s' "$secs"
 }
 # _devin_plan_quota_block <errfile> <model> <scope-clause> <switch-lanes-advice>
-# The one honest response to a spent plan bucket, shared by the free-tier and paid failure branches:
-#   1. say the SHARED daily/weekly quota is exhausted (period read from Devin's own line), with Devin's
-#      stated reset when it gave one, else the dashboard URL (the current devin CLI has no quota read);
-#   2. surface Devin's exact wording (telemetry for tightening the detector);
-#   3. take the WHOLE dv lane down (the bucket is shared, so this is lane-scoped, not model-scoped) so
-#      the dispatch gate + fallback shortlist stop feeding it. The TTL is Devin's OWN stated reset when
-#      the refusal carried a parseable one (+60s of slack so the lane comes back after, not before, the
-#      bucket refills), never a hardcoded clock. Only when Devin gave nothing parseable does it fall back
-#      to a conservative ESTIMATE (OSRC_DEVIN_PLAN_DOWN_TTL, default 3600s) and SAYS so: long enough to
-#      stop the bleed, short enough that a wrong guess self-heals; `posture reset` clears early. The
-#      reason is recorded beside the marker so brief/status and the gate can name it;
+# The one honest response to a plan-quota refusal, shared by the free-tier and paid failure branches.
+# PROBE-THEN-DECIDE (replaces the 0.12.3 blanket lane-down + "do NOT retry them"):
+#   1. say Devin refused THIS model citing its shared daily/weekly plan quota (period read from Devin's
+#      own line), with Devin's stated reset when it gave one, else the dashboard URL (the current devin
+#      CLI has no quota read); surface Devin's exact wording (telemetry for tightening the detector);
+#   2. VERIFY before taking anything down: one bounded, cheap request (_lane_free_probe) to a free /
+#      plan-included model that is NOT the one just refused (_devin_plan_probe_model). A refusal from
+#      one model does not prove every plan-included model shares the spent bucket;
+#   3. decide from the probe, never from the assumption:
+#        limit-refused -> CONFIRMED. The bucket really is shared and spent: take the WHOLE dv lane down
+#                         so the dispatch gate + fallback shortlist stop feeding it. The TTL is Devin's
+#                         OWN stated reset when the refusal carried a parseable one (+60s of slack so the
+#                         lane comes back after, not before, the bucket refills), never a hardcoded
+#                         clock. Only when Devin gave nothing parseable does it fall back to an ESTIMATE
+#                         (OSRC_DEVIN_PLAN_DOWN_TTL, default 3600s) and SAYS so; `posture reset` clears
+#                         early. The reason is recorded beside the marker so brief/status can name it.
+#        answered      -> NOT confirmed. The free model still runs, so the lane stays UP (a stale down
+#                         marker is cleared). Nothing is marked against the refused model beyond the
+#                         declared-cap reconcile in step 4: the message names which model was refused
+#                         on this run and which one answered, and the caller's off-Devin advice is
+#                         offered as an option, not an order.
+#        unreachable   -> INCONCLUSIVE. Nothing proven either way, and the lane is not answering right
+#                         now, so it gets the SHORT self-healing transport window (OSRC_LANE_DOWN_TTL,
+#                         default 300s) with an honest reason, never the day-long quota window.
 #   4. reconcile a declared daily cap with reality (no-op unless a cap is declared, same as the ACU path).
-# The advice it prints is the caller's, and it must point OFF Devin: another Devin plan model would just
-# fail on the same empty bucket.
+# The advice it prints is the caller's; on a confirmed block it must point OFF Devin.
 _devin_plan_quota_block() {
   local f="${1:-}" model="${2:-}" scope="${3:-}" advice="${4:-}"
   local _pq_line _pq_reset _pq_secs="" _pq_period="DAILY" _pq_ttl="${OSRC_DEVIN_PLAN_DOWN_TTL:-3600}"
+  local _pq_probe _pq_verdict _pq_probe_secs="${OSRC_LANE_PROBE_SECS:-${OSRC_DEVIN_PROBE_SECS:-30}}" _pq_pline=""
   case "$_pq_ttl" in ''|*[!0-9]*) _pq_ttl=3600 ;; esac
   _pq_line="$(_devin_plan_quota_line "$f")"
   printf '%s' "$_pq_line" | grep -qi 'weekly' && _pq_period="WEEKLY"
@@ -1132,15 +1219,277 @@ _devin_plan_quota_block() {
   else
     _pq_reset="Devin gave no reset time in this refusal; the live figure is at https://app.devin.ai/settings/usage."
   fi
-  printf '>>> [devin plan quota] Devin'\''s shared %s plan quota is exhausted — this blocks ALL plan-included models (glm/swe/kimi), %s. %s %s\n' "$_pq_period" "$scope" "$_pq_reset" "$advice" >&2
+  printf '>>> [devin plan quota] Devin refused "%s" saying its shared %s plan quota is exhausted. %s\n' "$model" "$_pq_period" "$_pq_reset" >&2
   [ -n "$_pq_line" ] && printf '>>> [devin plan quota] Devin'\''s exact wording (for tightening this detector): %s\n' "$_pq_line" >&2
-  _lane_down_mark dv "$_pq_ttl" "plan quota exhausted" || true
-  if [ -n "$_pq_secs" ]; then
-    printf '>>> [devin plan quota] dv lane marked DOWN for %s, until Devin'\''s stated reset (clear early with: %s posture reset). Dispatch + fallback skip Devin until then.\n' "$(_fmt_secs_human "$_pq_ttl")" "$0" >&2
-  else
-    printf '>>> [devin plan quota] dv lane marked DOWN for ~%s (an ESTIMATE: no parseable reset, and the devin CLI exposes none; override OSRC_DEVIN_PLAN_DOWN_TTL, clear early with: %s posture reset). Dispatch + fallback skip Devin until then.\n' "$(_fmt_secs_human "$_pq_ttl")" "$0" >&2
-  fi
+  # Verify, never assume: one bounded request to a DIFFERENT plan-included model decides whether the
+  # refusal really covers the whole lane. The probe reuses _timeout, so this path cannot hang.
+  _pq_probe="$(_devin_plan_probe_model "$model")"
+  printf '>>> [devin plan quota] probe: a refusal from one model does not prove every plan-included model is spent — verifying with a bounded (%ss) request to free model "%s" before deciding anything.\n' "$_pq_probe_secs" "$_pq_probe" >&2
+  _pq_verdict="$(_lane_free_probe dv "$_pq_probe")"
+  case "$_pq_verdict" in
+    limit-refused)
+      _pq_pline="$(_devin_plan_quota_line "$(_lane_probe_file dv)")"
+      [ -n "$_pq_pline" ] || _pq_pline="$(_devin_quota_refusal_line "$(_lane_probe_file dv)")"
+      printf '>>> [devin plan quota] probe: CONFIRMED — free model "%s" was refused with a limit too, so the shared %s plan quota is exhausted — this blocks ALL plan-included models (glm/swe/kimi), %s. %s\n' "$_pq_probe" "$_pq_period" "$scope" "$advice" >&2
+      [ -n "$_pq_pline" ] && printf '>>> [devin plan quota] probe: Devin'\''s exact wording on the probe: %s\n' "$_pq_pline" >&2
+      _lane_down_mark dv "$_pq_ttl" "plan quota exhausted" || true
+      if [ -n "$_pq_secs" ]; then
+        printf '>>> [devin plan quota] dv lane marked DOWN for %s, until Devin'\''s stated reset (clear early with: %s posture reset). Dispatch + fallback skip Devin until then.\n' "$(_fmt_secs_human "$_pq_ttl")" "$0" >&2
+      else
+        printf '>>> [devin plan quota] dv lane marked DOWN for ~%s (an ESTIMATE: no parseable reset, and the devin CLI exposes none; override OSRC_DEVIN_PLAN_DOWN_TTL, clear early with: %s posture reset). Dispatch + fallback skip Devin until then.\n' "$(_fmt_secs_human "$_pq_ttl")" "$0" >&2
+      fi
+      _failover_signal_write dv "$model" confirmed "$(printf 'daily quota spent (shared %s plan bucket; no free models there until reset%s)' "$(printf '%s' "$_pq_period" | tr '[:upper:]' '[:lower:]')" "${_pq_secs:+ in $(_fmt_secs_human "$_pq_secs")}")" "$_pq_secs" ;;
+    answered)
+      printf '>>> [devin plan quota] probe: NOT confirmed — free model "%s" answered, so the dv lane stays UP. "%s" was refused on this run; "%s" was not (Devin'\''s refusal did not hold for every plan-included model, and nothing is marked against it here). Use the free model that answered: -m %s. To route elsewhere instead: %s\n' "$_pq_probe" "$model" "$_pq_probe" "$_pq_probe" "$advice" >&2
+      _lane_down_clear dv
+      _failover_signal_write dv "$model" answered "free model $_pq_probe still answers" "" ;;
+    *)
+      _failover_signal_write dv "$model" inconclusive "refused \"$model\" citing its plan quota, and the free probe did not answer" "$_pq_secs"
+      printf '>>> [devin plan quota] probe: INCONCLUSIVE — free model "%s" gave no answer within %ss and no limit wording, so nothing is proven about the shared bucket. Not marking the day-long quota window; the lane is not answering right now, so it gets the short self-healing transport window (~%s; clear early with: %s posture reset). Re-check with: %s doctor. %s\n' "$_pq_probe" "$_pq_probe_secs" "$(_fmt_secs_human "${OSRC_LANE_DOWN_TTL:-300}")" "$0" "$0" "$advice" >&2
+      _lane_down_mark dv "" "plan quota refusal; free probe unreachable" || true ;;
+  esac
+  rm -f "$(_lane_probe_file dv)" 2>/dev/null   # consumed: quoted above; no per-PID litter in $OSRC_HOME
   _quota_note_refusal dv "$model" 2>/dev/null || true
+  return 0
+}
+
+# =============================================================================
+# GENERIC PLAN-LIMIT DETECTION. One dispatcher, per-lane matchers, one block.
+# Every subscription lane refuses in its own words when its plan window is spent. Devin's matcher
+# (_devin_plan_quota_exhausted) was the only one; these give the other plan lanes a BEST-EFFORT
+# matcher each, grounded in that CLI's real refusal wording (fixtures in tests/test_lane_plan_limit.sh),
+# and CONTEXT-ANCHORED like _DEVIN_PLAN_QUOTA_RE: a limit noun only counts beside a spent verb or a
+# reset phrase, never as a bare token, so an unrelated "limit" / "rate" / "quota" in ordinary output is
+# not read as a refusal. Only consulted after a run already FAILED (or, for headless claude -p, when the
+# JSON result says is_error:true — that path exits 0 with the refusal in the result text). A lane with
+# no matcher is a NON-match, never a guess. Nothing here hardcodes a plan number or a model roster.
+#
+# Grounding (real wording, per CLI):
+#   codex  (cx)     "You've hit your usage limit. Try again in 2h 15m." / "usage limit reached"
+#   claude (cc)     "Claude usage limit reached. Your limit will reset at 3pm (America/Santiago)." /
+#                   "You've hit your limit · resets 4pm (…)" / headless: "Claude AI usage limit reached|<epoch>"
+#   cursor          "You've hit your usage limit." + "Your usage limits will reset when your monthly cycle
+#                   ends on …" / spendLimitHit: true
+#   warp   (oz)     "Request failed with error: QuotaLimit" / "Quota Limit reached" / "exceed(ed) your
+#                   monthly credit limit … premium models will be disabled until your quota resets"
+#                   NOT "Message token limit exceeded" (that is the context window, not the plan)
+#   droid  (Factory) "Rate Limit" refusal once included usage is exhausted; "run /limits to toggle Droid
+#                   Core or Extra Usage and retry"
+#   cline           {"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on
+#                   model …. Try again in 9h 41m"}}   NOT a per-minute provider 429 (transient, not a window)
+# =============================================================================
+_CX_PLAN_LIMIT_RE="you'?ve hit your usage limit|usage limit (reached|exceeded|hit)|(5[- ]?hour|weekly|5h)[[:space:]]+(usage[[:space:]]+)?limit[^.]{0,20}(reached|exceeded|exhausted)"
+_CC_PLAN_LIMIT_RE="claude( ai)? usage limit reached|you'?ve hit your limit|usage limit reached[^.]{0,40}(reset|resets)|limit will reset at"
+_CURSOR_PLAN_LIMIT_RE="you'?ve hit your usage limit|usage limits? will reset|spend ?limit ?hit['\"]?[[:space:]]*[:=][[:space:]]*true|spend(ing)? limit (reached|hit|exceeded)|usage limit (reached|exceeded)"
+_WARP_PLAN_LIMIT_RE="error:[[:space:]]*quota ?limit|quota limit (reached|exceeded|hit)|(monthly|ai)[ -]?(credit|request)[ -]?(limit|quota)[^.]{0,40}(exceeded|reached|exhausted)|(exceed(ed)?|reached) your (monthly )?(credit|ai request) limit|premium models (will be|are) disabled until"
+_DROID_PLAN_LIMIT_RE="rate limit (reached|exceeded|hit|error)|(included|plan|5[- ]?hour|weekly|monthly) usage[^.]{0,40}(exhausted|reached|used up|limit)|run /limits|extra usage[^.]{0,40}(enable|toggle|continue|retry)"
+_CLINE_PLAN_LIMIT_RE="inference_cap_error|daily (free )?limit reached|(daily|weekly|monthly) (free )?(limit|quota|cap)[^.]{0,30}(reached|exceeded|exhausted)|rate_limit_error[^}]{0,200}(daily|weekly|monthly|quota)"
+# The subscription lanes the generic meter / block know about (dv keeps its bespoke block + meter).
+OSRC_PLAN_LANES="dv cx cc warp droid cursor cline gm"
+
+# _lane_plan_key <lane-code|disp|provider> -> the canonical quota-pool key (dv/cx/cc/warp/...), or empty.
+# Lane context FIRST (`cc` here means the Claude-native lane, not or's transport provider), then the
+# quota resolver for tokens that are only providers (devin -> dv). Empty for '?'/unknown.
+_lane_plan_key() {
+  local t="${1:-}" l k=""
+  [ -n "$t" ] || return 0
+  if l="$(_lane_by_token "$t" 2>/dev/null)"; then k="$(_lane_field "$l" quota_key 2>/dev/null)" || k="$l"; fi
+  [ -n "$k" ] || k="$(_quota_lane_key "$t")"
+  # Only a REGISTERED lane (or a known plan pool) is a plan key: _quota_lane_key echoes an unknown
+  # token back as an "engine lane" name, and a block/marker must never be keyed on a typo.
+  case "$k" in ''|'?') printf ''; return 0 ;; esac
+  case " $OSRC_LANE_REGISTRY $OSRC_PLAN_LANES " in *" $k "*) printf '%s' "$k" ;; *) printf '' ;; esac
+}
+# _lane_plan_limit_re <lane> -> that lane's matcher (empty = no matcher; dv is handled by its own fn).
+_lane_plan_limit_re() {
+  case "$(_lane_plan_key "${1:-}")" in
+    cx)     printf '%s' "$_CX_PLAN_LIMIT_RE" ;;
+    cc)     printf '%s' "$_CC_PLAN_LIMIT_RE" ;;
+    cursor) printf '%s' "$_CURSOR_PLAN_LIMIT_RE" ;;
+    warp)   printf '%s' "$_WARP_PLAN_LIMIT_RE" ;;
+    droid)  printf '%s' "$_DROID_PLAN_LIMIT_RE" ;;
+    cline)  printf '%s' "$_CLINE_PLAN_LIMIT_RE" ;;
+    *)      printf '' ;;
+  esac
+}
+# _lane_plan_limit_refusal <lane> <errfile> -> rc0 if the captured output is that lane's plan/usage-limit
+# refusal. Dispatcher: dv -> _devin_plan_quota_exhausted; other lanes -> their anchored regex; a lane
+# with no matcher (gm/or/hermes/local/unknown) -> rc1, never a false positive.
+_lane_plan_limit_refusal() {
+  local f="${2:-}" key re
+  [ -n "$f" ] && [ -s "$f" ] || return 1
+  key="$(_lane_plan_key "${1:-}")"
+  [ "$key" = dv ] && { _devin_plan_quota_exhausted "$f"; return; }
+  re="$(_lane_plan_limit_re "$key")"; [ -n "$re" ] || return 1
+  grep -qiE "$re" "$f" 2>/dev/null
+}
+# _lane_plan_limit_line <lane> <errfile> -> the first matching line, ANSI-stripped/trimmed (telemetry
+# for tightening the matcher, same role as _devin_plan_quota_line, which dv routes to).
+_lane_plan_limit_line() {
+  local f="${2:-}" key re esc
+  [ -n "$f" ] && [ -s "$f" ] || return 0
+  key="$(_lane_plan_key "${1:-}")"
+  [ "$key" = dv ] && { _devin_plan_quota_line "$f"; return; }
+  re="$(_lane_plan_limit_re "$key")"; [ -n "$re" ] || return 0
+  esc="$(printf '\033')"
+  grep -iE "$re" "$f" 2>/dev/null | head -1 | tr -d '\r' \
+    | sed -E "s/${esc}\\[[0-9;]*[A-Za-z]//g; s/^[[:space:]]+//" | cut -c1-200
+}
+# _lane_limit_reset_phrase <errfile> -> the lane's own reset fragment, in the shapes the CLIs print:
+#   "resets in 11h26m" / "resets at 09:00 UTC"        (Devin)
+#   "Try again in 9h 41m" / "try again at 5:30 pm"     (Codex, Cline)
+#   "will reset at 3pm (America/Santiago)"             (Claude Code)
+#   "resets 4pm (Asia/Kuala_Lumpur)"                   (Claude Code, short form)
+#   "usage limit reached|1749924000"                   (Claude Code headless: epoch after the pipe)
+# TEXT ONLY, first hit, <=50 chars of body. Empty when the refusal carried none.
+_lane_limit_reset_phrase() {
+  local f="${1:-}" esc; [ -n "$f" ] && [ -s "$f" ] || return 0
+  esc="$(printf '\033')"
+  tr -d '\r' < "$f" 2>/dev/null | sed -E "s/${esc}\\[[0-9;]*[A-Za-z]//g" \
+    | grep -oiE '(try again|will reset|resets?|resetting)[[:space:]]+(in|at)[[:space:]]+[^.,;)|"]{1,50}|resets?[[:space:]]+[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)|usage limit reached\|[0-9]{10}' \
+    | head -1 | sed -E 's/[[:space:]]+$//'
+}
+# _lane_limit_reset_secs <phrase> -> seconds until the reset the LANE stated, or empty (never a guess).
+# Normalizes the per-CLI verbs onto the "resets in/at" shapes _devin_plan_quota_reset_secs already
+# parses, and handles the epoch form directly. Same (0, 8d] sanity window.
+_lane_limit_reset_secs() {
+  local p e now; p="$(printf '%s' "${1:-}" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+  [ -n "$p" ] || return 0
+  case "$p" in
+    *'usage limit reached|'*)
+      e="${p##*|}"; case "$e" in ''|*[!0-9]*) return 0 ;; esac
+      now="$(date +%s)"; e=$(( e - now ))
+      [ "$e" -gt 0 ] && [ "$e" -le $(( 8*86400 )) ] || return 0
+      printf '%s' "$e"; return 0 ;;
+  esac
+  p="$(printf '%s' "$p" | sed -E 's/^try again (in|at) /resets \1 /; s/^will reset at /resets at /; s/^resets? ([0-9]{1,2})/resets at \1/')"
+  _devin_plan_quota_reset_secs "$p"
+}
+# Human names + where to look, for the block's message. Not a roster of limits, just labels.
+_lane_plan_display() {
+  case "$(_lane_plan_key "${1:-}")" in
+    dv) printf 'Devin' ;; cx) printf 'Codex (ChatGPT plan)' ;; cc) printf 'Claude Code (Claude plan)' ;;
+    warp) printf 'Warp (Oz)' ;; droid) printf 'Droid (Factory)' ;; cursor) printf 'Cursor' ;;
+    cline) printf 'Cline' ;; gm) printf 'Gemini CLI' ;; or) printf 'OpenRouter (cash)' ;;
+    tokenrouter) printf 'TokenRouter (cash)' ;; claudex) printf 'Claudex proxy' ;; local) printf 'local' ;;
+    *) printf '%s' "${1:-?}" ;;
+  esac
+}
+_lane_plan_usage_hint() {
+  case "$(_lane_plan_key "${1:-}")" in
+    cx)     printf 'Live figure: /status or /usage inside codex.' ;;
+    cc)     printf 'Live figure: /usage inside Claude Code.' ;;
+    warp)   printf 'Live figure: Warp Settings > AI usage.' ;;
+    droid)  printf 'Live figure: /limits inside droid (toggle Droid Core / Extra Usage there), or Settings > Usage.' ;;
+    cursor) printf 'Live figure: the Cursor dashboard (Settings > Usage).' ;;
+    cline)  printf 'Live figure: your Cline account / provider dashboard.' ;;
+    *)      printf '' ;;
+  esac
+}
+# _lane_meter_saturated <lane> -> rc0 when the lane's OWN meter shows a plan window at/over 100%.
+# cx reads the Codex rollout rate_limits (_codex_rate_limits), cc the statusline tap (_session_limits);
+# both arrive through _session_limits' normalized tokens, already freshness- and expiry-gated. This is
+# the cheap, dispatch-free CONFIRMATION recipe for those two lanes: a meter can prove a lane is spent,
+# it can never prove a request would answer, so the probe maps it to limit-refused / unreachable only.
+_lane_meter_saturated() {
+  local key tok v lim; key="$(_lane_plan_key "${1:-}")"
+  lim="$(_session_limits 2>/dev/null)"; [ -n "$lim" ] || return 1
+  for tok in $lim; do
+    case "$key:$tok" in
+      cx:codex5h=*|cx:codexwk=*|cc:claude5h=*|cc:claude7d=*) v="${tok#*=}" ;;
+      *) continue ;;
+    esac
+    awk -v v="$v" 'BEGIN { exit !(v+0 >= 100) }' 2>/dev/null && return 0
+  done
+  return 1
+}
+# _lane_plan_limit_block <lane> <errfile> <model> [advice]
+# The generic sibling of _devin_plan_quota_block (dv routes there). Same PROBE-THEN-DECIDE contract:
+#   1. say the lane refused THIS model citing its plan limit, quote the lane's stated reset (parsed when
+#      the shape is known, labeled an estimate otherwise) and its exact wording;
+#   2. verify with _lane_free_probe (cx/cc: meter-backed; the rest have no cheap recipe yet, rc2);
+#   3. decide: limit-refused -> CONFIRMED, lane down for the lane's stated reset (+60s slack) or the
+#      OSRC_LANE_PLAN_DOWN_TTL estimate (3600s), reason "plan limit exhausted";
+#      answered -> NOT confirmed, lane stays up, nothing marked; no recipe / inconclusive -> UNVERIFIED, only the short
+#      self-healing transport window (OSRC_LANE_DOWN_TTL, 300s), never a day-long block on a guess;
+#   4. reconcile a declared daily cap (no-op unless declared).
+_lane_plan_limit_block() {
+  local lane f="${2:-}" model="${3:-}" advice="${4:-}" name line reset secs="" ttl psecs verdict prc=0 short
+  lane="$(_lane_plan_key "${1:-}")"; [ -n "$lane" ] || return 0
+  if [ "$lane" = dv ]; then
+    _devin_plan_quota_block "$f" "$model" "not just \"$model\"" \
+      "${advice:-Switch lanes OFF Devin: OpenRouter (--provider cc -m glm | -m deepseek) for grind, or a native lane (Claude Code / Codex / Gemini) for judgment work.}"
+    return 0
+  fi
+  name="$(_lane_plan_display "$lane")"
+  ttl="${OSRC_LANE_PLAN_DOWN_TTL:-3600}"; case "$ttl" in ''|*[!0-9]*) ttl=3600 ;; esac
+  short="${OSRC_LANE_DOWN_TTL:-300}"; case "$short" in ''|*[!0-9]*) short=300 ;; esac
+  psecs="${OSRC_LANE_PROBE_SECS:-${OSRC_DEVIN_PROBE_SECS:-30}}"
+  line="$(_lane_plan_limit_line "$lane" "$f")"
+  reset="$(_lane_limit_reset_phrase "$f")"
+  [ -n "$reset" ] && secs="$(_lane_limit_reset_secs "$reset")"
+  if [ -n "$secs" ]; then
+    ttl=$(( secs + 60 ))
+    reset="$name says \"$reset\" (that is $(_epoch_local $(( $(date +%s) + secs )) ) local)."
+  elif [ -n "$reset" ]; then
+    reset="$name says \"$reset\" — I could not parse that into a time, so any lane-down window below is an estimate."
+  else
+    reset="$name gave no reset time in this refusal."
+  fi
+  printf '>>> [%s plan limit] %s refused "%s" citing its plan/usage limit. %s %s\n' "$lane" "$name" "$model" "$reset" "$(_lane_plan_usage_hint "$lane")" >&2
+  [ -n "$line" ] && printf '>>> [%s plan limit] exact wording (for tightening this detector): %s\n' "$lane" "$line" >&2
+  printf '>>> [%s plan limit] probe: a refusal from one request does not prove the lane is spent — verifying (bounded, %ss) before deciding anything.\n' "$lane" "$psecs" >&2
+  verdict="$(_lane_free_probe "$lane")"; prc=$?
+  case "$verdict:$prc" in
+    limit-refused:*)
+      printf '>>> [%s plan limit] probe: CONFIRMED — %s. %s lane marked DOWN for %s%s (clear early with: %s posture reset). Dispatch + fallback skip it until then. %s\n' \
+        "$lane" "$( [ -s "$(_lane_probe_file "$lane")" ] && head -c 160 "$(_lane_probe_file "$lane")" | tr '\n' ' ' | sed -E 's/[[:space:]]+$//' || printf 'the lane refused the probe with a limit too')" \
+        "$lane" "$(_fmt_secs_human "$ttl")" "$( [ -n "$secs" ] && printf ', until its stated reset' || printf ' (an ESTIMATE: no parseable reset; override OSRC_LANE_PLAN_DOWN_TTL)')" "$0" "$advice" >&2
+      _lane_down_mark "$lane" "$ttl" "plan limit exhausted" || true ;;
+    answered:*)
+      printf '>>> [%s plan limit] probe: NOT confirmed — the lane still answers, so it stays UP and nothing is marked; "%s" was refused on this run only. %s\n' "$lane" "$model" "$advice" >&2
+      _lane_down_clear "$lane" ;;
+    *:2)
+      printf '>>> [%s plan limit] probe: UNVERIFIED — no cheap probe recipe for this lane yet, so I am not assuming its whole plan window is spent. Marking it DOWN only for the short self-healing window (~%s) so dispatch + fallback skip a lane that just refused; if the refusal repeats it re-marks. %s\n' "$lane" "$(_fmt_secs_human "$short")" "$advice" >&2
+      _lane_down_mark "$lane" "" "plan limit refusal (unverified: no probe recipe)" || true ;;
+    *)
+      printf '>>> [%s plan limit] probe: INCONCLUSIVE — the meter/probe proved nothing either way. Short self-healing window only (~%s). %s\n' "$lane" "$(_fmt_secs_human "$short")" "$advice" >&2
+      _lane_down_mark "$lane" "" "plan limit refusal; probe inconclusive" || true ;;
+  esac
+  case "$verdict:$prc" in
+    limit-refused:*) _failover_signal_write "$lane" "$model" confirmed "plan limit spent${secs:+ (resets in $(_fmt_secs_human "$secs"))}" "$secs" ;;
+    answered:*)      _failover_signal_write "$lane" "$model" answered "still answers" "" ;;
+    *:2)             _failover_signal_write "$lane" "$model" unverified "refused \"$model\" citing its plan limit${secs:+ (it says the limit resets in $(_fmt_secs_human "$secs"))}" "$secs" ;;
+    *)               _failover_signal_write "$lane" "$model" inconclusive "refused \"$model\" citing its plan limit${secs:+ (resets in $(_fmt_secs_human "$secs"))}" "$secs" ;;
+  esac
+  rm -f "$(_lane_probe_file "$lane")" 2>/dev/null
+  _quota_note_refusal "$lane" "$model" 2>/dev/null || true
+  return 0
+}
+# _lane_errfile -> a private per-process capture file for a delegate's stderr (empty when unavailable).
+_lane_errfile() {
+  local f; _mkdir_private "$OSRC_HOME" >/dev/null 2>&1 || { printf ''; return 0; }
+  f="$OSRC_HOME/.lerr.$$"; : > "$f" 2>/dev/null && chmod 600 "$f" 2>/dev/null && printf '%s' "$f" || printf ''
+}
+# _run_tee_stderr <errfile|""> <cmd...> -> run the command with stderr STILL shown live and also captured
+# to the file (the dv lane's `2> >(tee ...)` idiom). stdout is untouched; $? is the command's. With an
+# empty file the command runs plain. Best-effort: a still-flushing tee can leave the file short, which
+# can only MISS a detection, never invent one.
+_run_tee_stderr() {
+  local f="${1:-}"; shift
+  if [ -n "$f" ]; then "$@" 2> >(tee "$f" >&2); else "$@"; fi
+}
+# _lane_plan_limit_after_run <lane> <errfile> <model> <rc> -> rc0 always. The post-run hook every plan
+# lane's delegate calls: on a failed run (or a headless claude -p result flagged is_error:true, which
+# exits 0), route the captured output through the dispatcher and, on a match, the probe-then-decide
+# block. Does NOT delete the file; the caller owns it.
+_lane_plan_limit_after_run() {
+  local lane="${1:-}" f="${2:-}" model="${3:-}" rc="${4:-0}"
+  [ -n "$f" ] && [ -s "$f" ] || return 0
+  case "$rc" in ''|*[!0-9]*) rc=1 ;; esac
+  if [ "$rc" -ne 0 ] || grep -qE '"is_error"[[:space:]]*:[[:space:]]*true' "$f" 2>/dev/null; then
+    _lane_plan_limit_refusal "$lane" "$f" && _lane_plan_limit_block "$lane" "$f" "$model"
+  fi
   return 0
 }
 
@@ -1865,9 +2214,10 @@ delegate() {
       _fallback="It is Devin-only (no OpenRouter sibling), so switch lanes."
     fi
     if [ -n "$_dverr" ] && _devin_plan_quota_exhausted "$_dverr"; then
-      # The SHARED plan bucket is spent — a real block, not a mis-gate. The "same model on
-      # OpenRouter" fallback is the right OFF-Devin hop for glm/deepseek; SWE/Kimi are Devin-only,
-      # so name the OpenRouter grind lane + native lanes instead. Never another Devin plan model.
+      # Devin says the SHARED plan bucket is spent. The block VERIFIES that with a bounded probe of a
+      # sibling free model before taking the lane down (probe-then-decide); the advice below is for
+      # the confirmed case and points OFF Devin: the "same model on OpenRouter" hop for glm/deepseek,
+      # the OpenRouter grind lane + native lanes for the Devin-only SWE/Kimi.
       local _pq_off
       if [ -n "$_or_alias" ]; then
         _pq_off="Switch lanes OFF Devin: the same model runs on OpenRouter — --provider cc -m $_or_alias (funded/cash lane) — or use a native lane (Claude Code / Codex / Gemini) for judgment work."
@@ -1882,15 +2232,17 @@ delegate() {
       local _qline; _qline="$(_devin_quota_refusal_line "$_dverr")"
       [ -n "$_qline" ] && printf '>>> [free-tier] Devin'\''s exact wording (for tightening this detector): %s\n' "$_qline" >&2
     elif [ -z "$_dverr" ]; then
-      printf '>>> [free-tier] if that was a plan/quota refusal, note "%s" is free-tier and should not be gated by a paid balance — unless Devin said the DAILY/WEEKLY plan quota is exhausted, which is a real block of every plan-included model. %s Check Devin'\''s plan usage at https://app.devin.ai/settings/usage.\n' "$MODEL" "$_fallback" >&2
+      printf '>>> [free-tier] if that was a plan/quota refusal, note "%s" is free-tier and should not be gated by a paid balance — unless Devin said the DAILY/WEEKLY plan quota is exhausted, which may block every plan-included model (verify with a bounded probe: %s doctor). %s Check Devin'\''s plan usage at https://app.devin.ai/settings/usage.\n' "$MODEL" "$0" "$_fallback" >&2
     fi
   fi
   if [ "$rc" -ne 0 ] && [ "$_dv_free" = "0" ] && [ -n "$_dverr" ]; then
     if _devin_plan_quota_exhausted "$_dverr"; then
-      # Gate on WHICH signature matched. A daily/weekly-plan exhaustion means the plan-included models
-      # are spent too (same bucket), so "free tier still available" would send the user straight back
-      # into the empty quota. Say so, take the lane down, and point OFF Devin.
-      _devin_plan_quota_block "$_dverr" "$MODEL" "including the free-tier ones you would otherwise fall back to, so do NOT retry them" \
+      # Gate on WHICH signature matched. A daily/weekly-plan exhaustion CLAIMS the plan-included models
+      # are spent too (same bucket), so a blind "free tier still available" could send the user straight
+      # back into an empty quota — and a blind "do not retry them" wrongly skips a free model that still
+      # answers. The block probes a free model and decides from the result; the scope/advice here are
+      # the confirmed-case wording.
+      _devin_plan_quota_block "$_dverr" "$MODEL" "including the free-tier ones you would otherwise fall back to (the probe was refused as well)" \
         "Switch lanes OFF Devin: OpenRouter (--provider cc -m glm | -m deepseek) for grind, or a native lane (Claude Code / Codex / Gemini) for judgment work."
     elif _devin_quota_refusal "$_dverr"; then
       # A pure ACU/paid block: the free-tier-still-available line IS valid here (separate pool).
@@ -3862,6 +4214,60 @@ _devin_plan_meter_line() {
   if [ "$warn" -gt 0 ] && [ "$n" -ge "$warn" ]; then
     printf 'WARN        : heavy Devin-plan use today (%s jobs, threshold OSRC_DEVIN_PLAN_JOBS_WARN=%s) — every dispatch drains the shared daily bucket. Route mechanical/parallel grind to OpenRouter (--provider cc -m glm|deepseek), a native lane, or local. Routing advice only; nothing is blocked.\n' "$n" "$warn"
   fi
+}
+
+# ---- GENERIC PLAN-LANE METER (dv keeps its bespoke free-tier meter above) ------------------
+# _lane_plan_jobs_today <lane> -> integer: this lane's countable ledger rows since the UTC day start.
+# dv routes to _devin_plan_jobs_today (plan-included models only). Other plan lanes bill every model
+# against one subscription, so every row counts. Rows are matched on (.lane // .provider) against the
+# lane's own tokens (code, aliases, disp, and the *-native provider names the ledger writer uses).
+_lane_plan_jobs_today() {
+  local lane l toks n; lane="$(_lane_plan_key "${1:-}")"
+  [ -n "$lane" ] || { printf 0; return; }
+  [ "$lane" = dv ] && { _devin_plan_jobs_today; return; }
+  [ -f "$OSRC_LEDGER" ] || { printf 0; return; }
+  have jq || { printf 0; return; }
+  toks="$lane"
+  if l="$(_lane_by_token "$lane" 2>/dev/null)"; then
+    toks="$toks $(_lane_field "$l" aliases 2>/dev/null) $(_lane_field "$l" disp 2>/dev/null)"
+  fi
+  case "$lane" in cx) toks="$toks codex-native" ;; cc) toks="$toks claude-native" ;; esac
+  local start today; start="$(_quota_day_start utc)"; today="$(date +%Y-%m-%d)"
+  n="$(jq -Rn --argjson start "$start" --arg today "$today" --arg toks "$toks" --arg noncount "$OSRC_QUOTA_NONCOUNT_VERBS" '
+       ($noncount | split(" ")) as $nc | ($toks | split(" ") | map(select(length > 0))) as $tk
+       | [ inputs | fromjson? // empty
+           | objects
+           | select( (((.lane // .provider) // "") | tostring) as $l | ($tk | index($l)) != null )
+           | select((.verb // "") as $v | ($nc | index($v)) | not)
+           | select( ((.epoch | numbers) // null) as $e
+                     | if $e != null then ($e >= $start) else ((.ts // "") | startswith($today)) end )
+         ] | length' "$OSRC_LEDGER" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$n" ;; esac
+}
+# _lane_plan_meter_line <lane> [quiet] -> one brief/status line for a plan lane: jobs today + the
+# lane-down notice (reason + time left) when a marker is live. `quiet` prints nothing when there is
+# nothing to say (0 jobs, lane up). dv routes to its bespoke line. Routing information only.
+_lane_plan_meter_line() {
+  local lane n down=0 line; lane="$(_lane_plan_key "${1:-}")"
+  [ -n "$lane" ] || return 0
+  [ "$lane" = dv ] && { _devin_plan_meter_line "${2:-}"; return; }
+  n="$(_lane_plan_jobs_today "$lane")"
+  _lane_down_active "$lane" && down=1
+  [ "${2:-}" = "quiet" ] && [ "$n" = "0" ] && [ "$down" = "0" ] && return 0
+  line="$(printf '%-12s: %s %s plan job%s today (UTC day)' "$lane plan" "$n" "$(_lane_plan_display "$lane")" "$([ "$n" = "1" ] || printf s)")"
+  if [ "$down" = "1" ]; then
+    line="$line — $lane lane DOWN ($(_lane_down_reason "$lane")) for another $(_lane_down_remaining "$lane"); dispatch + fallback skip it until then."
+  fi
+  printf '%s\n' "$line"
+}
+# _plan_lanes_meter [quiet] -> the meter lines for every plan lane. dv keeps its existing verbosity
+# (full line when devin is installed, else quiet); every other lane is always quiet-style so brief
+# stays terse for lanes the user does not touch.
+_plan_lanes_meter() {
+  local l
+  for l in $OSRC_PLAN_LANES; do
+    if [ "$l" = dv ]; then _devin_plan_meter_line "${1:-}"; else _lane_plan_meter_line "$l" quiet; fi
+  done
 }
 
 # Exhausted-until marker (posture cache). A real quota refusal writes the next-reset epoch here; the
@@ -7755,7 +8161,7 @@ cmd_brief() {
   _conserve_reco "$limits" "$lanes"
   # Devin plan meter: the one pre-flight signal we own for the shared daily bucket (see the meter
   # block). Full line whenever devin is installed; otherwise only when there is something to say.
-  if have devin; then _devin_plan_meter_line; else _devin_plan_meter_line quiet; fi
+  if have devin; then _plan_lanes_meter; else _plan_lanes_meter quiet; fi
   if mode="$(_mode_read)"; then printf 'driving mode : %s — %s\n' "$mode" "$(_mode_meaning "$mode")"
   else printf -- '---\n'; _mode_menu; fi
   # Self-heal the Devin skills mirror. `brief` runs at session start on EVERY host, so this closes the
@@ -10727,7 +11133,7 @@ cmd_status() {
   fi
   if [ -n "$id" ]; then _status_line "$id"; return; fi
   [ -d "$OSRC_JOBS" ] || { echo "no jobs yet."; return 0; }
-  _devin_plan_meter_line quiet   # Devin plan meter (+ lane-down notice) — silent when 0 and the lane is up
+  _plan_lanes_meter quiet   # plan-lane meters (+ lane-down notices) — silent when 0 and the lanes are up
   printf '%-22s %-8s %-6s %-16s %-12s %s\n' JOB STATE AGE MODEL ACTS "LAST"
   local d t0 now shown=0 total
   t0=$(date +%s)
@@ -12015,8 +12421,9 @@ delegate_cxnative() {
   # Luna) keeps working. Verified live: luna answers PONG with the flag on. Escape hatch: set
   # OSRC_CODEX_USER_CONFIG=1 to deliberately ride your full live config (e.g. to reuse an MCP server).
   local iso=(); [ "${OSRC_CODEX_USER_CONFIG:-0}" = "1" ] || iso=(--ignore-user-config)
-  local rc=0
-  codex exec --skip-git-repo-check ${iso[@]+"${iso[@]}"} ${cmh[@]+"${cmh[@]}"} ${eff[@]+"${eff[@]}"} "${sflag[@]}" ${sfx[@]+"${sfx[@]}"} -m "$id" "$wrapped" || rc=$?
+  local rc=0 _lerr; _lerr="$(_lane_errfile)"
+  _run_tee_stderr "$_lerr" codex exec --skip-git-repo-check ${iso[@]+"${iso[@]}"} ${cmh[@]+"${cmh[@]}"} ${eff[@]+"${eff[@]}"} "${sflag[@]}" ${sfx[@]+"${sfx[@]}"} -m "$id" "$wrapped" || rc=$?
+  _lane_plan_limit_after_run cx "$_lerr" "$id" "$rc"; [ -n "$_lerr" ] && rm -f "$_lerr" 2>/dev/null
   record_ledger codex-native "$id" "$ttier" "$tier" "$task" "0.000000" cx
   if [ "${OSRC_STREAM:-0}" != "1" ]; then
     local ql; ql="$(_codex_quota_line 2>/dev/null)"
@@ -12152,6 +12559,9 @@ delegate_ccnative() {
     record_ledger claude-native "$id" "$ttier" "$tier" "$task" "0.000000" cc
     if [ "$rc" -eq 0 ] && have jq && [ -s "$tmpj" ]; then jq -r '.result // empty' "$tmpj" 2>/dev/null; else cat "$tmpj" 2>/dev/null; fi
     _cc_verify_model "$id" "$tmpj"
+    # Plan-limit detection on the JSON result: headless claude -p reports a usage-limit refusal with
+    # exit 0 + is_error:true, the refusal text only in .result — the hook checks both shapes.
+    _lane_plan_limit_after_run cc "$tmpj" "$id" "$rc"
     chmod 600 "$tmpj" 2>/dev/null || true
     rm -f "$tmpj"
     umask "$old_umask"
@@ -12542,8 +12952,9 @@ delegate_droid() {
   local ttier; ttier="$(resolve_tier "$model_key" "${TTIER:-}")" || ttier="capable"
   local wrapped; wrapped="$(_build_prompt "$model_key" "$task" "$ttier")"
   _tier_banner "droid (Factory)" "$id" "$ttier" "$posture | $(_lane_cost_disclosure droid)"
-  local rc=0
-  droid exec ${mflag[@]+"${mflag[@]}"} ${aflag[@]+"${aflag[@]}"} ${eff[@]+"${eff[@]}"} -o text "$wrapped" || rc=$?
+  local rc=0 _lerr; _lerr="$(_lane_errfile)"
+  _run_tee_stderr "$_lerr" droid exec ${mflag[@]+"${mflag[@]}"} ${aflag[@]+"${aflag[@]}"} ${eff[@]+"${eff[@]}"} -o text "$wrapped" || rc=$?
+  _lane_plan_limit_after_run droid "$_lerr" "$ledger_model" "$rc"; [ -n "$_lerr" ] && rm -f "$_lerr" 2>/dev/null
   record_ledger droid "$ledger_model" "$ttier" "$tier" "$task" "$(_fg_run_cost droid 0 "")" droid
   printf '>>> [receipt] %s.\n' "$(_lane_cost_disclosure droid)" >&2
   return "$rc"
@@ -12572,8 +12983,9 @@ delegate_cursor() {
   local ttier; ttier="$(resolve_tier "${MODEL:-}" "${TTIER:-}")" || ttier="capable"
   local wrapped; wrapped="$(_build_prompt "${MODEL:-cursor}" "$task" "$ttier")"
   _tier_banner "cursor-agent" "$id" "$ttier" "$posture | $(_lane_cost_disclosure cursor)"
-  local rc=0
-  "$cur" -p "$wrapped" ${mflag[@]+"${mflag[@]}"} ${fflag[@]+"${fflag[@]}"} --trust --output-format text || rc=$?
+  local rc=0 _lerr; _lerr="$(_lane_errfile)"
+  _run_tee_stderr "$_lerr" "$cur" -p "$wrapped" ${mflag[@]+"${mflag[@]}"} ${fflag[@]+"${fflag[@]}"} --trust --output-format text || rc=$?
+  _lane_plan_limit_after_run cursor "$_lerr" "${MODEL:-cursor-default}" "$rc"; [ -n "$_lerr" ] && rm -f "$_lerr" 2>/dev/null
   record_ledger cursor "${MODEL:-cursor-default}" "$ttier" "$tier" "$task" "$(_fg_run_cost cursor 0 "")" cursor
   printf '>>> [receipt] %s.\n' "$(_lane_cost_disclosure cursor)" >&2
   return "$rc"
@@ -12677,8 +13089,9 @@ delegate_warp() {
   local ttier; ttier="$(resolve_tier "$model_key" "${TTIER:-}")" || ttier="capable"
   local wrapped; wrapped="$(_build_prompt "$model_key" "$task" "$ttier")"
   _tier_banner "warp (Oz agent)" "$id" "$ttier" "$posture | $(_lane_cost_disclosure warp)"
-  local rc=0
-  oz agent run -p "$wrapped" ${mflag[@]+"${mflag[@]}"} ${hflag[@]+"${hflag[@]}"} ${pflag[@]+"${pflag[@]}"} -C "$PWD" --output-format text || rc=$?
+  local rc=0 _lerr; _lerr="$(_lane_errfile)"
+  _run_tee_stderr "$_lerr" oz agent run -p "$wrapped" ${mflag[@]+"${mflag[@]}"} ${hflag[@]+"${hflag[@]}"} ${pflag[@]+"${pflag[@]}"} -C "$PWD" --output-format text || rc=$?
+  _lane_plan_limit_after_run warp "$_lerr" "$ledger_model" "$rc"; [ -n "$_lerr" ] && rm -f "$_lerr" 2>/dev/null
   record_ledger warp "$ledger_model" "$ttier" "$tier" "$task" "$(_fg_run_cost warp 0 "")" warp
   printf '>>> [receipt] %s.\n' "$(_lane_cost_disclosure warp)" >&2
   return "$rc"
@@ -12807,8 +13220,9 @@ delegate_cline() {
   local ttier; ttier="$(resolve_tier "${MODEL:-}" "${TTIER:-}")" || ttier="capable"
   local wrapped; wrapped="$(_build_prompt "${MODEL:-cline}" "$task" "$ttier")"
   _tier_banner "cline (Cline CLI)" "$id" "$ttier" "$posture, bills your ClinePass subscription or the keys configured in ~/.cline"
-  local rc=0
-  cline ${pflag[@]+"${pflag[@]}"} ${mflag[@]+"${mflag[@]}"} ${eff[@]+"${eff[@]}"} "$wrapped" || rc=$?
+  local rc=0 _lerr; _lerr="$(_lane_errfile)"
+  _run_tee_stderr "$_lerr" cline ${pflag[@]+"${pflag[@]}"} ${mflag[@]+"${mflag[@]}"} ${eff[@]+"${eff[@]}"} "$wrapped" || rc=$?
+  _lane_plan_limit_after_run cline "$_lerr" "${MODEL:-cline-default}" "$rc"; [ -n "$_lerr" ] && rm -f "$_lerr" 2>/dev/null
   # Pass the resolved lane ("cline") as the 7th arg so the Tab's plan-vs-cash split buckets
   # foreground cline runs correctly. Without it, fg rows carry no .lane field and are
   # misbucketed as cash (bg rows pass the lane via run_job; fg rows must pass it here).
@@ -14396,6 +14810,277 @@ _gate_hop() {
   return 1
 }
 
+# =============================================================================
+# CROSS-HARNESS FAILOVER. When the harness a job is running on hits ITS OWN plan limit
+# mid-job (detected by the plan-limit blocks above), move the work to another harness the user actually
+# has, and say so like a human. Invariants:
+#   * only harnesses the user HAS, discovered live (readiness probes + lane-down markers); never
+#     invented capacity;
+#   * same model on another harness first, else the nearest tier from the tier table (ties go to the
+#     cheaper tier, then lane preference order);
+#   * free/plan lanes auto; CASH lanes (cost_class=credits) only with consent already granted
+#     (OSRC_FAILOVER_CASH_OK=1), otherwise they are named in the stop message, never used silently;
+#   * a READ-ONLY job (auto tier) simply re-dispatches on the pick; a MUTATING job (edit/yolo/
+#     research) is re-dispatched FRESH with a handoff note so the new agent continues from the CURRENT
+#     repo state — never a byte-level resume of the interrupted turn, and never a silent retry;
+#   * every hop prints ">>> [failover] <source> <reason>. You have <target> — moving this to <model>
+#     there and continuing."; when nothing is ready it prints the "every lane you have is at its limit
+#     or absent" line and STOPS.
+# The blocks leave a per-process SIGNAL file (delegates run in subshells / background jobs, so a
+# variable cannot carry the verdict back); route_delegate clears it before a dispatch and reads it
+# after a failed one. Bounded by OSRC_FAILOVER_MAX hops per job (default 2) so two spent lanes can
+# never ping-pong.
+# =============================================================================
+# Lane preference order for a hop: plan/subscription lanes first, cash lanes last. `local` is left
+# out on purpose (no model-equivalence claim can be made for whatever the user pulled locally).
+OSRC_FAILOVER_LANES="cc cx gm dv droid warp cursor cline or tokenrouter claudex"
+_FAILOVER_CASH_SKIPPED=""   # in-process mirror; the file below is the source of truth across $(...)
+_FO_LANE=""; _FO_MODEL=""; _FO_VERDICT=""; _FO_REASON=""; _FO_RESET=""
+
+_failover_signal_file() { printf '%s/.failover.signal.%s' "$OSRC_HOME" "$$"; }
+# The picker runs under a command substitution, so the cash lanes it had to skip are recorded in a
+# per-process file (not a variable) for the stop line to name.
+_failover_cash_file() { printf '%s/.failover.cash.%s' "$OSRC_HOME" "$$"; }
+_failover_cash_skipped() { tr '\n' ' ' < "$(_failover_cash_file)" 2>/dev/null | sed -E 's/[[:space:]]+$//'; }
+_failover_cash_clear() { rm -f "$(_failover_cash_file)" 2>/dev/null; }
+# _failover_signal_write <lane> <model> <verdict> <reason> [reset-secs]. verdict: confirmed |
+# unverified | inconclusive | answered (answered = the lane still runs; not a failover trigger).
+_failover_signal_write() {
+  local f; f="$(_failover_signal_file)"
+  _mkdir_private "$OSRC_HOME" >/dev/null 2>&1 || return 0
+  { umask 077; printf '%s|%s|%s|%s|%s|%s\n' "${1:-}" "${2:-}" "${3:-}" "$(printf '%s' "${4:-}" | tr '|\n' '/ ')" "${5:-}" "$(date +%s)" > "$f"; } 2>/dev/null || true
+}
+_failover_signal_clear() { rm -f "$(_failover_signal_file)" 2>/dev/null; }
+# _failover_signal_read -> rc0 + _FO_* set when a signal exists (any verdict).
+_failover_signal_read() {
+  local f line rest; f="$(_failover_signal_file)"
+  [ -s "$f" ] || return 1
+  # Parsed with parameter expansion, not `read`: no fd is ever consumed (bg/CI-safe by construction).
+  line="$(head -n 1 "$f" 2>/dev/null)"; [ -n "$line" ] || return 1
+  _FO_LANE="${line%%|*}";    rest="${line#*|}"
+  _FO_MODEL="${rest%%|*}";   rest="${rest#*|}"
+  _FO_VERDICT="${rest%%|*}"; rest="${rest#*|}"
+  _FO_REASON="${rest%%|*}";  rest="${rest#*|}"
+  _FO_RESET="${rest%%|*}"
+  [ -n "$_FO_LANE" ]
+}
+# _failover_signal_pending -> rc0 when the last dispatch left a plan-limit verdict that warrants a hop.
+_failover_signal_pending() {
+  _failover_signal_read || return 1
+  [ "$_FO_VERDICT" != "answered" ]
+}
+
+_tier_index() { case "${1:-}" in frontier) printf 0 ;; capable) printf 1 ;; mid) printf 2 ;; budget) printf 3 ;; *) printf 2 ;; esac; }
+_tier_dist() { local a b; a="$(_tier_index "$1")"; b="$(_tier_index "$2")"; [ "$a" -ge "$b" ] && printf '%s' $(( a - b )) || printf '%s' $(( b - a )); }
+_failover_lane_rank() { local i=0 l; for l in $OSRC_FAILOVER_LANES; do i=$((i+1)); [ "$l" = "${1:-}" ] && { printf '%s' "$i"; return; }; done; printf 99; }
+_failover_lane_is_cash() { [ "$(_lane_field "${1:-}" cost_class 2>/dev/null)" = "credits" ]; }
+
+# _failover_lane_ok <lane> <verb> [model] -> rc0 when the lane can take this job RIGHT NOW: not marked
+# down, its CLI/key/login is present (the lane's own readiness probe), not a cash lane without consent,
+# not a denied model, and not a lane/model the descriptor warns off for a mutating verb. A skipped cash
+# lane is remembered in _FAILOVER_CASH_SKIPPED so the stop message can name it.
+_failover_lane_ok() {
+  local l="${1:-}" verb="${2:-run}" m="${3:-}" _ff _wm
+  [ -n "$l" ] || return 1
+  _lane_down_active "$l" && return 1
+  _ff="$(_lane_field "$l" fallback_ready_fn 2>/dev/null)"
+  if [ -n "$_ff" ] || [ "$l" = dv ] || [ "$l" = tokenrouter ]; then
+    _fallback_lane_ready "$l" || return 1
+  elif [ -n "$(_lane_field "$l" ready_fn 2>/dev/null)" ]; then
+    _lane_ready_probe "$l" >/dev/null 2>&1 || return 1
+  else
+    # No probe declared (warp): the descriptor's cli field is the presence check.
+    local _cli _hit=0; for _cli in $(_lane_field "$l" cli 2>/dev/null); do have "$_cli" && { _hit=1; break; }; done
+    [ "$_hit" = 1 ] || return 1
+  fi
+  if _failover_lane_is_cash "$l" && [ "${OSRC_FAILOVER_CASH_OK:-0}" != "1" ]; then
+    case " $_FAILOVER_CASH_SKIPPED " in *" $l "*) ;; *)
+      _FAILOVER_CASH_SKIPPED="${_FAILOVER_CASH_SKIPPED:+$_FAILOVER_CASH_SKIPPED }$l"
+      { umask 077; printf '%s\n' "$l" >> "$(_failover_cash_file)"; } 2>/dev/null || true ;;
+    esac
+    return 1
+  fi
+  [ -n "$m" ] && _model_denied "$m" && return 1
+  if [ -n "$m" ]; then
+    _wm="$(_lane_field "$l" warn_model 2>/dev/null)"
+    if [ -n "$_wm" ] && [ "$_wm" = "$m" ]; then
+      case " $(_lane_field "$l" warn_verbs 2>/dev/null) " in *" $verb "*) return 1 ;; esac
+    fi
+  fi
+  return 0
+}
+
+# _failover_same_model_on <lane> <model> <canon-key> -> the id that lane runs for the SAME model, or
+# empty. Sources, cache-only (never a fetch): the static alias table (cx/cc/gm/dv/or rows), the cached
+# catalogs _model_lanes already indexes (or/dv/warp), and the kimi family alias the droid/warp engines
+# share. An engine lane that owns its catalog is NOT assumed to serve an arbitrary id.
+_failover_same_model_on() {
+  local l="${1:-}" model="${2:-}" canon="${3:-}" alias resolved lane tier lanes
+  [ -n "$l" ] && [ -n "$canon" ] || return 0
+  while IFS='|' read -r alias resolved lane tier; do
+    [ -n "$alias" ] && [ "$lane" = "$l" ] || continue
+    [ "$(_model_canon_key "$resolved")" = "$canon" ] && { printf '%s' "$alias"; return 0; }
+  done <<_OSRC_FO_T
+$OSRC_MODEL_TABLE
+_OSRC_FO_T
+  lanes="$(_model_lanes "$canon" 2>/dev/null)"
+  case " $lanes " in
+    *" $l "*)
+      case "$l" in
+        dv)   local dvm; dvm="$(_devin_model_for "$model")"; printf '%s' "${dvm:-$model}" ;;
+        warp) _lane_model_for warp "$model" ;;
+        *)    printf '%s' "$model" ;;
+      esac
+      return 0 ;;
+  esac
+  case "$l:$canon" in droid:kimi-k3|warp:kimi-k3) printf 'kimi-k3' ;; esac
+  return 0
+}
+
+# _failover_pick <down-lane> <model> <verb> -> "lane|model|why" (why = same-model | tier:<t>), or empty
+# when no ready harness has headroom. Pass 1: the same model on another READY lane, in preference
+# order. Pass 2: nearest tier from the tier table (engine lanes contribute their default model at the
+# tier the table gives it, else mid) — smaller tier distance first, cheaper tier on a tie, then lane
+# order; one candidate per lane; readiness is probed at most once per lane.
+_failover_pick() {
+  local src="${1:-}" model="${2:-}" verb="${3:-run}" canon want l m alias resolved lane tier d ti key rows="" seen="" seq=0
+  src="$(_lane_plan_key "$src")"; [ -n "$src" ] || src="${1:-}"
+  _FAILOVER_CASH_SKIPPED=""; _failover_cash_clear
+  # An ALIAS as typed (kimi, glm, sonnet) must mean the model it resolves to: canonicalize the table's
+  # resolved id, not the raw token, or "kimi" never matches kimi-k3 on droid/warp and the same-model
+  # pass silently falls through to a tier pick.
+  local _row _res; _row="$(resolve_model_row "$model" 2>/dev/null)"; _res="${_row%%|*}"
+  canon="$(_model_canon_key "${_res:-$model}")"
+  want="$(resolve_tier "$model" "${TTIER:-}" 2>/dev/null)"; case "$want" in frontier|capable|mid|budget) ;; *) want=mid ;; esac
+  for l in $OSRC_FAILOVER_LANES; do
+    [ "$l" = "$src" ] && continue
+    m="$(_failover_same_model_on "$l" "$model" "$canon")"; [ -n "$m" ] || continue
+    _failover_lane_ok "$l" "$verb" "$m" || continue
+    printf '%s|%s|same-model' "$l" "$m"; return 0
+  done
+  while IFS='|' read -r alias resolved lane tier; do
+    [ -n "$alias" ] && [ "$lane" != "$src" ] || continue
+    case " $OSRC_FAILOVER_LANES " in *" $lane "*) ;; *) continue ;; esac
+    [ "$(_model_canon_key "$resolved")" = "$canon" ] && continue   # pass 1 already refused this
+    d="$(_tier_dist "$want" "$tier")"; ti="$(_tier_index "$tier")"; seq=$((seq + 1))
+    # key = distance, then cheaper tier, then lane order, then TABLE order (the short alias is listed first)
+    rows="$rows$(printf '%s%s%02d%04d|%s|%s|%s' "$d" "$((3 - ti))" "$(_failover_lane_rank "$lane")" "$seq" "$lane" "$alias" "$tier")
+"
+  done <<_OSRC_FO_T
+$OSRC_MODEL_TABLE
+_OSRC_FO_T
+  for l in $OSRC_FAILOVER_LANES; do
+    [ "$l" != "$src" ] && [ "$(_lane_field "$l" owns_catalog 2>/dev/null)" = "yes" ] || continue
+    tier="$(resolve_tier "$(_lane_field "$l" default_model 2>/dev/null)" 2>/dev/null)"; case "$tier" in frontier|capable|mid|budget) ;; *) tier=mid ;; esac
+    d="$(_tier_dist "$want" "$tier")"; ti="$(_tier_index "$tier")"; seq=$((seq + 1))
+    rows="$rows$(printf '%s%s%02d%04d|%s||%s' "$d" "$((3 - ti))" "$(_failover_lane_rank "$l")" "$seq" "$l" "$tier")
+"
+  done
+  [ -n "$rows" ] || return 0
+  while IFS='|' read -r key lane m tier; do
+    [ -n "$lane" ] || continue
+    case " $seen " in *" $lane "*) continue ;; esac
+    seen="$seen $lane"
+    _failover_lane_ok "$lane" "$verb" "$m" || continue
+    printf '%s|%s|tier:%s' "$lane" "$m" "$tier"; return 0
+  done < <(printf '%s' "$rows" | sort -t'|' -k1,1)
+  return 0
+}
+
+# _failover_soonest_reset -> "<Lane> in 11h26m" for the down lane that comes back first, or empty.
+_failover_soonest_reset() {
+  local l v now best="" bl=""; now="$(date +%s)"
+  for l in dv $OSRC_FAILOVER_LANES; do
+    _lane_down_active "$l" || continue
+    v="$(_posture_get "$l" down 2>/dev/null)"; case "$v" in ''|*[!0-9]*) continue ;; esac
+    if [ -z "$best" ] || [ "$v" -lt "$best" ]; then best="$v"; bl="$l"; fi
+  done
+  [ -n "$best" ] && printf '%s in %s' "$(_lane_plan_display "$bl")" "$(_fmt_secs_human $(( best - now )))"
+}
+# _failover_nothing_notice <src-lane> <reason> -> the honest STOP line (never invented capacity).
+_failover_nothing_notice() {
+  local soon cash="" skipped; soon="$(_failover_soonest_reset)"; skipped="$(_failover_cash_skipped)"
+  [ -n "$skipped" ] && cash=" ($skipped would take it but spends cash; allow that with OSRC_FAILOVER_CASH_OK=1.)"
+  printf '>>> [failover] every lane you have is at its limit or absent; nothing to fail over to (%s %s). Waiting for %s or add a lane.%s\n' \
+    "$(_lane_plan_display "${1:-?}")" "${2:-hit its plan limit}" "${soon:-the next reset (no lane stated one)}" "$cash" >&2
+}
+# _failover_handoff_note <src-lane> <model> -> the preamble a MUTATING re-dispatch carries. The new
+# agent starts from the CURRENT repo state; nothing is replayed.
+_failover_handoff_note() {
+  printf '[handoff] This task was started on %s (%s) and interrupted by that harness'\''s plan limit. Continue from the CURRENT repo state: first inspect the working tree (git status, git diff), keep everything already done, and finish only the remaining work. Do not redo completed steps and do not revert existing changes. The original task follows.' \
+    "$(_lane_plan_display "${1:-?}")" "${2:-?}"
+}
+# _failover_rebuild_argv <lane> <model-or-empty> <mutating:0|1> <src-lane> <src-model> -> ARGV rebuilt
+# to re-enter route_delegate pinned to the pick (dynamic scope like _fb_rebuild_argv). Empty model =
+# the lane's default (no -m). A mutating job gets the handoff note in front of the task.
+_failover_rebuild_argv() {
+  local lane="${1:-}" model="${2:-}" mutating="${3:-0}" _p _w _new
+  _p="$(_fallback_provider_for_lane "$lane")" || return 1
+  _new=(--provider "$_p")
+  [ -n "$model" ] && _new+=(-m "$model")
+  [ -n "${TIER_FLAG:-}" ] && _new+=(--tier "$TIER_FLAG")
+  [ -n "${EFFORT:-}" ] && _new+=(--effort "$EFFORT")
+  [ "${OSRC_ALLOW_DOWNGRADE:-0}" = "1" ] && _new+=(--allow-downgrade)
+  _words_noglob "${WITH_SPEC:-}"
+  for _w in ${WORDS[@]+"${WORDS[@]}"}; do _new+=(--with "$_w"); done
+  [ "$mutating" = "1" ] && _new+=("$(_failover_handoff_note "${4:-}" "${5:-}")")
+  _new+=(${REST[@]+"${REST[@]}"})
+  ARGV=("${_new[@]}")
+  return 0
+}
+# _failover_hop <tier> <verb> -> rc0 = ARGV rebuilt for the pick and the notice printed (caller
+# `continue`s the route loop); rc1 = nothing to hop to / refused (the stop line was printed; the
+# caller surfaces the original rc). Runs INSIDE route_delegate (dynamic scope: RESOLVED_ID, disp,
+# REST, ARGV, _fb_user_pinned, _fo_hops, TIER_FLAG, EFFORT, WITH_SPEC).
+_failover_hop() {
+  local tier="${1:-auto}" verb="${2:-run}" max pick lane model why mutating=0 src smodel reason
+  _failover_signal_read || return 1
+  _failover_signal_clear
+  src="$_FO_LANE"; smodel="${_FO_MODEL:-${RESOLVED_ID:-?}}"; reason="${_FO_REASON:-hit its plan limit}"
+  [ "$_FO_VERDICT" = "answered" ] && return 1
+  max="${OSRC_FAILOVER_MAX:-2}"; case "$max" in ''|*[!0-9]*) max=2 ;; esac
+  if [ "${_fo_hops:-0}" -ge "$max" ]; then
+    printf '>>> [failover] %s %s, but this job already hopped %s time(s) (OSRC_FAILOVER_MAX=%s) — stopping here rather than bouncing between spent lanes.\n' \
+      "$(_lane_plan_display "$src")" "$reason" "${_fo_hops:-0}" "$max" >&2
+    return 1
+  fi
+  pick="$(_failover_pick "$src" "${RESOLVED_ID:-$smodel}" "$verb")"
+  if [ -z "$pick" ]; then _failover_nothing_notice "$src" "$reason"; return 1; fi
+  lane="${pick%%|*}"; why="${pick##*|}"; model="${pick#*|}"; model="${model%|*}"
+  if [ "${_fb_user_pinned:-0}" = "1" ] && [ "${OSRC_FALLBACK_PINNED:-0}" != "1" ] && [ "$why" != "same-model" ]; then
+    printf '>>> [failover] %s %s. The only ready lane is %s, which serves a DIFFERENT model (%s); -m %s is a pinned choice, so I will not switch models silently. Re-run with --provider %s -m %s, or set OSRC_FALLBACK_PINNED=1 to allow it.\n' \
+      "$(_lane_plan_display "$src")" "$reason" "$(_lane_plan_display "$lane")" "${model:-its default}" "${RESOLVED_ID:-$smodel}" "$(_fallback_provider_for_lane "$lane" 2>/dev/null || printf '%s' "$lane")" "${model:-<model>}" >&2
+    return 1
+  fi
+  [ "$tier" != "auto" ] && mutating=1
+  _failover_rebuild_argv "$lane" "$model" "$mutating" "$src" "$smodel" || {
+    printf '>>> [failover] %s %s. %s is ready but has no provider mapping for a re-dispatch — stopping.\n' "$(_lane_plan_display "$src")" "$reason" "$(_lane_plan_display "$lane")" >&2
+    return 1
+  }
+  _failover_notice "$src" "$reason" "$lane" "$model" "$why" "$mutating"
+  OSRC_LEDGER_FORCE=1 record_ledger "${disp:-$src}" "${RESOLVED_ID:-$smodel}->${model:-$lane-default}" "" "fallback" "${REST[*]:-}" "0.000000" "" 2>/dev/null || true
+  _fo_hops=$(( ${_fo_hops:-0} + 1 ))
+  export OSRC_FALLBACK_PINNED=1
+  return 0
+}
+# _failover_notice <src> <reason> <dst> <model> <why> <mutating> -> the one human line per hop.
+_failover_notice() {
+  local src="${1:-?}" reason="${2:-}" dst="${3:-?}" model="${4:-}" why="${5:-}" mutating="${6:-0}" how what
+  case "$why" in
+    same-model) how="the same model" ;;
+    tier:*)     how="its nearest-tier equivalent (${why#tier:})" ;;
+    *)          how="" ;;
+  esac
+  what="${model:-its default model}"
+  if [ "$mutating" = "1" ]; then
+    printf '>>> [failover] %s %s. You have %s — moving this to %s there (%s) and continuing FRESH from the current repo state: the new agent reads the half-done files and finishes the remaining work; nothing from the interrupted turn is replayed.\n' \
+      "$(_lane_plan_display "$src")" "$reason" "$(_lane_plan_display "$dst")" "$what" "$how" >&2
+  else
+    printf '>>> [failover] %s %s. You have %s — moving this to %s there (%s) and continuing.\n' \
+      "$(_lane_plan_display "$src")" "$reason" "$(_lane_plan_display "$dst")" "$what" "$how" >&2
+  fi
+}
+
 # Route a one-shot delegation. THE MODEL CHOOSES THE LANE: an alias/id in the table
 # routes to its native lane regardless of --provider; unknown ids / no -m route by --provider.
 # Tiers: auto|accept-edits|autonomous|dangerous
@@ -14475,6 +15160,7 @@ route_delegate() {
     esac
   done
   local _fb_tried="" _fb_used=1 _fb_cands="" _fb_loaded=0 _fb_max
+  local _fo_hops=0    # cross-harness failover hops made on this job (bounded by OSRC_FAILOVER_MAX)
   local _adv_done=0   # auto-advise runs at most once per route_delegate call
   _fb_max="$(_fallback_max_attempts)"
   while :; do
@@ -14793,16 +15479,34 @@ route_delegate() {
   # byte-identical to before. Mutating tiers (anything but `auto`) never auto-retry: a failed
   # mutating run may already have half-applied its changes, and replaying it on another lane has
   # no rollback (see _fallback_is_transport, which enforces the same invariant as a second layer).
+  # CROSS-HARNESS FAILOVER (both dispatch paths): when the run fails because the harness hit ITS OWN
+  # plan limit (the plan-limit blocks leave a signal), hand the job to another harness the user has
+  # (_failover_hop) and re-enter the loop. A read-only job re-dispatches as-is; a MUTATING job is
+  # re-dispatched FRESH with a handoff note (the new agent continues from the current repo state) —
+  # this is the ONLY auto-retry a mutating tier ever gets, and it is never a resume of the interrupted
+  # turn. Any other failure keeps today's behavior: transport-class read-only failures walk the
+  # shortlist below, everything else surfaces.
   if ! _fallback_enabled || [ "$tier" != "auto" ] \
      || { [ "$_fb_user_pinned" = "1" ] && [ "${OSRC_FALLBACK_PINNED:-0}" != "1" ]; }; then
-    _fg_guard __osrc_fg_dispatch "$tier"
-    return $?
+    _failover_signal_clear
+    local _pl_rc=0
+    _fg_guard __osrc_fg_dispatch "$tier" || _pl_rc=$?
+    if [ "$_pl_rc" -ne 0 ] && _failover_signal_pending; then
+      if _failover_hop "$tier" "$verb"; then continue; fi
+    fi
+    return "$_pl_rc"
   fi
 
   local _fb_cap="$OSRC_HOME/.fbcap.$$" _fb_rc
+  _failover_signal_clear
   _fallback_dispatch "$tier" "$_fb_cap"
   _fb_rc="$_OSRC_FB_RC"
   if [ "$_fb_rc" -eq 0 ]; then rm -f "$_fb_cap" 2>/dev/null; return 0; fi
+  if _failover_signal_pending; then
+    rm -f "$_fb_cap" 2>/dev/null
+    if _failover_hop "$tier" "$verb"; then continue; fi
+    return "$_fb_rc"
+  fi
   if ! _fallback_is_transport "$_fb_cap" "$_fb_rc" "$tier"; then
     # CONTENT/task failure: the model gave a real (failing/refusing) answer. Surfacing it is the
     # job; retrying other lanes would re-ask an answered question N times. Stop here.

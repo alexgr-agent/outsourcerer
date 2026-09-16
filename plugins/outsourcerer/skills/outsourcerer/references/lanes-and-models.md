@@ -308,6 +308,67 @@ Recommendation rules:
   fallback, see "Image generation" above). If an automated suggest/routing command gets built
   later, wire these same two mappings into it rather than re-deriving them.
 
+## Plan limits and cross-harness failover
+
+Every subscription harness eventually refuses work because *its own* plan window is spent: Devin's
+daily/weekly bucket, the ChatGPT 5-hour/weekly windows behind Codex, the Claude windows behind
+Claude Code, Cursor's monthly usage, Warp's credit quota, Droid's rolling rate limits, Cline's daily
+free cap. Outsourcerer treats all of them the same way, in three steps.
+
+**1. Detect it, per harness, from the CLI's own words.** After a failed run (or a headless
+`claude -p` result flagged `is_error`), the captured output goes through one dispatcher,
+`_lane_plan_limit_refusal <lane> <errfile>`, which routes to a per-lane matcher grounded in that
+CLI's real refusal wording ("You've hit your usage limit. Try again in 2h 15m", "Claude usage limit
+reached. Your limit will reset at 3pm", "Request failed with error: QuotaLimit", "Daily free limit
+reached … Try again in 9h 41m", and so on). Matchers are context-anchored: a limit noun only counts
+beside a spent verb or a reset phrase, so a context-window error, a transient per-minute 429, or a
+task's own output that happens to say "limit" is never read as a plan refusal. A lane with no
+matcher is a non-match, never a guess. Nothing hardcodes a plan number or a model roster.
+
+**2. Probe, then decide. Never assume.** A refusal from ONE model does not prove a whole harness is
+dead. Before any lane is marked down, `_lane_free_probe <lane>` runs one bounded, cheap check:
+Devin gets a real request to a *sibling* free model (not the one just refused); Codex and Claude
+Code are confirmed from their own live meters; the other lanes have no cheap probe yet. The result
+decides:
+
+| Probe says | What happens |
+|---|---|
+| `limit-refused` | **Confirmed.** The lane is marked down until the reset the harness itself stated (+60 s slack), or a labeled estimate (`OSRC_LANE_PLAN_DOWN_TTL`, default 1h) when it stated none. |
+| `answered` | **Not confirmed.** The lane stays up and nothing is marked; you are told which model was refused on that run and which one answered, so you can use the one that works. |
+| `unreachable` / no probe | **Unverified.** Only the short self-healing transport window (`OSRC_LANE_DOWN_TTL`, default 300 s). A five-minute skip of a lane that just refused is cheap; a day-long block on a guess is not. |
+
+`brief` and `status` show a per-lane meter ("N <lane> plan jobs today") plus any live lane-down
+notice with its reason and time left.
+
+**3. Fail over to a harness you actually have.** When the harness a job is running on is confirmed
+(or plausibly) spent, the job moves. `_failover_pick` chooses from lanes that are ready *right now*
+(their CLI/key/login present, no lane-down marker), in this order:
+
+- the **same model** on another harness, when the alias table, a cached catalog, or a shared
+  family alias says that harness serves it (kimi-k3 on Droid or Warp, glm on OpenRouter, …);
+- else the **nearest-tier equivalent** from the tier table (frontier / capable / mid / budget):
+  smallest tier distance first, cheaper tier on a tie, then lane preference order (plan lanes
+  before cash lanes). Engine lanes contribute their default model.
+
+Cash lanes (OpenRouter, TokenRouter, Claudex) are **never used silently**: they join the candidate
+list only when `OSRC_FAILOVER_CASH_OK=1` is set; otherwise the stop message names them and the
+switch. A pinned `-m` is moved only to the *same* model on another harness; a different-model pick
+is refused loudly unless `OSRC_FALLBACK_PINNED=1`. Hops are bounded per job (`OSRC_FAILOVER_MAX`,
+default 2) so two spent lanes cannot ping-pong. The `local` lane is not a failover target: no
+equivalence claim can be made for whatever you pulled locally.
+
+How the job continues depends on what it was doing:
+
+- a **read-only** job (`run`/`explore`) simply re-dispatches the same task on the picked harness;
+- a **mutating** job (`edit`/`yolo`/`research`) is re-dispatched **fresh** on the picked harness
+  with a handoff note: continue from the *current* repo state, inspect the tree first, keep what
+  is already done, finish only the rest. Nothing from the interrupted turn is replayed and there is
+  no byte-level resume; the new agent reads the half-done files. This is the only automatic retry a
+  mutating verb ever gets, and only for a verified plan-limit refusal.
+
+Every hop prints one human line, and when nothing is ready the run stops instead of inventing
+capacity; both are described in `jobs-and-safety.md`.
+
 ## Notes
 
 - **Devin has TWO pools, and the plan-included models are NOT free of limits.** The paid **ACU
@@ -316,11 +377,14 @@ Recommendation rules:
   is a Devin-side mis-gate. But the **plan-included daily/weekly quota** is real, shared, and
   exhaustible: on Pro, every plan-included model draws on ONE daily bucket, and when Devin says
   "Your daily usage quota has been exhausted … resets in 11h26m" ALL of them are blocked at once
-  until that reset. Outsourcerer reads that refusal (`_devin_plan_quota_exhausted`), takes the whole
-  `dv` lane down for Devin's stated window (a labeled estimate, default 1h via
-  `OSRC_DEVIN_PLAN_DOWN_TTL`, when Devin gives no parseable reset), and points OFF Devin (OpenRouter
-  via `--provider cc -m glm|deepseek`, or a native lane), never at another Devin plan model. The
-  current devin CLI exposes no quota read; the live figure is at https://app.devin.ai/settings/usage.
+  until that reset. Outsourcerer reads that refusal (`_devin_plan_quota_exhausted`) and then
+  **verifies it before taking anything down**: one bounded request to a sibling free model (see
+  "Plan limits and cross-harness failover" below). Only if that probe is refused too does the whole
+  `dv` lane go down for Devin's stated window (a labeled estimate, default 1h via
+  `OSRC_DEVIN_PLAN_DOWN_TTL`, when Devin gives no parseable reset) and the advice points OFF Devin
+  (OpenRouter via `--provider cc -m glm|deepseek`, or a native lane). If the sibling still answers,
+  the lane stays up and you are told which free model to keep using. The current devin CLI exposes
+  no quota read; the live figure is at https://app.devin.ai/settings/usage.
   `brief`/`status` show a proactive meter, "N Devin plan jobs today", with a WARN past
   `OSRC_DEVIN_PLAN_JOBS_WARN` (default 8): routing advice only, never a block. The older claim that
   GLM does not draw Devin limits described the ACU pool only; do not read it as "unlimited".

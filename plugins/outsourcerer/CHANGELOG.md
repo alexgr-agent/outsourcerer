@@ -2,6 +2,52 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.13.0
+
+When the harness a job is running on hits **its own plan limit** mid-job, Outsourcerer now verifies
+it, moves the work to another harness you have, and tells you in plain language. 0.12.3 could only
+recognize Devin's limit, and it did so too bluntly.
+
+### Fixed
+
+- **The 0.12.3 over-block.** A Devin daily/weekly-quota refusal took the whole `dv` lane down and
+  told you not to retry any free model, assuming every plan-included model shared the spent bucket.
+  Now it is **probe-then-decide**: one bounded request to a *sibling* free model runs before anything
+  is marked down. Refused too → confirmed, lane down until Devin's stated reset. Still answers → the
+  lane stays up and you are told which free model to keep using. No answer → only the short
+  self-healing transport window, never a day-long block on a guess.
+
+### Added
+
+- **Per-harness plan-limit detection.** One dispatcher routes a failed run's output to a matcher for
+  its lane, each grounded in that CLI's real refusal wording: Codex ("You've hit your usage limit.
+  Try again in …"), Claude Code ("Claude usage limit reached. Your limit will reset at …", including
+  the headless `is_error` result that exits 0), Cursor, Warp/Oz, Droid (Factory), Cline, and Devin.
+  Matchers are context-anchored, so context-window errors, transient per-minute 429s, and ordinary
+  output containing "limit" never read as a plan refusal. The lane's own stated reset ("try again in
+  9h 41m", "will reset at 3pm", "resets 4pm") sets the down window; unparseable resets stay empty
+  rather than guessed. Codex and Claude Code confirm from their own live meters. `brief`/`status`
+  show a per-lane meter and any live lane-down notice for every plan lane.
+- **Cross-harness failover with a human notice.** A confirmed (or plausibly) spent harness hands the
+  job to a harness you actually have and that is ready right now: the **same model** elsewhere when
+  one serves it, else the **nearest-tier equivalent** from the tier table. Every hop prints
+  `>>> [failover] <source> <reason>. You have <target> — moving this to <model> there and continuing.`
+  When nothing is ready it stops honestly: `>>> [failover] every lane you have is at its limit or
+  absent; nothing to fail over to. Waiting for <soonest reset> or add a lane.` Bounded by
+  `OSRC_FAILOVER_MAX` hops per job (default 2).
+- Four new test suites (`test_devin_plan_quota_probe`, `test_lane_plan_limit`, `test_failover_pick`,
+  plus the extended `test_devin_plan_quota`).
+
+### Safety
+
+- **Mutating jobs are re-dispatched fresh, never byte-resumed.** A read-only job simply hops. An
+  `edit`/`yolo`/`research` job is re-dispatched on the new harness with a handoff note to continue
+  from the *current* repo state (inspect the tree, keep what is done, finish the rest); nothing from
+  the interrupted turn is replayed. This is the only automatic retry a mutating verb ever gets.
+- **Cash lanes need consent.** OpenRouter, TokenRouter, and Claudex are failover candidates only with
+  `OSRC_FAILOVER_CASH_OK=1`; otherwise the stop line names them and the switch. A pinned `-m` moves
+  only to the same model; a different-model pick is refused unless `OSRC_FALLBACK_PINNED=1`.
+
 ## 0.12.3
 
 On a long Devin Pro session the **shared daily plan quota** can be exhausted, which blocks every
