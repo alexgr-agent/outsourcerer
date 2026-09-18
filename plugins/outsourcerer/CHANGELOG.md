@@ -2,6 +2,71 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.13.1
+
+A granted skill now arrives **whole**, on every lane, or the dispatch refuses to pretend.
+
+Until now `--with skills=x` pasted only the skill's top doc (SKILL.md, capped at 20KB) into the
+prompt - its `references/`, `scripts/`, and `assets/` never made the trip, the Devin lane dropped
+the grant entirely, and `--with mcp=x` was silently ignored on every lane but the Claude CLI ones.
+The README's "your whole setup, on any harness" was stronger than the code.
+
+### Hardened (judge panel, rounds 1-3)
+
+- **Bundle containment:** symlinks in a skill tree are verified before staging - any link that
+  resolves outside the skill directory (or dangles) refuses the dispatch, and every staged link is
+  listed in the manifest with its target. Special files (fifo/socket/device) refuse the dispatch
+  too: every transferred entry is now manifest-accounted.
+- **Text cap is exact and hard:** `OSRC_WITH_TEXT_MAX_BYTES` now counts every serialized byte
+  (intro, per-file boundaries, filenames, NOT TRANSFERRED lists), and exceeding it DIES with the
+  precise file and byte counts instead of silently truncating a grant.
+- **Unique per-dispatch bundle roots:** every dispatch stages into its own immutable
+  `skill-bundle.<pid>.<seq>` directory - concurrent dispatches can no longer yank each other's
+  bundle mid-run (foreground runs shared one root before). Roots untouched for 2+ days are swept.
+- **MCP grants verified before launch:** every server named in `mcp=` must resolve into the
+  generated strict config; an absent name, missing ~/.claude.json, or missing jq fails the
+  dispatch instead of launching with an empty MCP surface.
+- **Devin grants scoped per dispatch:** links from earlier grants that are not in the current one
+  are removed from the Devin skills home (tracked via a marker file; only outsourcerer-created
+  symlinks are ever touched), so the skills home holds exactly what the prompt claims.
+- **Skill names with spaces/unicode:** `--with 'skills=space ünicode'` validates, resolves, and
+  transfers correctly (denylist charset; traversal and glob metacharacters still refused).
+- **Text transport integrity:** the final serialized payload is re-measured against the cap
+  (NOT FOUND notices count too), file contents transfer byte-faithfully (trailing newlines
+  preserved), NUL-bearing files refuse the dispatch, and CR/LF in file/dir names refuses at every
+  staging point.
+- **Devin lane hardening:** granted dispatches serialize on a skills-home lock held for the whole
+  synchronous run (no overlapping grant sets); the grant marker is mktemp-created (O_EXCL,
+  non-following), verified regular+owned, and renamed atomically - planted symlinks at the marker
+  or temp paths are never followed; spaced grants render as one grant.
+
+### Added
+
+- **Full skill-bundle transfer.** On tool-capable lanes (Claude Code native and OpenRouter, Codex,
+  Gemini, Claudex, Droid, Cursor, Hermes, Warp, Cline, agentic-local) each granted skill is staged
+  as its COMPLETE on-disk directory - SKILL.md plus every references/, scripts/, and assets/ file -
+  in a per-job bundle with a manifest (`skill-bundle/MANIFEST.txt`), and the delegate is pointed at
+  it. The 20KB prompt ceiling no longer applies to granted skills.
+- **Text-only lanes get the full text, honestly.** On the local chat and TokenRouter lanes the
+  skill's SKILL.md plus every text doc in its tree is serialized into the prompt with explicit
+  per-file boundaries and cumulative byte accounting (`OSRC_WITH_TEXT_MAX_BYTES`, default 100000,
+  loud truncation). Scripts/assets cannot execute there, so they are listed as NOT TRANSFERRED -
+  inline and on stderr - instead of being silently absent.
+- **Automatic per-dispatch Devin sync.** `--with skills=x` on the Devin lane now links each granted
+  skill's whole directory into the Devin skills home before dispatch (the `parity` mechanism, made
+  automatic) and tells the delegate exactly what arrived.
+- **`--with skills=all`** grants every resolvable skill (user dir, parity dir, plugin caches).
+  Auto-transfer means AVAILABILITY through the bundle/native home; prompt injection stays
+  selected/on-demand, so stuffing every skill into every prompt never happens.
+- **Loud MCP boundaries.** `--with mcp=x` on a lane that cannot honor it (everything but the
+  Claude CLI lanes) now dies at dispatch with the reason and the working route, instead of the
+  delegate silently running without the server.
+
+### Fixed
+
+- The Devin lane parsed `--with skills=` and then discarded it - the default lane dropped granted
+  skills with no error and no warning.
+
 ## 0.13.0
 
 When the harness a job is running on hits **its own plan limit** mid-job, Outsourcerer now verifies
