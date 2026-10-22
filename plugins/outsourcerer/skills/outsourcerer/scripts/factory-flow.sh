@@ -445,12 +445,30 @@ _ff_verify() {
   fi
 }
 
+# _ff_land_setup <plan> <owner-tid> <target-tid> -> the --setup command for land: the land stage's own
+# `setup`, else the build's, else `plan run --setup`. Empty = none.
+_FF_SETUP=""
+_ff_land_setup() {
+  local s1 s2
+  s1="$(_task_get "$1" "$2" 2>/dev/null | jq -r '.setup // ""' 2>/dev/null)"
+  s2="$(_task_get "$1" "$3" 2>/dev/null | jq -r '.setup // ""' 2>/dev/null)"
+  printf '%s' "${s1:-${s2:-$_FF_SETUP}}"
+}
+# _ff_run_land <plan> <target-tid> <setup>: cmd_land, passing --setup only when given and supported.
+_ff_run_land() {
+  if [ -n "$3" ] && { declare -f _land_run 2>/dev/null; declare -f _land_usage 2>/dev/null; } | grep -q -- '--setup'; then
+    cmd_land "$2" --plan "$1" --setup "$3"
+  else
+    cmd_land "$2" --plan "$1"
+  fi
+}
+
 # _ff_auto_land <plan> <tid>: land a done build. A failed land never undoes the build: the task stays
 # done, the failure is recorded in .land_error, and the captain gets a wake with the exact command.
 _ff_auto_land() {
   local plan="$1" tid="$2" out rc st
   declare -F cmd_land >/dev/null 2>&1 || { printf '  %s: landing is not available in this build; land it by hand\n' "$tid"; return 0; }
-  out="$( cmd_land "$tid" --plan "$plan" 2>&1 )"; rc=$?
+  out="$( _ff_run_land "$plan" "$tid" "$(_ff_land_setup "$plan" "$tid" "$tid")" 2>&1 )"; rc=$?
   out="$(printf '%s' "$out" | tail -3 | tr '\n' ' ' | sed 's/^ERROR: //' | cut -c1-200)"
   if [ "$rc" -eq 0 ]; then
     _task_update "$plan" "$tid" 'del(.land_error)' >/dev/null 2>&1
@@ -474,7 +492,7 @@ _ff_land_stage() {
     _ff_hold "$plan" "$lt" "landing is not available in this build; land $target by hand, then: $(_ff_cmd "$plan" task done "$lt" --force)"
     return 0
   fi
-  out="$( cmd_land "$target" --plan "$plan" 2>&1 )"; rc=$?
+  out="$( _ff_run_land "$plan" "$target" "$(_ff_land_setup "$plan" "$lt" "$target")" 2>&1 )"; rc=$?
   out="$(printf '%s' "$out" | tail -3 | tr '\n' ' ' | sed 's/^ERROR: //' | cut -c1-200)"
   if [ "$rc" -eq 0 ]; then
     _task_update "$plan" "$lt" 'if .state != "running" then error("moved") else . end | .state = "done" | .result = ("landed " + $t + ": " + $o)' \
@@ -734,7 +752,7 @@ _ff_sleep() { sleep "$1" & _FF_SLEEPER=$!; wait "$_FF_SLEEPER" 2>/dev/null; _FF_
 
 cmd_plan_run() {
   local plan="" max=3 once=0 interval=30 maxmin=240 a pd t0 tick=0 c total done_n canceled failed held running ready todo landfail why sl rc pass
-  _FF_AUTO_LAND=0
+  _FF_AUTO_LAND=0; _FF_SETUP=""
   while [ "$#" -gt 0 ]; do
     a="$1"
     case "$a" in
@@ -746,6 +764,8 @@ cmd_plan_run() {
       --max-minutes=*) maxmin="${a#*=}"; shift ;;
       --once) once=1; shift ;;
       --auto-land) _FF_AUTO_LAND=1; shift ;;
+      --setup) [ -n "${2:-}" ] || die "plan run --setup needs a command, e.g. --setup \"npm ci\""; _FF_SETUP="$2"; shift 2 ;;
+      --setup=*) _FF_SETUP="${a#*=}"; shift ;;
       --plan) plan="${2:-}"; shift 2 || true ;;
       -h|--help) _ff_plan_run_usage; return 0 ;;
       -*) die "plan run: unknown option '$a' ($(_ff_plan_run_usage | head -1))" ;;
@@ -833,13 +853,15 @@ _ff_wake_finished() {   # <plan> <done-count>: one wake per distinct finished st
 
 _ff_plan_run_usage() {
   cat <<'EOF'
-usage: plan run [plan] [--max-parallel N] [--once] [--interval S] [--auto-land] [--max-minutes M]
+usage: plan run [plan] [--max-parallel N] [--once] [--interval S] [--auto-land] [--max-minutes M] [--setup CMD]
   Drives a plan: checks running work, finishes or retries it, starts ready tasks (up to N at once, default 3).
   --once         one pass, then exit (for the heartbeat or an orchestrator turn)
   --interval S   seconds between passes (default 30)
   --auto-land    land each finished plain build task through the merge gate (flow builds land through
                  the flow's own land stage, after their review)
   --max-minutes  stop driving after M minutes (default 240); running jobs keep going
+  --setup CMD    default command land runs in the merged checkout before the check (e.g. "npm ci");
+                 a task's or flow stage's own `setup` wins
   exit: 0 all done | 3 needs the captain | 2 time cap | 124 --once with work underway | 4 another run drives it | 1 error
 EOF
 }
@@ -930,8 +952,8 @@ else
         elif ($s | has("deps")) and (($s.deps | strlist) | not) then "stage \($s.id): deps must be a list of stage ids"
         elif ($s | has("models")) and (($s.models | strlist) | not) then "stage \($s.id): models must be a list of model names"
         elif ($s | has("fallback")) and (($s.fallback | strlist) | not) then "stage \($s.id): fallback must be a list of model names"
-        elif ([("title","prompt","check","model","provider","land","shape","verb","deliver") as $f | select(optstr($s[$f]) | not) | $f] | length) > 0
-          then "stage \($s.id): \([("title","prompt","check","model","provider","land","shape","verb","deliver") as $f | select(optstr($s[$f]) | not) | $f][0]) must be text"
+        elif ([("title","prompt","check","setup","model","provider","land","shape","verb","deliver") as $f | select(optstr($s[$f]) | not) | $f] | length) > 0
+          then "stage \($s.id): \([("title","prompt","check","setup","model","provider","land","shape","verb","deliver") as $f | select(optstr($s[$f]) | not) | $f][0]) must be text"
         elif (optbool($s.hold) and optbool($s.verdict)) | not then "stage \($s.id): hold and verdict must be true or false"
         elif ($s | has("repeat")) and (($s.repeat | type) as $t | ($t == "string" or $t == "number") | not) then "stage \($s.id): repeat must be a number"
         elif ($s | has("retries")) and (($s.retries | type) != "number" or $s.retries < 0 or $s.retries > 10 or ($s.retries | floor) != $s.retries)
@@ -969,7 +991,7 @@ _ff_flow_load() {
 
 # _ff_flow_vars_used <flow-json> -> newline list of {{var}} names used in the stages
 _ff_flow_vars_used() {
-  printf '%s' "$1" | jq -r '[.stages[] | (.title, .prompt, .check, .repeat, .model, (.fallback // [])[], (.models // [])[])
+  printf '%s' "$1" | jq -r '[.stages[] | (.title, .prompt, .check, .setup, .repeat, .model, (.fallback // [])[], (.models // [])[])
      | select(type == "string") | [match("\\{\\{([A-Za-z_][A-Za-z0-9_]*)\\}\\}"; "g") | .captures[0].string][]] | unique[]'
 }
 
@@ -1024,7 +1046,7 @@ _ff_flow_expand() {
         | . as $s
         | {sid: (if ($s | has("repeat")) then $s.id + "-" + $i else $s.id end), copy_of: $s.id,
            title: (($s.title // $s.id) | sub($vv)), shape: ($s.shape // "scout"), verb: ($s.verb // "run"),
-           prompt: (($s.prompt // "") | sub($vv)), check: (($s.check // "") | sub($vv)),
+           prompt: (($s.prompt // "") | sub($vv)), check: (($s.check // "") | sub($vv)), setup: (($s.setup // "") | sub($vv)),
            deps: ($s.deps // []), hold: ($s.hold // false), land: ($s.land // ""), verdict: ($s.verdict // false),
            retries: ($s.retries // 1), deliver: ($s.deliver // (if ($s.shape // "scout") == "ship" then "branch" else "local" end)),
            provider: ($s.provider // ""),
@@ -1292,7 +1314,8 @@ _ff_flow_run() {
        hold:{reason:"",until:"",answer:""}, result:"", evidence:"",
        flow:{name:$flow, stage:.sid}, created:$now, updated:$now,
        hold_after_deps:.hold, gate:(.hold and .prompt == "" and .land == ""), land_target:$ltid, require_verdict:.verdict,
-       fallback:(if .land != "" then [] else .cands end)}')" || { _ff_flow_rollback "$plan" $made; die "could not build stage $sid; nothing was added"; }
+       fallback:(if .land != "" then [] else .cands end)}
+      + (if .setup != "" then {setup: .setup} else {} end)')" || { _ff_flow_rollback "$plan" $made; die "could not build stage $sid; nothing was added"; }
     tid="$(_task_new "$plan" "$json")" || {
       # shellcheck disable=SC2086
       _ff_flow_rollback "$plan" $made

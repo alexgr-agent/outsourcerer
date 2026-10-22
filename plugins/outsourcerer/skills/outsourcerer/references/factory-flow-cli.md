@@ -2,7 +2,7 @@
 
 Source: `scripts/factory-flow.sh`. Tests: `scripts/tests/test_factory_flow.sh`.
 
-## `plan run [plan] [--max-parallel N] [--once] [--interval S] [--auto-land] [--max-minutes M]`
+## `plan run [plan] [--max-parallel N] [--once] [--interval S] [--auto-land] [--max-minutes M] [--setup CMD]`
 
 Drives a plan until it is finished or needs you. Each pass ("tick") does two things:
 
@@ -48,6 +48,10 @@ It stops with one plain line saying why:
   flow are never auto-landed: the flow's own land stage lands them after their review (council-build), or the
   captain lands the winner after the pick (best-of-n). A failed auto-land never undoes the build: it stays done,
   the reason goes in `land_error`, a wake is sent, and the stop line lists `land tX --plan p`.
+- `--setup CMD`: the default command `land` runs in the clean merged checkout before the check (for example
+  `npm ci`). A land stage's own `setup`, then the build task's `setup`, win over it. Passed only to a `land` that
+  supports `--setup`. A failed land never changes the build's state from here: if `land` holds it (merge
+  conflict), it stays held with land's reason.
 - Only one `plan run` can drive a plan at a time (lock at `plans/<plan>/run.lock`). A lock left by a crashed run is
   taken over automatically, under a second guard lock and only if its owner record is unchanged, so a slow taker
   never removes a fresh lock. A run that cannot record itself as the owner (disk full) refuses to start.
@@ -76,7 +80,7 @@ Built-in flows (`references/flows/`); your own in `$OSRC_HOME/flows/<name>.json`
 
 | flow | stages |
 |---|---|
-| `council-build` | two advisors on different frontier families (sol, opus) -> synthesize (opus) -> build (glm-5-2, then swe-1-7, kimi-k3) with `check` -> fidelity review (sol, must say VERDICT: PASS) -> land |
+| `council-build` (`--var setup=...` for land) | two advisors on different frontier families (sol, opus) -> synthesize (opus) -> build (glm-5-2, then swe-1-7, kimi-k3) with `check` -> fidelity review (sol, must say VERDICT: PASS) -> land |
 | `spec-build` | spec (opus) -> plan (sol) -> build (glm-5-2...) -> verify against the spec (sol, VERDICT) |
 | `best-of-n` | `--var n=3` candidates built in parallel on different models -> compare (sol) -> captain picks |
 
@@ -90,7 +94,7 @@ excluded the task gets no model and the router picks (which also respects the li
  "vars": {"goal": "required", "check": "optional", "n": {"default": "3"}},
  "stages": [
    {"id": "build", "title": "Build {{goal}}", "shape": "ship", "verb": "edit", "deps": ["plan"],
-    "model": "glm-5-2", "fallback": ["swe-1-7"], "check": "{{check}}", "prompt": "...", "retries": 1},
+    "model": "glm-5-2", "fallback": ["swe-1-7"], "check": "{{check}}", "setup": "npm ci", "prompt": "...", "retries": 1},
    {"id": "cand", "repeat": "{{n}}", "models": ["glm-5-2", "swe-1-7"], "prompt": "candidate {{i}} of {{n}}", "shape": "ship", "verb": "edit"},
    {"id": "review", "deps": ["build"], "verdict": true, "model": "sol", "prompt": "... end with VERDICT: PASS or VERDICT: FAIL - why"},
    {"id": "decide", "deps": ["review"], "hold": true, "title": "Captain decides"},

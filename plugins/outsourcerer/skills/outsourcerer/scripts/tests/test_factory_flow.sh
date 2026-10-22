@@ -127,7 +127,7 @@ _factory_done_check() {
   if [ -f "$TMP/donefail-$2" ]; then echo "no commits beyond base"; return 1; fi
   echo "done: job finished"; return 0
 }
-cmd_land() { echo "$1" >> "$TMP/landed"; [ -f "$TMP/landfail-$1" ] && { echo "merge breaks check"; return 1; }; echo "landed $1"; return 0; }
+cmd_land() { echo "$1" >> "$TMP/landed"; echo "$*" >> "$TMP/landargs"; [ -f "$TMP/landfail-$1" ] && { echo "merge breaks check"; return 1; }; echo "landed $1"; return 0; }
 
 REPO="$TMP/repo"; mkdir -p "$REPO"; git -C "$REPO" init -q; git -C "$REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 REPO="$(cd "$REPO" && pwd -P)"
@@ -627,6 +627,27 @@ EOF
 out="$( cmd_flow run big --plan big1 --var "x=$BIG1" --var "y=$BIG2" 2>&1 )"; rc=$?
 [ "$rc" = 0 ] && [ "$(_task_get big1 t1 | jq -r '.prompt | length')" = "$SZ" ] && [ "$(_task_get big1 t2 | jq -r '.prompt | length')" = "$SZ" ] \
   && ok "two ${SZ}-byte vars expand without hitting the argument limit" || bad "big vars rc=$rc: $(printf '%s' "$out" | tail -2 | cut -c1-200)"
+
+
+# --- land --setup (H's land): a flow var / task field / plan run default reaches land
+_land_usage() { echo "usage: land ... [--setup CMD]"; }
+rm -f "$TMP/landargs"
+( cmd_flow run council-build --plan su1 --repo "$REPO" --var goal=g --var setup="npm ci" >/dev/null 2>&1 )
+for t in t1 t2 t3 t4 t5; do _task_update su1 "$t" '.state = "done"' >/dev/null; done
+( cmd_plan_run su1 --once >/dev/null 2>&1 )
+grep -q -- "^t4 --plan su1 --setup npm ci$" "$TMP/landargs" && ok "a flow's setup var reaches land --setup" || bad "setup var: $(cat "$TMP/landargs" 2>/dev/null)"
+rm -f "$TMP/landargs"; mkplan su2 't1||ship|1'
+( cmd_plan_run su2 --interval 1 --auto-land --setup "make deps" >/dev/null 2>&1 )
+grep -q -- "^t1 --plan su2 --setup make deps$" "$TMP/landargs" && ok "plan run --setup is the default for auto-land" || bad "setup default: $(cat "$TMP/landargs" 2>/dev/null)"
+unset -f _land_usage; rm -f "$TMP/landargs"; mkplan su3 't1||ship|1'
+( cmd_plan_run su3 --interval 1 --auto-land --setup "make deps" >/dev/null 2>&1 )
+grep -q -- "^t1 --plan su3$" "$TMP/landargs" && ok "an older land without --setup is called without it" || bad "setup feature-detect: $(cat "$TMP/landargs" 2>/dev/null)"
+# a land that holds its target (merge conflict) never has that state overwritten
+_hold_land() { _task_update "$3" "$1" '.state = "held" | .hold.reason = "merge conflict with main: a.txt"' >/dev/null; echo "merge conflict"; return 1; }
+mkplan su4 't1||ship|1'
+( cmd_land() { _hold_land "$1" x "$3"; }; cmd_plan_run su4 --interval 1 --auto-land >/dev/null 2>&1 )
+_task_get su4 t1 | jq -e '.state == "held" and (.hold.reason | test("merge conflict")) and (.land_error | test("merge conflict"))' >/dev/null \
+  && ok "a merge-conflict hold from land is kept; the failure is recorded beside it" || bad "conflict hold: $(_task_get su4 t1 | jq -c '{state,hold,land_error}')"
 
 echo "---"
 echo "test_factory_flow: $pass passed, $fail failed"
