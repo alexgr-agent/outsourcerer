@@ -453,6 +453,7 @@ _land_run() {
   # ---- 3. Fresh integration worktree at the target tip; no-ff merge of the VERIFIED head ----
   local lid nohooks; lid="land-$(_new_job_id)"
   nohooks="$OSRC_HOME/land/nohooks"; mkdir -p "$nohooks" "$root/.outsourcerer/worktrees" 2>/dev/null
+  type _osrc_git_exclude_state >/dev/null 2>&1 && _osrc_git_exclude_state "$root"
   _LAND_IWT="$root/.outsourcerer/worktrees/$lid"
   git -C "$root" worktree add -q --detach "$_LAND_IWT" "$before" >/dev/null 2>&1 \
     || { _LAND_IWT=""; die "land: could not create a scratch worktree to merge in (under $root/.outsourcerer/worktrees)"; }

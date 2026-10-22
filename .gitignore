@@ -50,3 +50,6 @@ plugins/outsourcerer/skills/outsourcerer/scripts/_*_tmp.sh
 
 # Delegate scratch dirs
 .scratch*/
+
+# Local scratch for agents
+.context/
