@@ -802,7 +802,10 @@ _task_cli_add() {
       --spec) spec="${2:-}"; shift 2 ;;
       --check) check="${2:-}"; shift 2 ;;
       --verb) verb="${2:-}"; shift 2 ;;
-      -m|--model) model="${2:-}"; shift 2 ;;
+      -m|--model) model="${2:-}"
+        # Exclude list (#45): refuse at add time, not when the task later fails to launch.
+        if [ -n "$model" ] && declare -F _exclude_refuse >/dev/null 2>&1; then _exclude_refuse "$model" "task add"; fi
+        shift 2 ;;
       --provider) provider="${2:-}"; shift 2 ;;
       --deliver) deliver="${2:-}"; shift 2 ;;
       --retries) retries="${2:-}"; shift 2 ;;

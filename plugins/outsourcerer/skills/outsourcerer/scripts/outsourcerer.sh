@@ -576,6 +576,17 @@ $OSRC_MODEL_TABLE"
   unset _osrc_ml
 fi
 
+# CURRENT ids of the floating Claude aliases (what `-m opus` etc. runs today). Used ONLY by the exclude
+# list (#45) to decide whether excluding a specific version also refuses the bare alias: excluding an
+# OLD model (claude-opus-4-8) must leave `-m opus` usable. UPDATE THIS LINE ON EVERY CLAUDE RELEASE.
+# Other aliases need no entry: the model table above already maps them (sol -> gpt-5.6-sol, glm ->
+# z-ai/glm-5.2, swe -> swe-1.7); Gemini family aliases pick their id live and fail closed.
+OSRC_CLAUDE_CURRENT_IDS="fable|claude-fable-5-1 opus|claude-opus-5-5 sonnet|claude-sonnet-5-5 haiku|claude-haiku-5-5"
+# Point releases, "<point release>:<its parent>". Excluding the parent also refuses a bare alias whose
+# current id is listed here (exclude claude-fable-5 -> -m fable refused). Never inferred from version
+# shape: claude-sonnet-5-5 is NOT a point release of claude-sonnet-5. UPDATE ON EVERY CLAUDE RELEASE.
+OSRC_CLAUDE_POINT_RELEASES="claude-fable-5-1:claude-fable-5"
+
 # Interactive tmux session name, derived from the working directory AND, when set,
 # the owning Claude Code session id. Deriving it from the cwd alone means two
 # Claude Code sessions working in the same directory resolve to one name and can
@@ -841,10 +852,25 @@ _devin_free_own_quota() { # <model> <text>
     && grep -qiE 'exhausted|depleted|exceeded|0%[[:space:]]*(remaining|left)' <<<"$text"
 }
 
+# _devin_probe_pick <preferred...> -> the first health-probe model NOT on the user's exclude list
+# (#45: a probe is still a request to that model), falling back through the plan-included/free ids.
+# rc1 when every candidate is excluded (the caller then skips the probe).
+_devin_probe_pick() {
+  local c skip="${OSRC_DEVIN_PROBE_SKIP:-}"
+  for c in "$@" glm-5-2 swe-2 swe-1-7 kimi-k3; do
+    [ -n "$c" ] || continue
+    [ -n "$skip" ] && [ "$(printf '%s' "$c" | tr '[:upper:]._' '[:lower:]--')" = "$skip" ] && continue
+    _model_excluded "$c" && continue
+    printf '%s' "$c"; return 0
+  done
+  return 1
+}
+
 # A real, minimal request against the known plan-included model. _timeout is
 # bash-native, captures output safely, and returns 124 when the bound fires.
 _devin_free_probe() {
-  local model="${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}"
+  local model
+  model="$(_devin_probe_pick "${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}")" || { echo "every Devin probe model is on your exclude list; probe skipped" >&2; return 3; }
   _timeout "${OSRC_DEVIN_PROBE_SECS:-30}" \
     devin --model "$model" --permission-mode auto --respect-workspace-trust false -p PONG </dev/null
 }
@@ -887,7 +913,9 @@ _lane_free_probe() {
     out="$(_lane_probe_file "$lane")"
     : > "$out" 2>/dev/null && chmod 600 "$out" 2>/dev/null || out=""
   fi
-  model="${2:-${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}}"
+  model="$(_devin_probe_pick "${2:-${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}}")" || {
+    [ -n "$out" ] && printf 'every Devin probe model is on your exclude list\n' > "$out"
+    printf 'unreachable'; return 0; }
   if ! have devin; then
     [ -n "$out" ] && printf 'devin CLI not on PATH\n' > "$out"
     printf 'unreachable'; return 0
@@ -923,6 +951,8 @@ _devin_plan_probe_model() {
   if [ "$(printf '%s' "$probe" | tr '[:upper:]' '[:lower:]' | tr '._' '--')" = "$refused" ]; then
     alt="${OSRC_DEVIN_PROBE_MODEL_ALT:-$(_devin_first_catalog_free_model)}"; probe="${alt:-swe-2}"
   fi
+  # #45: never probe a model the user excluded; pick the next allowed one that is not the refused model.
+  if _model_excluded "$probe"; then probe="$(OSRC_DEVIN_PROBE_SKIP="$refused" _devin_probe_pick)" || probe=""; fi
   printf '%s' "$probe"
 }
 
@@ -2634,6 +2664,7 @@ Note on this run: it is non-interactive and only file edits are auto-approved. S
   # token verbatim, and `devin --model glm` is a hard launch failure.
   local _dvmodel; _dvmodel="$(_devin_resolve_model "$MODEL")"
   [ "$_dvmodel" = "$MODEL" ] || printf '>>> [model] alias "%s" -> Devin id "%s"\n' "$MODEL" "$_dvmodel" >&2
+  _exclude_refuse_resolved "$MODEL" "$_dvmodel"   # #45: `-m claude` can resolve to an excluded Fable id
   MODEL="$_dvmodel"
   # live-catalog gate. Validate the RESOLVED id against Devin's live catalog (cached, short
   # TTL) BEFORE the devin call, so a stale/renamed id dies loud with closest matches instead of
@@ -2774,9 +2805,16 @@ continue_turn() {
   [ "${#REST[@]}" -gt 0 ] || die "no follow-up prompt given"
   local prompt="${REST[*]}"
   _utf8_guard_prompt prompt
+  # #45: without -m, `devin -c` keeps the conversation's ORIGINAL model, which outsourcerer cannot see
+  # (it may be one the user excluded since). While an exclude list is active, require an explicit model.
+  if [ "${MODEL_EXPLICIT:-0}" != "1" ] && _exclude_active; then
+    die "continue: without -m the conversation keeps its original model, which outsourcerer cannot check against your exclude list. Pass the model to continue with: $0 continue -m <allowed model> \"...\" (see: $0 exclude ls)"
+  fi
   need_devin
   # Same alias-resolution requirement as delegate(): an unresolved alias fails the continue at launch.
+  local _req="$MODEL"
   MODEL="$(_devin_resolve_model "$MODEL")"
+  _exclude_refuse_resolved "$_req" "$MODEL" continue
   _devin_guard_before_delegation "$MODEL"
   echo ">>> devin -c --model $MODEL -p (continue)" >&2
   # `continue` must NOT silently escalate a read-only conversation to accept-edits.
@@ -5472,125 +5510,358 @@ _quota_note_refusal() {  # <lane-or-disp> <model> [reset]
 #   $OSRC_HOME/exclude          one entry per line (alias, exact id, family word or glob; # comments)
 #   OSRC_EXCLUDE_MODELS         comma/space list, UNIONED with the file (never replaces it)
 # Managed with `outsourcerer exclude add|rm|ls|clear|check`. Enforced at every model-choice point: an
-# explicit -m naming an excluded model is REFUSED (one line naming the fix), and every automatic
-# choice (advise shortlist, failover, OpenRouter chain, second-opinion pair + premium, escalate
-# ladder, provider defaults) skips it. `brief` and `doctor` print the active list, so every new
-# orchestrator session sees it: that is what makes "never use Fable" stick across sessions.
-# Matching (case-insensitive, one awk pass, no network):
-#   * glob entry (has * ? or [) -> matched against the name AND its resolved table id;
-#   * exact: name or resolved id equals the entry, or the entry's own resolved id;
-#   * family: the entry's word-tokens appear contiguously in the candidate's tokens (split on
-#     anything not [a-z0-9]), so `fable` covers fable, claude-fable-5, claude-fable-5-1 and
-#     anthropic/claude-5-fable; `gpt-5.6` covers gpt-5.6-sol/terra/luna. Entries with no letter
-#     are ignored (a bare "5" must never exclude half the catalog).
+# explicit -m naming an excluded model is REFUSED (one line naming the fix), the id an alias RESOLVES
+# to (Devin live catalog, agy/gemini family pick, engine-lane alias maps) is re-checked before launch,
+# and every automatic choice (advise shortlist, failover, OpenRouter chain, second-opinion pair +
+# premium, escalate ladder, provider defaults, fanout defaults, session defaults, drift restore,
+# health probes) skips it. `brief` and `doctor` print the active list, so every new orchestrator
+# session sees it: that is what makes "never use Fable" stick across sessions.
+#
+# Matching (case-insensitive, no network). Every name is reduced to word-token FORMS: as written,
+# without its provider prefix (z-ai/, anthropic/...), its alias-table id, and a canonical order
+# (name words, then version numbers, then effort words; Claude families gain "anthropic claude"), so
+# claude-fable-5, anthropic/claude-5-fable and claude-fable-5-high all line up. An entry matches a
+# candidate when one entry form appears as a contiguous run of a candidate form, unless the very next
+# candidate token makes it a DIFFERENT model:
+#   * another version number after an entry that ends in a number (claude-sonnet-5 does NOT cover
+#     claude-sonnet-5-5; point releases need a glob or the family word). Date stamps (6+ digits) and
+#     effort words (high, low, max, preview...) are the same model and still match;
+#   * a size word (mini, nano, lite, flash, lightning, air, small, micro, tiny) after a multi-word
+#     entry (gpt-5.5 does NOT cover gpt-5.5-mini; gemini-flash does NOT cover gemini-flash-lite).
+# A bare family alias is refused when the family word itself is excluded, or when an entry covers the
+# id the alias runs TODAY: the model table for sol/terra/luna/glm/swe..., OSRC_CLAUDE_CURRENT_IDS for
+# fable/opus/sonnet/haiku (an entry also covers the current id when that id is LISTED in
+# OSRC_CLAUDE_POINT_RELEASES as its point release: claude-fable-5 refuses -m fable = claude-fable-5-1;
+# claude-sonnet-5 and claude-opus-4-8 leave -m sonnet / -m opus alone).
+# Gemini family aliases pick their id live, so any excluded version of the family refuses them (fail
+# closed, and the refusal says why). `claude` covers every Claude family. A glob (* and ? only;
+# every other character is literal) is matched against the name, its prefix-less form, its table id
+# and the canonical forms. Entries with no letter are ignored (a bare "5" must never exclude half the
+# catalog). An entry that is not a valid model name (only an unvalidated OSRC_EXCLUDE_MODELS can hold
+# one) FAILS CLOSED: every model counts as excluded, with one warning naming the entry, until it is
+# fixed. A matcher failure fails closed the same way.
+# Cost: no list -> zero forks. Active list -> the entries are loaded once per process (re-read only
+# when the file content or the env value changes), each distinct name is matched once (memoized),
+# and list filters run as ONE awk pass per batch.
 # =============================================================================
 OSRC_EXCLUDE_FILE="$OSRC_HOME/exclude"
+_OSRC_EXCL_KEY=""; _OSRC_EXCL_LIST=""; _OSRC_EXCL_BAD=""; _OSRC_EXCL_MEMO=""; _OSRC_EXCL_WARNED=0
+EXCL_HIT=""; EXCL_WHY=""
 
-# _exclude_active -> rc0 when any exclusion exists. Every gate short-circuits on it, so with no list
-# the default routing path is unchanged.
-_exclude_active() {
-  case "${OSRC_EXCLUDE_MODELS:-}" in *[!\ ,]*) return 0 ;; esac
-  [ -s "$OSRC_EXCLUDE_FILE" ]
+# _exclude_load -> (re)parse the saved file + env into _OSRC_EXCL_LIST (valid entries) and
+# _OSRC_EXCL_BAD (unparsable ones). Fork-free when nothing changed since the last load.
+_exclude_load() {
+  local content="" key
+  if [ -f "$OSRC_EXCLUDE_FILE" ]; then IFS= read -r -d '' content 2>/dev/null < "$OSRC_EXCLUDE_FILE" || true; fi
+  key="$OSRC_EXCLUDE_FILE|${OSRC_EXCLUDE_MODELS:-}|$content"
+  [ "$_OSRC_EXCL_KEY" = "$key" ] && return 0
+  _OSRC_EXCL_LIST=""; _OSRC_EXCL_BAD=""; _OSRC_EXCL_MEMO=""
+  local out line
+  out="$(OSRC_EXCL_FILE_TEXT="$content" OSRC_EXCL_ENV_TEXT="${OSRC_EXCLUDE_MODELS:-}" LC_ALL=C awk '
+    function emit(e,   s) {
+      e = tolower(e); sub(/\[[0-9]+[a-z]*\]$/, "", e)
+      if (e == "" || (e in seen)) return
+      seen[e] = 1
+      if (e !~ /^[a-z0-9._:\/*?@+-]+$/) { print "bad\t" e; return }
+      if (e !~ /[a-z]/) return
+      print "ok\t" e
+    }
+    BEGIN {
+      n = split(ENVIRON["OSRC_EXCL_FILE_TEXT"], L, "\n")
+      for (i = 1; i <= n; i++) { s = L[i]; sub(/#.*/, "", s); gsub(/[ \t\r]/, "", s); if (s != "") emit(s) }
+      n = split(ENVIRON["OSRC_EXCL_ENV_TEXT"], L, /[ ,\t\r\n]+/)
+      for (i = 1; i <= n; i++) if (L[i] != "") emit(L[i])
+    }' 2>/dev/null)" || out="bad	(the exclude list could not be read)"
+  while IFS= read -r line; do
+    case "$line" in
+      ok$'\t'*)  _OSRC_EXCL_LIST="${_OSRC_EXCL_LIST}${line#ok	}"$'\n' ;;
+      bad$'\t'*) _OSRC_EXCL_BAD="${_OSRC_EXCL_BAD}${line#bad	}"$'\n' ;;
+    esac
+  done <<_OSRC_EXCL_LOAD
+$out
+_OSRC_EXCL_LOAD
+  _OSRC_EXCL_KEY="$key"
 }
 
-# _exclude_saved_entries -> the saved file's entries, lowercased, comments/blank lines dropped.
+# _exclude_active -> rc0 when any exclusion (or an unparsable entry) exists. With no file and no env
+# value this is two builtin tests and zero forks; a comments-only file counts as inactive.
+_exclude_active() {
+  case "${OSRC_EXCLUDE_MODELS:-}" in
+    *[!\ ,]*) ;;
+    *) [ -s "$OSRC_EXCLUDE_FILE" ] || return 1 ;;
+  esac
+  _exclude_load
+  [ -n "$_OSRC_EXCL_LIST$_OSRC_EXCL_BAD" ]
+}
+
+# _exclude_bad_warn -> one stderr warning per process when an entry is unparsable (fail closed).
+_exclude_bad_warn() {
+  [ -n "$_OSRC_EXCL_BAD" ] || return 0
+  [ "$_OSRC_EXCL_WARNED" = 1 ] && return 0
+  _OSRC_EXCL_WARNED=1
+  local b; b="${_OSRC_EXCL_BAD%%$'\n'*}"
+  printf ">>> [exclude] the entry '%s' is not a valid model name, so every model counts as excluded until it is fixed (fail closed). Fix: %s exclude rm '%s', or correct OSRC_EXCLUDE_MODELS.\n" "$b" "$0" "$b" >&2
+}
+
+# _exclude_entries -> the valid entries, one per line (saved order, then env), deduped.
+_exclude_entries() { printf '%s' "$_OSRC_EXCL_LIST"; }
+# _exclude_saved_entries / _exclude_env_entries -> each source on its own (for ls and rm notes).
 _exclude_saved_entries() {
   [ -f "$OSRC_EXCLUDE_FILE" ] || return 0
-  LC_ALL=C sed -e 's/#.*//' -e 's/[[:space:]]//g' "$OSRC_EXCLUDE_FILE" 2>/dev/null | tr '[:upper:]' '[:lower:]' | awk 'NF'
+  LC_ALL=C sed -e 's/#.*//' -e 's/[[:space:]]//g' "$OSRC_EXCLUDE_FILE" 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed 's/\[[0-9]*[a-z]*\]$//' | awk 'NF'
 }
-# _exclude_env_entries -> OSRC_EXCLUDE_MODELS split, lowercased.
 _exclude_env_entries() {
-  printf '%s\n' "${OSRC_EXCLUDE_MODELS:-}" | tr ', \t' '\n\n\n' | tr '[:upper:]' '[:lower:]' | awk 'NF'
-}
-# _exclude_entries -> the unioned list, deduped, one per line (saved order, then env).
-_exclude_entries() {
-  { _exclude_saved_entries; _exclude_env_entries; } | awk 'NF && !seen[$0]++'
+  printf '%s\n' "${OSRC_EXCLUDE_MODELS:-}" | tr ', \t' '\n\n\n' | tr '[:upper:]' '[:lower:]' | sed 's/\[[0-9]*[a-z]*\]$//' | awk 'NF'
 }
 
-# _model_excluded_by <name> -> prints the exclude entry that matches <name> and returns 0; rc1 (no
-# output) when the model is allowed. <name> may be an alias, a resolved id, an OpenRouter slug or a
-# footer label; a trailing context-window suffix ([1m]) is ignored for matching.
-_model_excluded_by() {
-  local name="${1:-}" out
-  [ -n "$name" ] || return 1
-  _exclude_active || return 1
-  # The table travels via ENVIRON, not -v: BSD awk (macOS) rejects a newline inside a -v value.
-  out="$(_exclude_entries | OSRC_EXCL_TABLE="$OSRC_MODEL_TABLE" LC_ALL=C awk -v name="$name" '
-    function strip(s) { sub(/\[[0-9]+[a-z]*\]$/, "", s); return s }
-    function toks(s, arr,   n, i, t, k) {
-      n = split(s, t, /[^a-z0-9]+/); k = 0
-      for (i = 1; i <= n; i++) if (t[i] != "") arr[++k] = t[i]
-      return k
+# _exclude_awk <mode> -> the matcher. Entries come from ENVIRON OSRC_EXCL_ENTRIES, the alias table
+# from ENVIRON OSRC_EXCL_TABLE (BSD awk rejects a newline inside a -v value), candidates on stdin.
+#   mode=hits  : print "<name>\t<entry>" for every excluded input line (the line is the name)
+#   mode=keep  : print every input line whose FIRST WORD is not excluded (display filters)
+_exclude_awk() {
+  OSRC_EXCL_TABLE="$OSRC_MODEL_TABLE" OSRC_EXCL_CUR="$OSRC_CLAUDE_CURRENT_IDS" OSRC_EXCL_PR="$OSRC_CLAUDE_POINT_RELEASES" LC_ALL=C awk -v mode="$1" '
+    function isnum(t) { return t ~ /^[0-9]+$/ }
+    function tokstr(s,   n, a, i, o) {
+      n = split(s, a, /[^a-z0-9]+/); o = ""
+      for (i = 1; i <= n; i++) if (a[i] != "") o = o (o == "" ? "" : " ") a[i]
+      return o
     }
-    function contig(e, c,   ea, ca, ne, nc, i, j, ok) {
-      ne = toks(e, ea); nc = toks(c, ca)
+    function canon(ts,   n, a, i, isc, L, N, Qs, o) {
+      n = split(ts, a, " "); isc = 0; L = ""; N = ""; Qs = ""
+      for (i = 1; i <= n; i++) if (a[i] in CF) isc = 1
+      for (i = 1; i <= n; i++) {
+        if (isc && (a[i] == "anthropic" || a[i] == "claude")) continue
+        if (isnum(a[i])) N = N " " a[i]
+        else if (a[i] in Q) Qs = Qs " " a[i]
+        else L = L " " a[i]
+      }
+      o = (isc ? "anthropic claude" : "") L N Qs; sub(/^ /, "", o); return o
+    }
+    function addform(F, f) { if (f != "" && !((f) in FS_)) { FS_[f] = 1; F[++F[0]] = f } }
+    # forms(name, F) -> F[1..F[0]] token strings; also sets G_ (glob strings) and FLOAT_/SIG_
+    function forms(x, F,   s, t, k, j, fl, c) {
+      split("", FS_); split("", G_); F[0] = 0; G_[0] = 0; fl = 1
+      for (k = 0; k < 2; k++) {
+        if (k == 0) s = x; else { if (!(x in ID) || ID[x] == x) break; s = ID[x] }
+        G_[++G_[0]] = s
+        t = s; sub(/^.*\//, "", t); G_[++G_[0]] = t
+        addform(F, tokstr(s)); addform(F, tokstr(t))
+        c = canon(tokstr(t)); addform(F, c)
+        if (k == 0) SIG_ = sig(c)
+        if (tokstr(t) ~ /(^| )[0-9]+( |$)/) fl = 0
+      }
+      for (j = 1; j <= F[0]; j++) { c = F[j]; gsub(/ /, "-", c); G_[++G_[0]] = c }
+      FLOAT_ = fl
+    }
+    function sig(c,   n, a, i, o) {
+      n = split(c, a, " "); o = ""
+      for (i = 1; i <= n; i++) if (!isnum(a[i]) && !(a[i] in Q) && a[i] != "anthropic") o = o " " a[i]
+      return o
+    }
+    function cmatch(e, c,   ea, ca, ne, nc, i, j, ok, nx) {
+      ne = split(e, ea, " "); nc = split(c, ca, " ")
       if (ne == 0 || ne > nc) return 0
       for (i = 0; i + ne <= nc; i++) {
         ok = 1
         for (j = 1; j <= ne; j++) if (ca[i + j] != ea[j]) { ok = 0; break }
-        if (ok) return 1
+        if (!ok) continue
+        if (i + ne == nc) return 1
+        nx = ca[i + ne + 1]
+        if (isnum(nx)) { if (length(nx) >= 6 || !isnum(ea[ne])) return 1; continue }
+        if (ne >= 2 && (nx in SIB)) continue
+        return 1
       }
       return 0
     }
-    function g2r(g,   r, i, c) {
+    function g2r(g,   r, i, ch) {
       r = "^"
       for (i = 1; i <= length(g); i++) {
-        c = substr(g, i, 1)
-        if (c == "*") r = r ".*"
-        else if (c == "?") r = r "."
-        else if (index(".^$+(){}|\\", c)) r = r "\\" c
-        else r = r c
+        ch = substr(g, i, 1)
+        if (ch == "*") r = r ".*"
+        else if (ch == "?") r = r "."
+        else if (ch ~ /[a-z0-9]/) r = r ch
+        else r = r "[" ch "]"
       }
       return r "$"
     }
+    function norm(s) { s = tolower(s); sub(/\[[0-9]+[a-z]*\]$/, "", s); return s }
+    # excluded(name) -> the matching entry ("" = allowed); WHY_ carries a reason worth printing.
+    function excluded(name,   x, CFm, CCm, CPm, j, k, e, cur, par, CCG) {
+      x = norm(name); WHY_ = ""
+      if (x == "") return ""
+      forms(x, CFm)
+      for (k = 1; k <= G_[0]; k++) CG[k] = G_[k]; CG[0] = G_[0]
+      cfl = FLOAT_; csig = SIG_
+      cur = (x in CUR) ? CUR[x] : ""; par = ""; CPm[0] = 0
+      if (cur != "") {
+        forms(cur, CCm)
+        for (k = 1; k <= G_[0]; k++) CCG[k] = G_[k]; CCG[0] = G_[0]
+        if (cur in PAR) { par = PAR[cur]; forms(par, CPm) }
+      }
+      for (e = 1; e <= NE; e++) {
+        if (EGLOB[e] != "") {
+          for (k = 1; k <= CG[0]; k++) if (CG[k] ~ EGLOB[e]) return ENT[e]
+          if (cur != "") {
+            for (k = 1; k <= CCG[0]; k++) if (CCG[k] ~ EGLOB[e]) { WHY_ = x " runs " cur " today"; return ENT[e] }
+          } else if (cfl && EGSIG[e] != "" && index(csig " ", EGSIG[e] " ") == 1) {
+            WHY_ = x " picks its model id live, so outsourcerer cannot tell which version it would run (fail closed); name an exact id with -m"
+            return ENT[e]
+          }
+          continue
+        }
+        for (j = 1; j <= EF[e, 0]; j++)
+          for (k = 1; k <= CFm[0]; k++)
+            if (cmatch(EF[e, j], CFm[k])) return ENT[e]
+        if (cur != "") {
+          # The bare alias runs its CURRENT id. An entry covers it when it covers that id exactly, or
+          # when that id is LISTED as a point release of what the entry covers (OSRC_CLAUDE_POINT_RELEASES:
+          # claude-fable-5 covers fable = claude-fable-5-1). Never inferred from the version shape:
+          # claude-sonnet-5 is a different model from claude-sonnet-5-5.
+          for (j = 1; j <= EF[e, 0]; j++) {
+            for (k = 1; k <= CCm[0]; k++)
+              if (cmatch(EF[e, j], CCm[k])) { WHY_ = x " runs " cur " today"; return ENT[e] }
+            for (k = 1; k <= CPm[0]; k++)
+              if (cmatch(EF[e, j], CPm[k])) { WHY_ = x " runs " cur " today, a point release of " par; return ENT[e] }
+          }
+        } else if (cfl && EVER[e] && ESIG[e] != "" && ESIG[e] == csig) {
+          WHY_ = x " picks its model id live, so outsourcerer cannot tell which version it would run (fail closed); name an exact id with -m"
+          return ENT[e]
+        }
+      }
+      return ""
+    }
     BEGIN {
+      split("fable opus sonnet haiku", t, " "); for (i in t) CF[t[i]] = 1
+      split("high low medium xhigh max min minimal thinking latest preview free fast exp experimental", t, " "); for (i in t) Q[t[i]] = 1
+      split("mini nano lite flash lightning air small micro tiny", t, " "); for (i in t) SIB[t[i]] = 1
+      nr = split(ENVIRON["OSRC_EXCL_CUR"], rows, " ")
+      for (i = 1; i <= nr; i++) if (split(rows[i], f, "|") == 2) CUR[tolower(f[1])] = tolower(f[2])
+      nr = split(ENVIRON["OSRC_EXCL_PR"], rows, " ")
+      for (i = 1; i <= nr; i++) if (split(rows[i], f, ":") == 2) PAR[tolower(f[1])] = tolower(f[2])
       nr = split(ENVIRON["OSRC_EXCL_TABLE"], rows, "\n")
       for (i = 1; i <= nr; i++) {
         if (split(rows[i], f, "|") < 2) continue
-        a = tolower(f[1]); if (a != "" && !(a in id)) id[a] = tolower(f[2])
+        a = tolower(f[1]); if (a != "" && !(a in ID)) ID[a] = norm(f[2])
       }
-      c1 = strip(tolower(name)); c2 = (c1 in id) ? id[c1] : ""
+      n = split(ENVIRON["OSRC_EXCL_ENTRIES"], el, "\n"); NE = 0
+      for (i = 1; i <= n; i++) {
+        if (el[i] == "") continue
+        NE++; ENT[NE] = el[i]; EGLOB[NE] = ""
+        if (el[i] ~ /[*?]/) {
+          EGLOB[NE] = g2r(el[i]); p = el[i]; sub(/[*?].*$/, "", p); sub(/^.*\//, "", p)
+          EGSIG[NE] = sig(canon(tokstr(p))); continue
+        }
+        forms(el[i], F1)
+        for (j = 1; j <= F1[0]; j++) EF[NE, j] = F1[j]
+        EF[NE, 0] = F1[0]
+        EVER[NE] = !FLOAT_; ESIG[NE] = SIG_
+      }
     }
     {
-      e = $0
-      if (e !~ /[a-z]/) next
-      if (e ~ /[*?[]/) {
-        r = g2r(e)
-        if (c1 ~ r || (c2 != "" && c2 ~ r)) { print e; exit }
+      if (mode == "keep") {
+        w = $1
+        if (w == "" || excluded(w) == "") print
         next
       }
-      eid = (e in id) ? id[e] : ""
-      if (c1 == e || c2 == e) { print e; exit }
-      if (eid != "" && (c1 == eid || c2 == eid)) { print e; exit }
-      if (contig(e, c1) || (c2 != "" && contig(e, c2))) { print e; exit }
-    }' 2>/dev/null)"
-  [ -n "$out" ] || return 1
-  printf '%s\n' "$out"
+      h = excluded($0)
+      if (h != "") print $0 "\t" h "\t" WHY_
+    }'
+}
+
+# _exclude_hits <name...> -> "<name>\t<entry>" per excluded name, one awk pass for the whole batch.
+# Fails closed: an unparsable entry or a matcher failure reports EVERY name as excluded.
+_exclude_hits() {
+  _exclude_active || return 0
+  local n out list=""
+  if [ -n "$_OSRC_EXCL_BAD" ]; then
+    _exclude_bad_warn
+    for n in "$@"; do [ -n "$n" ] && printf '%s\t%s\n' "$n" "${_OSRC_EXCL_BAD%%$'\n'*}"; done
+    return 0
+  fi
+  for n in "$@"; do
+    case "$n" in ''|*$'\n'*|*$'\t'*) continue ;; esac
+    list="$list$n"$'\n'
+  done
+  [ -n "$list" ] || return 0
+  if ! out="$(OSRC_EXCL_ENTRIES="$_OSRC_EXCL_LIST" _exclude_awk hits <<<"$list" 2>/dev/null)"; then
+    printf '>>> [exclude] the exclude matcher failed, so every model counts as excluded for this run (fail closed). Check: %s exclude ls\n' "$0" >&2
+    for n in "$@"; do [ -n "$n" ] && printf '%s\t%s\n' "$n" "(exclude matcher error)"; done
+    return 0
+  fi
+  [ -n "$out" ] && printf '%s\n' "$out"
   return 0
 }
-_model_excluded() { _model_excluded_by "${1:-}" >/dev/null; }
+
+# _exclude_hit <name> -> rc0 + EXCL_HIT=<entry> when <name> is excluded; rc1 (EXCL_HIT empty) when
+# allowed. Runs in the CALLER's shell (no command substitution needed), so the per-name memo sticks:
+# each distinct name costs at most one awk per process.
+_exclude_hit() {
+  EXCL_HIT=""; EXCL_WHY=""
+  local name="${1:-}" rest r
+  [ -n "$name" ] || return 1
+  _exclude_active || return 1
+  case "$name" in *$'\n'*|*$'\t'*) EXCL_HIT="(invalid model name)"; return 0 ;; esac
+  case "$_OSRC_EXCL_MEMO" in
+    *$'\n'"$name"$'\t'*)
+      rest="${_OSRC_EXCL_MEMO#*$'\n'"$name"$'\t'}"; r="${rest%%$'\n'*}"
+      [ "$r" = "-" ] && return 1
+      _exclude_hit_split "$r"; return 0 ;;
+  esac
+  r="$(_exclude_hits "$name")"
+  r="${r#*$'\t'}"; r="${r%%$'\n'*}"
+  _OSRC_EXCL_MEMO="${_OSRC_EXCL_MEMO:-$'\n'}$name"$'\t'"${r:--}"$'\n'
+  [ -n "$r" ] || return 1
+  _exclude_hit_split "$r"; return 0
+}
+# _exclude_hit_split "<entry>[\t<why>]" -> EXCL_HIT=<entry>, EXCL_WHY=<why> (may be empty).
+_exclude_hit_split() {
+  EXCL_HIT="${1%%$'\t'*}"; EXCL_WHY=""
+  case "$1" in *$'\t'*) EXCL_WHY="${1#*$'\t'}" ;; esac
+}
+
+# _model_excluded_by <name> -> prints the matching exclude entry and returns 0; rc1 (no output) when
+# the model is allowed. <name> may be an alias, a resolved id, an OpenRouter slug or a footer label;
+# a trailing context-window suffix ([1m]) is ignored. Prefer _exclude_hit in new code (no subshell).
+_model_excluded_by() { _exclude_hit "${1:-}" || return 1; printf '%s\n' "$EXCL_HIT"; }
+_model_excluded() { _exclude_hit "${1:-}"; }
 
 # _exclude_refuse <model[,model...]> [label] -> dies with ONE plain line when any named model is on the
 # exclude list. An explicit -m is a deliberate choice, so it is refused, never silently swapped.
 _exclude_refuse() {
   _exclude_active || return 0
-  local spec="${1:-}" label="${2:-}" m hit
+  local spec="${1:-}" label="${2:-}" m
   _words_noglob "$(printf '%s' "$spec" | tr ',' ' ')"
   for m in ${WORDS[@]+"${WORDS[@]}"}; do
     [ -n "$m" ] || continue
-    if hit="$(_model_excluded_by "$m")"; then
-      die "${label:+$label: }you excluded '$m' (exclude list entry: $hit). Pick another model with -m, or allow it again with: $0 exclude rm $hit"
+    if _exclude_hit "$m"; then
+      die "${label:+$label: }you excluded '$m' (exclude list entry: $EXCL_HIT${EXCL_WHY:+; $EXCL_WHY}). Pick another model with -m, or allow it again with: $0 exclude rm $EXCL_HIT"
     fi
   done
   return 0
 }
 
-# _exclude_filter <word...> -> the allowed words, space-separated, order kept. For automatic lists.
+# _exclude_refuse_resolved <requested> <resolved> [label] -> the second gate for every alias -> id
+# resolver (Devin live catalog, agy/gemini family pick, engine alias maps): an alias that passed the
+# -m check can still resolve to an excluded id (`-m claude` -> claude-fable-5-high on Devin).
+_exclude_refuse_resolved() {
+  _exclude_active || return 0
+  local req="${1:-}" res="${2:-}" label="${3:-}"
+  [ -n "$res" ] || return 0
+  _exclude_hit "$res" || return 0
+  if [ -n "$req" ] && [ "$req" != "$res" ]; then
+    die "${label:+$label: }'$req' resolves to $res, which you excluded (exclude list entry: $EXCL_HIT), so it will not run. Pick another model with -m, or allow it again with: $0 exclude rm $EXCL_HIT"
+  fi
+  die "${label:+$label: }you excluded '$res' (exclude list entry: $EXCL_HIT), so it will not run. Pick another model with -m, or allow it again with: $0 exclude rm $EXCL_HIT"
+}
+
+# _exclude_filter <word...> -> the allowed words, space-separated, order kept. One awk pass.
 _exclude_filter() {
-  local w out=""
+  if ! _exclude_active; then local IFS=' '; printf '%s' "$*"; return 0; fi
+  local w out="" hits
+  hits="$(_exclude_hits "$@")"
   for w in "$@"; do
     [ -n "$w" ] || continue
-    _model_excluded "$w" && continue
+    case "$hits" in "$w"$'\t'*|*$'\n'"$w"$'\t'*) continue ;; esac
     out="${out:+$out }$w"
   done
   printf '%s' "$out"
@@ -5599,20 +5870,50 @@ _exclude_filter() {
 # _exclude_filter_lines -> stdin filter: drops display lines whose first word is an excluded model.
 _exclude_filter_lines() {
   if ! _exclude_active; then cat; return 0; fi
-  local line w
-  while IFS= read -r line; do
-    w="$(printf '%s' "$line" | awk '{print $1}')"
-    [ -n "$w" ] && _model_excluded "$w" && continue
-    printf '%s\n' "$line"
-  done
+  if [ -n "$_OSRC_EXCL_BAD" ]; then _exclude_bad_warn; cat >/dev/null; return 0; fi
+  local all out
+  all="$(cat)"
+  [ -n "$all" ] || return 0
+  if out="$(OSRC_EXCL_ENTRIES="$_OSRC_EXCL_LIST" _exclude_awk keep <<<"$all" 2>/dev/null)"; then
+    [ -n "$out" ] && printf '%s\n' "$out"
+  else
+    printf '>>> [exclude] the exclude matcher failed; hiding this list (fail closed). Check: %s exclude ls\n' "$0" >&2
+  fi
+  return 0
 }
 
 # _exclude_notice_line -> one line naming the active exclusions, or nothing. Shared by brief + doctor.
 _exclude_notice_line() {
   _exclude_active || return 0
-  local list; list="$(_exclude_entries | awk 'NF' | paste -sd ',' - | sed 's/,/, /g')"
+  local list b
+  list="$(printf '%s' "$_OSRC_EXCL_LIST" | awk 'NF' | paste -sd ',' - | sed 's/,/, /g')"
+  if [ -n "$_OSRC_EXCL_BAD" ]; then
+    b="$(printf '%s' "$_OSRC_EXCL_BAD" | awk 'NF' | paste -sd ',' - | sed 's/,/, /g')"
+    printf 'excluded    : EVERY MODEL (unparsable entry: %s; fix it with: %s exclude rm <entry>)%s\n' "$b" "$0" "${list:+; also listed: $list}"
+    return 0
+  fi
   [ -n "$list" ] || return 0
   printf 'excluded    : %s (never chosen, never a fallback, -m refused; change with: %s exclude rm <model>)\n' "$list" "$0"
+}
+
+# _exclude_known_models -> every model name outsourcerer knows offline: alias table (aliases + ids),
+# native benchmark slugs, a few Devin catalog ids, and the cached OpenRouter catalog when present.
+_exclude_known_models() {
+  {
+    printf '%s\n' "$OSRC_MODEL_TABLE" | awk -F'|' 'NF >= 2 { print $1; print $2 }'
+    printf '%s\n' "$_NATIVE_BENCH_MAP" | awk -F'|' 'NF >= 2 { print $2 }'
+    printf '%s\n' claude-fable-5-high claude-opus-5-high claude-sonnet-5-5 swe-1-8 swe-2 gpt-5.5-mini deepseek-v4-pro-high
+    printf '%s\n' "$_AGY_PRO_LASTKNOWN" "$_AGY_FLASH_LASTKNOWN" "$_GI_FLASH_LITE_LASTKNOWN"
+    if [ -f "$OSRC_MODELS_JSON" ] && have jq; then jq -r '.data[]?.id // empty' "$OSRC_MODELS_JSON" 2>/dev/null; fi
+  } | awk 'NF && !seen[tolower($0)]++'
+}
+
+# _exclude_coverage <entry> -> "a, b, c" of the known models one entry covers (max 12 + count).
+_exclude_coverage() {
+  local e="$1" names out
+  names="$(_exclude_known_models)"
+  out="$(OSRC_EXCL_ENTRIES="$e" _exclude_awk hits <<<"$names" 2>/dev/null | cut -f1)" || return 1
+  printf '%s\n' "$out" | awk 'NF { n++; if (n <= 12) s = s (s == "" ? "" : ", ") $0 } END { if (n > 12) s = s ", and " (n - 12) " more"; print s }'
 }
 
 # _exclude_write <content> -> atomic replace of the saved list (caller holds the state lock).
@@ -5624,9 +5925,66 @@ _exclude_write() {
   return 1
 }
 
+# _exclude_entry_norm <raw> -> the stored form (lowercase, [1m] suffix dropped); dies when unparsable.
+_exclude_entry_norm() {
+  local m="$1" lm
+  case "$m" in *$'\n'*|*$'\t'*|*' '*) die "exclude add: '$m' is not a model name (one name per argument, no spaces)" ;; esac
+  lm="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]' | sed 's/\[[0-9]*[a-z]*\]$//')"
+  printf '%s' "$lm" | LC_ALL=C grep -qE '^[a-z0-9._:/*?@+-]+$' \
+    || die "exclude add: '$m' is not a model name (use letters, digits and . _ : / - * ? only; a trailing [1m] is allowed)"
+  printf '%s' "$lm" | grep -q '[a-z]' \
+    || die "exclude add: '$m' has no letters; name a model or family (e.g. fable, claude-fable-5, gpt-5.6-*)"
+  printf '%s' "$lm"
+}
+
+# _exclude_cc_configured_model / _exclude_cx_configured_model -> the default model the CLI itself
+# would run with no --model (env override, then its settings file), or nothing when unset.
+_exclude_cc_configured_model() {
+  [ -n "${ANTHROPIC_MODEL:-}" ] && { printf '%s' "$ANTHROPIC_MODEL"; return 0; }
+  [ -f "$HOME/.claude/settings.json" ] && have jq && jq -r '.model // empty' "$HOME/.claude/settings.json" 2>/dev/null | head -1
+}
+_exclude_cx_configured_model() {
+  [ -f "$HOME/.codex/config.toml" ] || return 0
+  LC_ALL=C awk '/^[[:space:]]*\[/ { exit } /^[[:space:]]*model[[:space:]]*=/ { sub(/^[^=]*=/, ""); sub(/#.*/, ""); print; exit }' "$HOME/.codex/config.toml" 2>/dev/null | tr -d "\"' \t"
+}
+
+# _exclude_session_default_guard <provider> -> for a session (or relaunch) WITHOUT -m: the CLI runs its
+# own default model. Refuse when that default is known and excluded, or unknown while the list covers
+# a model of that CLI's family (the default could be it). Engine CLIs whose catalogs we cannot see
+# (devin/droid/cursor/hermes/cline) get one notice instead of a refusal.
+_exclude_session_default_guard() {
+  _exclude_active || return 0
+  [ "${MODEL_EXPLICIT:-0}" = "1" ] && return 0
+  local prov="${1:-}" cfg="" fams="" label hits allowed
+  case "$prov" in
+    cc|claude)  cfg="$(_exclude_cc_configured_model)"; fams="fable opus sonnet haiku"; label="Claude Code" ;;
+    codex|cx)   cfg="$(_exclude_cx_configured_model)"; fams="sol terra luna gpt-5.5"; label="Codex" ;;
+    gemini|gm)  fams="gemini-pro gemini-flash gemini-flash-lite"; label="Gemini" ;;
+    *)
+      printf '>>> [exclude] this %s session runs the model %s itself picks by default, which outsourcerer cannot see, so your exclude list cannot be checked against it. Pass -m <model> to be sure.\n' "${prov:-?}" "${prov:-the CLI}" >&2
+      return 0 ;;
+  esac
+  if [ -n "$cfg" ]; then
+    _exclude_hit "$cfg" && die "session start: without -m this $label session runs your configured default $cfg, which you excluded (exclude list entry: $EXCL_HIT). Pass -m <an allowed model>, or change the default in $label."
+    return 0
+  fi
+  _words_noglob "$fams"
+  hits="$(_exclude_hits ${WORDS[@]+"${WORDS[@]}"} | cut -f1 | paste -sd ',' - | sed 's/,/, /g')"
+  [ -n "$hits" ] || return 0
+  allowed="$(_exclude_filter ${WORDS[@]+"${WORDS[@]}"})"; allowed="${allowed%% *}"
+  die "session start: without -m this $label session runs $label's own default model, which outsourcerer cannot see, and your exclude list covers $hits. Pass -m <an allowed model>${allowed:+ (for example -m $allowed)}."
+}
+
+# _exclude_engine_default_notice <provider> -> one line when an engine lane runs its own default model.
+_exclude_engine_default_notice() {
+  _exclude_active || return 0
+  [ "${MODEL_EXPLICIT:-0}" = "1" ] && return 0
+  printf '>>> [exclude] the %s lane runs the model it is configured with, which outsourcerer cannot see, so your exclude list is only enforced on models named with -m. Pass -m <model> to be sure.\n' "${1:-engine}" >&2
+}
+
 cmd_exclude() {
   local action="${1:-ls}"; [ "$#" -gt 0 ] && shift
-  local m lm cur keep line nl removed hit e
+  local m lm cur keep line nl removed e cov
   case "$action" in
     ls|list|status)
       if ! _exclude_active; then
@@ -5634,34 +5992,43 @@ cmd_exclude() {
         return 0
       fi
       echo "excluded models (never chosen, never used as a fallback; -m with one of these is refused):"
+      local saved; saved="$(_exclude_saved_entries)"
       while IFS= read -r e; do
         [ -n "$e" ] || continue
-        if _exclude_saved_entries | grep -qxF -- "$e"; then printf '  %s\n' "$e"
+        if printf '%s\n' "$saved" | grep -qxF -- "$e"; then printf '  %s\n' "$e"
         else printf '  %s   (from OSRC_EXCLUDE_MODELS)\n' "$e"; fi
       done <<_OSRC_EXCL_LS
-$(_exclude_entries)
+$_OSRC_EXCL_LIST
 _OSRC_EXCL_LS
+      while IFS= read -r e; do
+        [ -n "$e" ] || continue
+        printf '  %s   (NOT A VALID MODEL NAME: every model counts as excluded until you fix it: %s exclude rm '"'"'%s'"'"')\n' "$e" "$0" "$e"
+      done <<_OSRC_EXCL_LSB
+$_OSRC_EXCL_BAD
+_OSRC_EXCL_LSB
       ;;
     add)
       [ "$#" -ge 1 ] || die "exclude add needs a model or family, e.g.: $0 exclude add fable"
-      for m in "$@"; do
-        printf '%s' "$m" | LC_ALL=C grep -qE '^[A-Za-z0-9._:/*?@+-]+$' \
-          || die "exclude add: '$m' is not a model name (use letters, digits and . _ : / - * ? only)"
-        printf '%s' "$m" | grep -q '[A-Za-z]' \
-          || die "exclude add: '$m' has no letters; name a model or family (e.g. fable, claude-fable-5, gpt-5.6-*)"
-      done
+      local -a norm=()
+      for m in "$@"; do lm="$(_exclude_entry_norm "$m")" || exit 1; norm+=("$lm"); done
       _mkdir_private "$OSRC_HOME" >/dev/null 2>&1 || die "exclude: cannot write the state home $OSRC_HOME"
       [ ! -L "$OSRC_EXCLUDE_FILE" ] || die "exclude: $OSRC_EXCLUDE_FILE is a symlink; refusing to write through it"
       _state_lock_acquire "$OSRC_EXCLUDE_FILE" || die "exclude: the list is busy (another update holds its lock); try again in a moment"
       cur="$( [ -f "$OSRC_EXCLUDE_FILE" ] && cat "$OSRC_EXCLUDE_FILE" 2>/dev/null)"
-      for m in "$@"; do
-        lm="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')"
-        if printf '%s\n' "$cur" | sed -e 's/#.*//' -e 's/[[:space:]]//g' | tr '[:upper:]' '[:lower:]' | grep -qxF -- "$lm"; then
+      for lm in "${norm[@]}"; do
+        if printf '%s\n' "$cur" | sed -e 's/#.*//' -e 's/[[:space:]]//g' | tr '[:upper:]' '[:lower:]' | sed 's/\[[0-9]*[a-z]*\]$//' | grep -qxF -- "$lm"; then
           echo "already excluded: $lm"; continue
         fi
         cur="${cur:+$cur
 }$lm"
         echo "excluded: $lm (never chosen automatically; -m $lm is refused)"
+        cov="$(_exclude_coverage "$lm")"
+        if [ -n "$cov" ]; then echo "  covers: $cov"
+        else echo "  covers no model outsourcerer knows today; it still refuses any model whose name matches it later."; fi
+        case "$lm" in
+          *[*?]*) : ;;
+          *[0-9]) echo "  note: an exact version does not cover its point releases (e.g. $lm-1) or other sizes; use '$lm*' or the family word to cover those too." ;;
+        esac
       done
       _exclude_write "$cur" || { _state_lock_release "$OSRC_EXCLUDE_FILE"; die "exclude: could not write $OSRC_EXCLUDE_FILE"; }
       _state_lock_release "$OSRC_EXCLUDE_FILE"
@@ -5673,9 +6040,9 @@ _OSRC_EXCL_LS
         _state_lock_acquire "$OSRC_EXCLUDE_FILE" || die "exclude: the list is busy (another update holds its lock); try again in a moment"
         cur="$(cat "$OSRC_EXCLUDE_FILE" 2>/dev/null)"
         for m in "$@"; do
-          lm="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')"; keep=""; removed=0
+          lm="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]' | sed 's/\[[0-9]*[a-z]*\]$//')"; keep=""; removed=0
           while IFS= read -r line; do
-            nl="$(printf '%s' "$line" | sed -e 's/#.*//' -e 's/[[:space:]]//g' | tr '[:upper:]' '[:lower:]')"
+            nl="$(printf '%s' "$line" | sed -e 's/#.*//' -e 's/[[:space:]]//g' | tr '[:upper:]' '[:lower:]' | sed 's/\[[0-9]*[a-z]*\]$//')"
             if [ -n "$nl" ] && [ "$nl" = "$lm" ]; then removed=1; continue; fi
             [ -n "$line" ] || continue
             keep="${keep:+$keep
@@ -5692,7 +6059,7 @@ _OSRC_EXCL_RM
         for m in "$@"; do echo "not in the saved list: $(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')"; done
       fi
       for m in "$@"; do
-        lm="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')"
+        lm="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]' | sed 's/\[[0-9]*[a-z]*\]$//')"
         _exclude_env_entries | grep -qxF -- "$lm" \
           && echo "note: $lm is still excluded by the OSRC_EXCLUDE_MODELS environment variable; remove it there too."
       done
@@ -5700,7 +6067,11 @@ _OSRC_EXCL_RM
       ;;
     clear)
       [ ! -L "$OSRC_EXCLUDE_FILE" ] || die "exclude: $OSRC_EXCLUDE_FILE is a symlink; refusing to touch it"
-      rm -f "$OSRC_EXCLUDE_FILE" 2>/dev/null
+      if [ -e "$OSRC_EXCLUDE_FILE" ]; then
+        _state_lock_acquire "$OSRC_EXCLUDE_FILE" || die "exclude: the list is busy (another update holds its lock); try again in a moment"
+        rm -f "$OSRC_EXCLUDE_FILE" 2>/dev/null
+        _state_lock_release "$OSRC_EXCLUDE_FILE"
+      fi
       echo "exclude list cleared (every model can be chosen again)."
       [ -n "$(_exclude_env_entries)" ] \
         && echo "note: OSRC_EXCLUDE_MODELS is still set in your environment ($OSRC_EXCLUDE_MODELS); those stay excluded."
@@ -5708,11 +6079,12 @@ _OSRC_EXCL_RM
       ;;
     check)
       [ -n "${1:-}" ] || die "exclude check needs a model name"
-      if hit="$(_model_excluded_by "$1")"; then echo "excluded: $1 (matches $hit)"; return 0; fi
+      if _exclude_hit "$1"; then echo "excluded: $1 (matches $EXCL_HIT${EXCL_WHY:+; $EXCL_WHY})"; return 0; fi
       echo "allowed: $1"; return 1 ;;
     -h|--help|help)
       echo "usage: $0 exclude add|rm|ls|clear|check <model-or-family>"
-      echo "  an entry can be an alias (fable), an exact id (claude-fable-5-1), a family word (fable covers every Fable id) or a glob (gpt-5.6-*)"
+      echo "  an entry can be an alias (fable), an exact id (claude-fable-5), a family word (fable covers every Fable id) or a glob (gpt-5.6-*)"
+      echo "  an exact version does not cover point releases (claude-sonnet-5 leaves claude-sonnet-5-5 allowed); a bare family alias (-m fable) is refused when any version of it is excluded"
       echo "  OSRC_EXCLUDE_MODELS (comma/space list) is added on top of the saved list" ;;
     *) die "exclude: unknown action '$action' (use: add|rm|ls|clear|check <model-or-family>)" ;;
   esac
@@ -7687,6 +8059,10 @@ _model_pin_enforce_item() { # <fleet-item> <snapshot-generation>
   _wake_append "$(jq -cn --arg event_id "$event_id" --arg generation "$snapshot_generation" --arg session_id "$session_id" --arg requested "$requested" --arg observed "$observed" '{event_id:$event_id,kind:"model-drift",generation:$generation,session_id:$session_id,state:"blocked",task_summary:("model drifted " + $requested + "->" + $observed)}')" >/dev/null 2>&1 || result=unknown
   # Automatic input is restricted to an actively working managed session with both proof adapters.
   # External, idle, terminal, and unknown sessions are reported only.
+  # #45: a drifted session is never flipped BACK onto a model the user has since excluded.
+  if [ "$result" = reported ] && { _model_excluded "$resolved" || _model_excluded "$requested"; }; then
+    result=restore-skipped-excluded
+  fi
   if [ "$result" = reported ] && [ "$owner" = managed ] && [ "$state" = working ] && [ -n "$lane" ] && [ -n "$endpoint" ] \
      && _model_pin_restore_allowed "$session_id" "$model_generation"; then
     lock="$OSRC_SESSIONS/model-pin-${session_id}.${model_generation}.lock"
@@ -12021,6 +12397,23 @@ run_job() {
     return 1
   fi
   rm -f "$jd/setup" 2>/dev/null || true   # setup finished; normal launch-grace applies from here
+  # #45: the exclude list can change between launch and this child. _consume_flags refuses an
+  # excluded -m with `die` (exit), which here would end the job SILENTLY with no status. Check first
+  # and fail the job with its reason on record.
+  if _exclude_active; then
+    local _ja _jprev="" _jm=""
+    for _ja in "$@"; do
+      case "$_jprev" in -m|--model) _jm="$_ja"; break ;; esac
+      _jprev="$_ja"
+    done
+    if [ -n "$_jm" ] && _exclude_hit "$_jm"; then
+      printf "[outsourcerer] job %s did not start: you excluded '%s' (exclude list entry: %s). Pick another model with -m, or allow it again with: %s exclude rm %s\n" "$id" "$_jm" "$EXCL_HIT" "$0" "$EXCL_HIT" | tee -a "$jd/out.log" >&2
+      printf 'excluded-model:%s\n' "$_jm" > "$jd/reason" 2>/dev/null || true
+      echo 1 > "$jd/exit" 2>/dev/null || true
+      echo failed > "$jd/status"
+      return 1
+    fi
+  fi
   # peek model/tier for windows + meta (non-fatal)
   _consume_flags "$@" 2>/dev/null || true
   # Classify from the REAL task text (REST), not the "job:<id>" placeholder record_ledger sees.
@@ -13620,7 +14013,16 @@ $body"
       _xm="$g_model"
       [ -z "$_xm" ] && [ -n "$route_spec" ] && _xm="$(_route_match "${labels[$_xi]}" "$route_spec")"
       [ -z "$_xm" ] && _xm="${a_model[$_xi]}"
-      [ -n "$_xm" ] && _exclude_refuse "$_xm" "fanout job ${labels[$_xi]} (nothing was started)"
+      if [ -n "$_xm" ]; then
+        _exclude_refuse "$_xm" "fanout job ${labels[$_xi]} (nothing was started)"
+      else
+        # No model named anywhere: the member runs its provider's built-in default. Check that up
+        # front too, instead of letting every member launch and then refuse one by one.
+        local _xp _xdm; _xp="${g_prov:-${a_prov[$_xi]}}"; _xp="${_xp:-$PROVIDER}"
+        if _xdm="$(_route_provider_default_model "$_xp" 2>/dev/null)" && [ -n "$_xdm" ] && _exclude_hit "$_xdm"; then
+          die "fanout job ${labels[$_xi]} (nothing was started): it names no model, so it would run the --provider $_xp default $_xdm, which you excluded (exclude list entry: $EXCL_HIT). Pass -m <another model>, pick another --provider, or allow it again with: $0 exclude rm $EXCL_HIT"
+        fi
+      fi
     done
   fi
 
@@ -13850,6 +14252,7 @@ _so_resolve() {  # <model> -> "resolved_id|disp|tier" (mirrors run-verb routing)
   [ -n "$tier" ] || tier="$(resolve_tier "$id" "")"
   printf '%s|%s|%s\n' "$id" "$disp" "$tier"
 }
+_so_rid() { local _r; _r="$(_so_resolve "$1" 2>/dev/null)"; _r="${_r%%|*}"; printf '%s' "${_r:-$1}"; }   # <model> -> resolved id
 _so_run() {   # <model> <prompt> -> stdout text via the same read-only routing as `run`
   OSRC_NO_AUTODETACH=1 OSRC_STREAM=0 OSRC_LEDGER_QUIET=1 \
     route_delegate auto run -m "$1" -- "$2"
@@ -13878,19 +14281,39 @@ second_opinion() {
   # and the premium judge are automatic choices, so an excluded one is swapped for the next allowed
   # model, out loud, and never run. Nothing allowed left -> stop with the fix.
   if _exclude_active; then
-    local _so_pool="z-ai/glm-5.2 sol deepseek/deepseek-v4-pro terra kimi gemini-pro opus" _c _x
-    if _x="$(_model_excluded_by "$m1")"; then
-      for _c in $_so_pool; do [ "$_c" != "$m2" ] && ! _model_excluded "$_c" && { echo ">>> second-opinion: $m1 is on your exclude list ($_x); using $_c instead" >&2; m1="$_c"; break; }; done
-      _model_excluded "$m1" && die "second-opinion: every default comparison model is on your exclude list. Pass two allowed models with -m a,b (see: $0 exclude ls)"
+    # Swaps compare RESOLVED ids (glm and z-ai/glm-5.2 are one model), so a swap can never pair a
+    # model with itself; the judge must differ from both comparison models the same way.
+    local _so_pool="z-ai/glm-5.2 sol deepseek/deepseek-v4-pro terra kimi gemini-pro opus" _c _x _rc _rid1 _rid2
+    _rid1="$(_so_rid "$m1")"; _rid2="$(_so_rid "$m2")"
+    if _exclude_hit "$m1" || _exclude_hit "$_rid1"; then
+      _x="$EXCL_HIT"
+      for _c in $_so_pool; do
+        _model_excluded "$_c" && continue
+        _rc="$(_so_rid "$_c")"; [ "$_rc" != "$_rid2" ] || continue
+        _exclude_hit "$_rc" && continue
+        echo ">>> second-opinion: $m1 is on your exclude list ($_x); using $_c instead" >&2; m1="$_c"; _rid1="$_rc"; break
+      done
+      { _model_excluded "$m1" || _model_excluded "$_rid1"; } && die "second-opinion: every default comparison model is on your exclude list. Pass two allowed models with -m a,b (see: $0 exclude ls)"
     fi
-    if _x="$(_model_excluded_by "$m2")"; then
-      for _c in $_so_pool; do [ "$_c" != "$m1" ] && ! _model_excluded "$_c" && { echo ">>> second-opinion: $m2 is on your exclude list ($_x); using $_c instead" >&2; m2="$_c"; break; }; done
-      _model_excluded "$m2" && die "second-opinion: every default comparison model is on your exclude list. Pass two allowed models with -m a,b (see: $0 exclude ls)"
+    if _exclude_hit "$m2" || _exclude_hit "$_rid2"; then
+      _x="$EXCL_HIT"
+      for _c in $_so_pool; do
+        _model_excluded "$_c" && continue
+        _rc="$(_so_rid "$_c")"; [ "$_rc" != "$_rid1" ] || continue
+        _exclude_hit "$_rc" && continue
+        echo ">>> second-opinion: $m2 is on your exclude list ($_x); using $_c instead" >&2; m2="$_c"; _rid2="$_rc"; break
+      done
+      { _model_excluded "$m2" || _model_excluded "$_rid2"; } && die "second-opinion: every default comparison model is on your exclude list. Pass two allowed models with -m a,b (see: $0 exclude ls)"
     fi
-    if _x="$(_model_excluded_by "$premium")"; then
+    [ "$_rid1" != "$_rid2" ] || die "second-opinion: after skipping excluded models both comparison models are $_rid1. Pass two different allowed models with -m a,b (see: $0 exclude ls)"
+    local _rp; _rp="$(_so_rid "$premium")"
+    if _exclude_hit "$premium" || _exclude_hit "$_rp"; then
+      _x="$EXCL_HIT"
       local _p_was="$premium"; premium=""
       for _c in opus terra gemini-pro sol fable; do
-        [ "$_c" != "$m1" ] && [ "$_c" != "$m2" ] && ! _model_excluded "$_c" && { premium="$_c"; break; }
+        _model_excluded "$_c" && continue
+        _rc="$(_so_rid "$_c")"
+        [ "$_rc" != "$_rid1" ] && [ "$_rc" != "$_rid2" ] && ! _model_excluded "$_rc" && { premium="$_c"; break; }
       done
       [ -n "$premium" ] || die "second-opinion: the premium judge ($_p_was) and every fallback judge are on your exclude list. Set OSRC_SECOND_OPINION_PREMIUM to an allowed model (see: $0 exclude ls)"
       echo ">>> second-opinion: premium judge $_p_was is on your exclude list ($_x); using $premium instead" >&2
@@ -14352,6 +14775,7 @@ delegate_gmnative() {
   if [ "$vehicle" = "agy" ]; then
     have agy || die "OSRC_GEMINI_VEHICLE=agy but 'agy' not on PATH. Install it using the official guide: https://antigravity.google/docs/cli/install/"
     local atok aflag posture; atok="$(_agy_model_token "$id")"
+    _exclude_refuse_resolved "$id" "$atok"   # #45: gemini-pro can resolve to an excluded dated id
     case "$tier" in
       auto)                    aflag=();                                          posture="READ-ONLY (headless -p; no auto-approve)" ;;
       accept-edits|autonomous) aflag=(--sandbox --dangerously-skip-permissions);  posture="SANDBOXED autonomy (--sandbox terminal restrictions + auto-approve)" ;;
@@ -14420,7 +14844,8 @@ delegate_gmnative() {
   # FALLBACK: gemini CLI + API key.
   have gemini || die "OSRC_GEMINI_VEHICLE=gemini but 'gemini' CLI not on PATH. Install: npm install -g @google/gemini-cli  (https://geminicli.com/docs/get-started/installation/). Then set GEMINI_API_KEY in ~/.env."
   _gm_load_key
-  id="$(_gemini_api_id "$id")"
+  local _gid_req="$id"; id="$(_gemini_api_id "$id")"
+  _exclude_refuse_resolved "$_gid_req" "$id"
   local gflag posture
   case "$tier" in
     auto)         gflag=(--approval-mode default);            posture="READ-ONLY (headless denies tool-exec approval)" ;;
@@ -14565,7 +14990,8 @@ delegate_droid() {
   esac
   local mflag=()
   if [ "${MODEL_EXPLICIT:-0}" = "1" ] && [ -n "$id" ]; then
-    id="$(_lane_model_for droid "$id")"; model_key="$id"; ledger_model="$id"
+    local _lreq="$id"; id="$(_lane_model_for droid "$id")"; model_key="$id"; ledger_model="$id"
+    _exclude_refuse_resolved "$_lreq" "$id"
     _validate_model_token "$id"; mflag=(-m "$id")
   else id="(droid default/configured)"; fi
   local eff=()
@@ -14705,7 +15131,8 @@ delegate_warp() {
   esac
   local mflag=()
   if [ "${MODEL_EXPLICIT:-0}" = "1" ] && [ -n "$id" ]; then
-    id="$(_lane_model_for warp "$id")"; model_key="$id"; ledger_model="$id"
+    local _lreq="$id"; id="$(_lane_model_for warp "$id")"; model_key="$id"; ledger_model="$id"
+    _exclude_refuse_resolved "$_lreq" "$id"
     _validate_model_token "$id"
     # live-catalog gate for the Warp lane. Validate the resolved id against `oz model list`
     # (cached, short TTL) before dispatch. OSRC_CATALOG_VALIDATE=0 skips. A fetch failure is
@@ -16830,8 +17257,9 @@ route_delegate() {
     MODEL="$(_route_provider_default_model "$PROVIDER")" || die "unknown provider '$PROVIDER'"
     # A provider's built-in default can be a model the user excluded (e.g. --provider codex -> sol).
     # Never run it silently: say which default it is and how to pick another.
-    local _xd; if _xd="$(_model_excluded_by "$MODEL")"; then
-      die "the default model for --provider $PROVIDER is $MODEL, which you excluded (exclude list entry: $_xd). Pass -m <another model>, pick another --provider, or allow it again with: $0 exclude rm $_xd"
+    case "$MODEL" in *-default) _exclude_engine_default_notice "$PROVIDER" ;; esac
+    if _exclude_hit "$MODEL"; then
+      die "the default model for --provider $PROVIDER is $MODEL, which you excluded (exclude list entry: $EXCL_HIT). Pass -m <another model>, pick another --provider, or allow it again with: $0 exclude rm $EXCL_HIT"
     fi
   fi
 
@@ -17016,8 +17444,8 @@ route_delegate() {
   # quota gate above. Enforced here (not only in cmd_advise's candidate scoring) so an explicit -m
   # pin cannot bypass it -- filtering advise alone only stops auto-selection from RECOMMENDING a
   # denied model, it does nothing for a caller who names one directly.
-  local _xr; if _xr="$(_model_excluded_by "$RESOLVED_ID")" || _xr="$(_model_excluded_by "$MODEL")"; then
-    die "you excluded '$RESOLVED_ID' (exclude list entry: $_xr), so it will not be dispatched. Pick another model with -m, or allow it again with: $0 exclude rm $_xr"
+  if _exclude_hit "$RESOLVED_ID" || _exclude_hit "$MODEL"; then
+    die "you excluded '$RESOLVED_ID' (exclude list entry: $EXCL_HIT), so it will not be dispatched. Pick another model with -m, or allow it again with: $0 exclude rm $EXCL_HIT"
   fi
   if _model_denied "$RESOLVED_ID"; then
     die "-m $RESOLVED_ID is on OSRC_MODEL_DENYLIST and will not be dispatched. Pick another -m, or unset/edit OSRC_MODEL_DENYLIST if this is unwanted."
@@ -17656,6 +18084,12 @@ _session_control_exit() { # <pane> <provider>
 # process. Never tears down or discards work.
 _session_control_relaunch() { # <pane> <provider> <model> <effort>
   local pane="$1" prov="$2" model="$3" effort="${4:-}" launch pid_before pid_after gen i
+  # #45: never relaunch onto a model the user excluded after the session started.
+  if [ -n "$model" ] && _exclude_hit "$model"; then
+    echo "relaunch refused: this session was started on $model, which you have since excluded (exclude list entry: $EXCL_HIT). Stop it and start a new one with an allowed model:  $0 session stop && $0 --provider $prov session start -m <model>" >&2
+    return 1
+  fi
+  [ -z "$model" ] && MODEL_EXPLICIT=0 _exclude_session_default_guard "$prov"
   case "$prov" in
     codex|cx|cc|claude|droid)
       launch="$(_session_relaunch_command "$prov" "$model" "$effort")" || return 1 ;;
@@ -18648,13 +19082,14 @@ _winpty_session() {
       local LAUNCH=()
       case "$PROVIDER" in
         devin|dv)
-          need_devin; MODEL="$(_devin_resolve_model "$MODEL")"; _devin_guard_before_delegation "$MODEL"
+          need_devin; _exclude_session_default_guard devin; local _sreq="$MODEL"; MODEL="$(_devin_resolve_model "$MODEL")"; _exclude_refuse_resolved "$_sreq" "$MODEL" "session start"; _devin_guard_before_delegation "$MODEL"
           [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable devin devin --help
           # Effort is NOT silently dropped (see the tmux devin case): Devin's interactive TUI has no
           # reasoning control this tool can set, so a requested --effort cannot be enforced here.
           [ -n "$EFFORT" ] && printf '>>> [effort] WARNING: --effort %s NOT applied to this Devin session — Devin'"'"'s interactive TUI has no reasoning control this tool can set; it runs at the TUI default. Set it in the TUI, or use `%s --provider devin run --effort %s ...` (exec honors -r).\n' "$EFFORT" "$0" "$EFFORT" >&2
           LAUNCH=("devin" "--model" "$MODEL" "--respect-workspace-trust" "false") ;;
         codex|cx|droid|cursor|hermes|cline|gemini|gm|cc|claude)
+          _exclude_session_default_guard "$PROVIDER"
           _session_launch_adapter "$PROVIDER"
           LAUNCH=("${SESSION_LAUNCH[@]}") ;;
         *) die "session start: provider '$PROVIDER' not supported for interactive sessions (use --provider devin|codex|cc|droid|cursor|hermes|cline|gemini)" ;;
@@ -18839,7 +19274,7 @@ session() {
       local launch
       case "$PROVIDER" in
         devin|dv)
-          need_devin; MODEL="$(_devin_resolve_model "$MODEL")"; _devin_guard_before_delegation "$MODEL"
+          need_devin; _exclude_session_default_guard devin; local _sreq="$MODEL"; MODEL="$(_devin_resolve_model "$MODEL")"; _exclude_refuse_resolved "$_sreq" "$MODEL" "session start"; _devin_guard_before_delegation "$MODEL"
           [ "$MODEL_EXPLICIT" = "1" ] && _session_assert_model_pinnable devin devin --help
           # Effort is NOT silently dropped: the Devin interactive TUI exposes no reasoning control this
           # tool can drive, so a requested --effort cannot be enforced on a session. Say so loudly rather
@@ -18847,6 +19282,7 @@ session() {
           [ -n "$EFFORT" ] && printf '>>> [effort] WARNING: --effort %s NOT applied to this Devin session — Devin'"'"'s interactive TUI has no reasoning control this tool can set; it runs at the TUI default. Set it in the TUI, or use `%s --provider devin run --effort %s ...` (exec honors -r), or a lane that supports interactive effort.\n' "$EFFORT" "$0" "$EFFORT" >&2
           launch="devin --model '$MODEL' --respect-workspace-trust false" ;;   # single-quoted: a validated [1m]-style token must not glob-expand when send-keys hands it to the shell
         codex|cx|droid|cursor|hermes|cline|gemini|gm|cc|claude)
+          _exclude_session_default_guard "$PROVIDER"
           _session_launch_adapter "$PROVIDER"
           launch="$(_session_shell_command "${SESSION_LAUNCH[@]}")" ;;
         *) die "session start: provider '$PROVIDER' not supported for interactive sessions (use --provider devin|codex|cc|droid|cursor|hermes|cline|gemini)" ;;
@@ -19549,8 +19985,16 @@ doctor() {
         esac
       fi
     fi
-    if have agy; then agy -p "reply PONG" --model "$(_agy_model_token gemini-flash)" --effort low --print-timeout 60s >/dev/null 2>&1 && echo "      antigravity-agy (keyless): PONG (Antigravity login active)" || echo "      antigravity-agy: no reply (open Antigravity / sign in once so agy inherits your login)"; fi
-    have gemini && { gemini -p "reply PONG" --allowed-mcp-server-names __none__ --approval-mode default --model "$(_gemini_api_id gemini-flash-lite)" >/dev/null 2>&1 && echo "      gemini-cli (api key): PONG (authenticated)" || echo "      gemini-cli: no reply (not authed / model unavailable)"; }
+    if have agy; then
+      local _agtok; _agtok="$(_agy_model_token gemini-flash 2>/dev/null)"
+      if _model_excluded gemini-flash || _model_excluded "$_agtok"; then echo "      antigravity-agy: ping skipped ($_agtok is on your exclude list)"
+      else agy -p "reply PONG" --model "$(_agy_model_token gemini-flash)" --effort low --print-timeout 60s >/dev/null 2>&1 && echo "      antigravity-agy (keyless): PONG (Antigravity login active)" || echo "      antigravity-agy: no reply (open Antigravity / sign in once so agy inherits your login)"; fi
+    fi
+    if have gemini; then
+      local _gmtok; _gmtok="$(_gemini_api_id gemini-flash-lite 2>/dev/null)"
+      if _model_excluded gemini-flash-lite || _model_excluded "$_gmtok"; then echo "      gemini-cli: ping skipped ($_gmtok is on your exclude list)"
+      else gemini -p "reply PONG" --allowed-mcp-server-names __none__ --approval-mode default --model "$(_gemini_api_id gemini-flash-lite)" >/dev/null 2>&1 && echo "      gemini-cli (api key): PONG (authenticated)" || echo "      gemini-cli: no reply (not authed / model unavailable)"; fi
+    fi
   else
     echo "    (set OSRC_DOCTOR_PING=1 to probe native lane liveness with a bounded 1-token request; without it, 'present' above means installed + authed-looking, NOT proven to answer)"
   fi
@@ -19658,7 +20102,9 @@ doctor() {
     # work gets routed to something that cannot answer: agy stays installed and authenticated-looking
     # while every request times out (expired app login, service trouble). A bounded real request is the
     # only thing that distinguishes the two. OSRC_DOCTOR_PROBE=0 skips it.
+    local _aglive=""
     if [ "$_doff" = "1" ]; then echo "    agy liveness: probe skipped (OSRC_DOCTOR_OFFLINE)"
+    elif _aglive="$(_agy_model_token gemini-flash 2>/dev/null)"; _model_excluded gemini-flash || _model_excluded "$_aglive"; then echo "    agy liveness: probe skipped ($_aglive is on your exclude list)"
     elif [ "${OSRC_DOCTOR_PROBE:-1}" = "1" ]; then
       local _pt _prc=0
       _pt="$(agy -p "reply with the single word: ok" --model "$(_agy_model_token gemini-flash)" --effort low \
@@ -19719,10 +20165,17 @@ doctor() {
     echo "  Devin GLM (free): probe skipped (OSRC_DOCTOR_OFFLINE)"
     echo "  Devin paid tier: usage check skipped (OSRC_DOCTOR_OFFLINE); free tier remains separate"
   elif [ "$_dauth" = "1" ]; then
-    local _dpt _drc=0 _dstate _du="" _durc=0
-    _dpt="$(_devin_free_probe 2>&1)" || _drc=$?
-    _dstate="$(_devin_probe_classify "$_drc" "$_dpt")"
+    local _dpt _drc=0 _dstate _du="" _durc=0 _dpick
+    if _exclude_active; then
+      if ! _dpick="$(_devin_probe_pick "${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}")"; then
+        echo "  Devin free probe: skipped (every probe model is on your exclude list)"; _dstate=skipped
+      elif [ "$_dpick" != "${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}" ]; then
+        echo "  Devin free probe: using $_dpick (${OSRC_DEVIN_PROBE_MODEL:-glm-5-2} is on your exclude list)"
+      fi
+    fi
+    [ "${_dstate:-}" = skipped ] || { _dpt="$(_devin_free_probe 2>&1)" || _drc=$?; _dstate="$(_devin_probe_classify "$_drc" "$_dpt")"; }
     case "$_dstate" in
+      skipped) : ;;
       up)
         _lane_down_clear dv   # authoritative probe answered: drop any still-unexpired down marker
         echo "  Devin GLM (free): UP — glm-5-2 plan-included probe answered within ${OSRC_DEVIN_PROBE_SECS:-30}s" ;;
@@ -20271,7 +20724,17 @@ cmd_loop_escalate() {
 $_rep
 EOF
   local nrung=${#RUNGS[@]}
-  [ "$nrung" -ge 2 ] || die "loop escalate: the ladder needs at least 2 rungs (a cheap one and a pricier tier above it) — with one model, use loop verify"
+  if [ "$nrung" -lt 2 ]; then
+    # #45: say when it was the exclude list that shrank the default ladder, not the user's input.
+    local _xdrop=""
+    if [ -z "$ladder_arg" ] && _exclude_active; then
+      local _xt; if [ -n "$model" ]; then _xt="${OSRC_ESCALATE_LADDER:-glm-5.2,fable}"; else _xt="${OSRC_ESCALATE_LADDER:-haiku,glm-5.2,fable}"; fi
+      _words_noglob "$(printf '%s' "$_xt" | tr ',' ' ')"
+      _xdrop="$(_exclude_hits ${WORDS[@]+"${WORDS[@]}"} | cut -f1 | paste -sd ',' - | sed 's/,/, /g')"
+    fi
+    [ -n "$_xdrop" ] && die "loop escalate: your exclude list removed $_xdrop from the default ladder, which leaves only ${RUNGS[0]:-nothing}; a ladder needs at least 2 rungs. Pass --ladder <cheap>,<stronger> with allowed models (see: $0 exclude ls), or use loop verify for one model."
+    die "loop escalate: the ladder needs at least 2 rungs (a cheap one and a pricier tier above it) — with one model, use loop verify"
+  fi
   [ "$nrung" -le 4 ] || die "loop escalate: $nrung rungs is a spend plan, not an escalation ladder — keep it to 4 or fewer (cheap -> capable -> frontier is usually 3)"
   # A ladder that climbs DOWN in capability is almost certainly a mistake: warn loudly, but still
   # run — the check is the real safety net and the user may know something the table does not.
