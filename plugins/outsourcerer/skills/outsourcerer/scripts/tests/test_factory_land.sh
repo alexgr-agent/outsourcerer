@@ -11,7 +11,9 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP: jq missing"; exit 0; }
 
 # Outside this checkout (mktemp -d), and git may not climb out of it, so no worktree, branch or
 # hook of the real repo can ever be touched by these temp repos.
-TMP="$(mktemp -d 2>/dev/null || mktemp -d -t osrc-factory-land)"
+TEST_ROOT="${OSRC_TEST_ROOT:-${TMPDIR:-/tmp}}"
+mkdir -p "$TEST_ROOT"
+TMP="$(mktemp -d "$TEST_ROOT/run.XXXXXX")"
 TMP="$(cd "$TMP" && pwd -P)"
 HOME="$TMP/home"; export HOME; mkdir -p "$HOME"
 export GIT_CEILING_DIRECTORIES="$TMP"
@@ -153,6 +155,7 @@ out="$(drv cmd_land t9 --into rel 2>&1)"; rc=$?
 
 # ---------------- conflict ----------------
 mk_task t10 ship ""
+drv _task_update p t10 '.state="done"' >/dev/null
 commit_in t10 a.txt "worker line"
 printf 'main line\n' > "$REPO/a.txt"; git -C "$REPO" commit -qam "main edits a"
 m="$(git -C "$REPO" rev-parse main)"
@@ -160,25 +163,26 @@ out="$(drv cmd_land t10 2>&1)"; rc=$?
 [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'conflicts with main in: a.txt' && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
   && [ -z "$(git -C "$REPO" status --porcelain -uno)" ] && [ "$(efield t10 .land.verdict)" = conflict ] \
   && ok "land: merge conflict aborts cleanly, target untouched" || bad "conflict (rc=$rc out=$out)"
-[ "$(tfield t10 .state)" = held ] && [ "$(tfield t10 .hold.reason)" = "merge conflict with main: a.txt; rebase the task branch or retry" ] \
-  && printf '%s' "$out" | grep -q 'task release t10' \
-  && ok "land (#16): a conflict holds the task with a plain reason and says how to release it" || bad "conflict hold (state=$(tfield t10 .state) reason=$(tfield t10 .hold.reason))"
+[ "$(tfield t10 .state)" = done ] && [ "$(tfield t10 .land_error)" = "merge conflict with main: a.txt; rebase the task branch or retry" ] \
+  && [ "$(tfield t10 .land_error_at)" != null ] && printf '%s' "$out" | grep -q 'land t10 --plan p' \
+  && ok "land (S13/S14/S15): conflict preserves done, records land_error and gives a runnable plan-specific retry" || bad "conflict state/error (state=$(tfield t10 .state) error=$(tfield t10 .land_error))"
 no_land_wt && ok "land: no integration worktree left after a conflict" || bad "worktree left after conflict"
 grep -q '"land_conflict"' "$PD/events.jsonl" 2>/dev/null && ok "land: conflict recorded as a task event" || bad "conflict event missing"
 
 # ---------------- merged result breaks the check ----------------
 CHK='! { [ -f x.txt ] && [ -f y.txt ]; }'
 mk_task t11 ship "$CHK"
+drv _task_update p t11 '.state="done"' >/dev/null
 commit_in t11 x.txt x
 printf 'y\n' > "$REPO/y.txt"; git -C "$REPO" add y.txt; git -C "$REPO" commit -qm "main adds y"
 m="$(git -C "$REPO" rev-parse main)"
 out="$(drv cmd_land t11 2>&1)"; rc=$?
 [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'check fails' && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
-  && [ "$(tfield t11 .state)" = failed ] && [ "$(tfield t11 .result)" = "merge breaks check" ] && [ "$(tfield t11 .landed)" != true ] \
+  && [ "$(tfield t11 .state)" = done ] && [ "$(tfield t11 .land_error)" = "merge breaks check" ] && [ "$(tfield t11 .land_error_at)" != null ] && [ "$(tfield t11 .landed)" != true ] \
   && [ "$(efield t11 .land.verdict)" = check_failed ] \
-  && ok "land: merged result breaks check -> target untouched, task failed" || bad "merge breaks check (rc=$rc out=$out)"
+  && ok "land (S13): merged check failure preserves done with separate landing error" || bad "merge breaks check (rc=$rc out=$out)"
 no_land_wt && ok "land: no integration worktree left after a red check" || bad "worktree left after red check"
-grep '"task":"t11"' "$ST/wake-queue.jsonl" 2>/dev/null | grep -q 'merge breaks check' && ok "land: red check queued a wake event" || bad "wake event missing"
+grep 'merge breaks check' "$ST/wake-queue.jsonl" 2>/dev/null | grep -q 'p/t11' && ok "land: red check queued a wake event" || bad "wake event missing"
 printf '%s' "$out" | grep -q 'clean checkout' && printf '%s' "$out" | grep -q -- '--setup' \
   && ok "land (#9): a red merged check says it ran in a clean checkout and points at --setup" || bad "clean-checkout hint missing: $out"
 
@@ -447,6 +451,196 @@ git -C "$REPO" worktree remove --force "$WD/land-live" >/dev/null 2>&1; rm -f "$
 out="$(OSRC_HOME="$ST" bash "$SRC" no-such-subcommand 2>&1)"
 printf '%s' "$out" | grep -q 'plan|task|land|flow' && printf '%s' "$out" | grep -q 'exclude' \
   && ok "main (#24): unknown subcommand hint lists plan, task, land, flow, exclude" || bad "hint missing factory commands: $(printf '%s' "$out" | tail -1 | cut -c1-200)"
+
+# ---------------- round 3: exact tree, history, delivery and recovery ----------------
+mk_task t40 ship 'printf good > mutation.txt; test "$(cat mutation.txt)" = good'
+commit_in t40 mutation.txt bad
+m="$(git -C "$REPO" rev-parse main)"
+out="$(drv cmd_land t40 --plan p 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'changed HEAD or tracked files' && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && ok "S2: worker check cannot repair the tree it claims to verify" || bad "mutating worker check ($rc $out)"
+
+mk_task t41 ship 'case "$PWD" in */land-*) printf changed > mutation.txt ;; esac'
+commit_in t41 mutation.txt original
+out="$(drv cmd_land t41 --plan p 2>&1)"; rc=$?
+[ "$rc" != 0 ] && [ "$(efield t41 .land.verdict)" = tree_changed ] && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && ok "S2: merged check cannot change tracked contents" || bad "mutating integration check ($rc $out)"
+out="$(drv cmd_land t41 --plan p --no-check --setup 'printf changed > mutation.txt; git add mutation.txt; git commit -qm changed' 2>&1)"; rc=$?
+[ "$rc" != 0 ] && [ "$(efield t41 .land.verdict)" = tree_changed ] && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && ok "S2: setup cannot replace the verified HEAD" || bad "mutating setup ($rc $out)"
+out="$(drv cmd_land t41 --plan p --setup 'printf changed > mutation.txt' --check 'case "$PWD" in */land-*) git checkout -- mutation.txt ;; esac' 2>&1)"; rc=$?
+[ "$rc" != 0 ] && [ "$(efield t41 .land.verdict)" = tree_changed ] && [ "$(tfield t41 .state)" = running ] \
+  && ok "S2/S13: setup mutations are caught before a check can undo them; running state survives" || bad "setup restored by check ($rc $out)"
+
+mk_task t42 ship true
+commit_in t42 transient.txt "token=$GHK"
+git -C "$(wt_of t42)" rm -q transient.txt; git -C "$(wt_of t42)" commit -qm 'remove transient secret'
+out="$(drv _factory_done_check p t42 2>&1)"; rc=$?
+[ "$rc" != 0 ] && [ "$(efield t42 .secret_scan)" = blocked ] \
+  && ok "S5: secret committed then removed still blocks landing history" || bad "intermediate secret ($rc $out)"
+
+# A review approved an earlier commit; direct land must refuse the replacement revision.
+mk_task t43 ship true; commit_in t43 revision.txt old
+h43="$(git -C "$(wt_of t43)" rev-parse HEAD)"
+mk_task t44 scout ""; setst t44 '.state="done" | .require_verdict=true | .deps=["t43"]'
+drv _task_update p t44 '.reviewed_head=$h' --arg h "$h43" >/dev/null
+commit_in t43 revision.txt new
+out="$(drv cmd_land t43 --plan p 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'does not approve revision' && [ "$(tfield t43 .landed)" != true ] \
+  && ok "C5: stale reviewed_head refuses a rebuilt task" || bad "stale review ($rc $out)"
+drv _task_update p t44 '.reviewed_head=$h' --arg h "$(git -C "$(wt_of t43)" rev-parse HEAD)" >/dev/null
+out="$(drv cmd_land t43 --plan p 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ "$(tfield t43 .landed)" = true ] && ok "C5: matching review permits landing" || bad "current review ($rc $out)"
+
+mk_task t45 ship true; commit_in t45 branch-only.txt branch
+setst t45 '.deliver="branch"'
+m="$(git -C "$REPO" rev-parse main)"
+out="$(drv cmd_land t45 --plan p 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ "$(tfield t45 .delivered)" = branch ] && [ "$(tfield t45 .delivered_head)" = "$(git -C "$(wt_of t45)" rev-parse HEAD)" ] \
+  && [ "$(tfield t45 .landed)" != true ] && [ "$(tfield t45 .state)" = done ] && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && ok "D8: branch delivery verifies and records the branch without a merge" || bad "branch delivery ($rc $out)"
+mk_task t46 ship true; commit_in t46 implicit-pr.txt pr; setst t46 '.deliver="pr"'
+out="$(PATH="$TMP/bin:$PATH" drv cmd_land t46 --plan p 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ "$(tfield t46 .pr)" = https://github.com/example/repo/pull/7 ] && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && ok "D8: PR delivery acts as --pr without the explicit flag" || bad "implicit PR ($rc $out)"
+
+cat > "$TMP/cancel_pr.sh" <<EOT
+case "\$PWD" in */land-*) jq '.state="canceled"' "$PD/tasks/t47.json" > "$PD/tasks/t47.json.x" && mv "$PD/tasks/t47.json.x" "$PD/tasks/t47.json" ;; esac
+EOT
+mk_task t47 ship "bash $TMP/cancel_pr.sh"; commit_in t47 canceled-pr.txt x
+rm -f "$TMP/gh.args"
+out="$(PATH="$TMP/bin:$PATH" drv cmd_land t47 --plan p --pr 2>&1)"; rc=$?
+[ "$rc" != 0 ] && [ ! -f "$TMP/gh.args" ] && ! git -C "$TMP/origin.git" rev-parse --verify refs/heads/outsourcerer/j-t47 >/dev/null 2>&1 \
+  && [ "$(tfield t47 .state)" = canceled ] && ok "S9: cancellation during check prevents both push and PR creation" || bad "canceled PR ($rc $out)"
+
+cat > "$TMP/replace_attempt.sh" <<EOT
+case "\$PWD" in */land-*) jq '.attempt_token="replacement"' "$PD/tasks/t48.json" > "$PD/tasks/t48.json.x" && mv "$PD/tasks/t48.json.x" "$PD/tasks/t48.json" ;; esac
+EOT
+mk_task t48 ship "bash $TMP/replace_attempt.sh"; commit_in t48 replacement.txt x
+out="$(PATH="$TMP/bin:$PATH" drv cmd_land t48 --plan p --pr 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'changed attempts' && [ ! -f "$TMP/gh.args" ] \
+  && ! git -C "$TMP/origin.git" rev-parse --verify refs/heads/outsourcerer/j-t48 >/dev/null 2>&1 \
+  && ok "S9: replacement attempt also prevents PR publication" || bad "replacement PR ($rc $out)"
+
+cat > "$TMP/crash_land.sh" <<EOT
+OSRC_SOURCED=1 . "$SRC" >/dev/null 2>&1
+. "$LAND"
+eval "_original_land_record() \$(declare -f _land_record | tail -n +2)"
+_land_record() {
+  if [ "\$(printf '%s' "\$2" | jq -r .verdict)" = landed ]; then kill -KILL "\$_FL_PID"; fi
+  _original_land_record "\$@"
+}
+"\$@"
+EOT
+mk_task t49 ship true; commit_in t49 recover.txt x
+out="$(OSRC_HOME="$ST" bash "$TMP/crash_land.sh" cmd_land t49 --plan p 2>&1)"; rc=$?
+m="$(git -C "$REPO" rev-parse main)"
+[ "$rc" != 0 ] && [ "$(tfield t49 .land_intent.merged_sha)" = "$m" ] && [ "$(tfield t49 .landed)" != true ] \
+  && ok "S10: SIGKILL after ref movement leaves a durable verified receipt" || bad "crash receipt ($rc $out)"
+setst t49 '.state="canceled" | .check="false"'
+out="$(OSRC_LAND_LOCK_WAIT=5 drv cmd_land t49 --plan p 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ "$(tfield t49 .landed_sha)" = "$m" ] && [ "$(tfield t49 .landed)" = true ] \
+  && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] && [ "$(efield t49 .land.reconciled)" = true ] && [ "$(tfield t49 .state)" = canceled ] && no_land_wt \
+  && ok "S10: recovery records the completed merge before checks, preserves cancellation and prunes crash scratch" || bad "receipt recovery ($rc $out)"
+
+mk_task t50 ship true; commit_in t50 bare-recovery.txt x
+out="$(OSRC_HOME="$ST" bash "$TMP/crash_land.sh" cmd_land j-t50 --check true 2>&1)"; rc=$?
+m="$(git -C "$REPO" rev-parse main)"
+[ "$rc" != 0 ] && [ "$(jq -r .land_intent.merged_sha "$ST/jobs/j-t50/evidence.json")" = "$m" ] \
+  && ok "S10: bare-job landing also persists a receipt before the ref move" || bad "bare crash ($rc $out)"
+out="$(OSRC_LAND_LOCK_WAIT=5 drv cmd_land j-t50 --check false 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ "$(jq -r .land.reconciled "$ST/jobs/j-t50/evidence.json")" = true ] && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && ok "S10: bare-job receipt recovers without repeating checks or merges" || bad "bare recovery ($rc $out)"
+
+cat > "$TMP/receipt_failure.sh" <<EOT
+OSRC_SOURCED=1 . "$SRC" >/dev/null 2>&1
+. "$LAND"
+eval "_original_task_update() \$(declare -f _task_update | tail -n +2)"
+_task_update() { case "\$3" in *land_intent*) return 1 ;; esac; _original_task_update "\$@"; }
+"\$@"
+EOT
+mk_task t51 ship true; commit_in t51 no-receipt.txt x
+out="$(OSRC_HOME="$ST" bash "$TMP/receipt_failure.sh" cmd_land t51 --plan p 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'could not persist landing receipt' && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && [ "$(tfield t51 .land_intent)" = null ] && ok "S10: receipt write failure refuses the ref move" || bad "receipt write failure ($rc $out)"
+
+# Lock helpers are exercised with deterministic ownership interleavings.
+cat > "$TMP/lock_probes.sh" <<'EOT'
+case "$PROBE" in
+  replacement)
+    mkdir -p "$LOCK"; printf '123 stale\n' > "$LOCK/owner"
+    mv() {
+      if [ "$1" = "$LOCK" ]; then printf '456 replacement\n' > "$LOCK/owner"; fi
+      command mv "$@"
+    }
+    _land_lock_break "$LOCK" '123 stale' 123 && exit 1
+    [ "$(cat "$LOCK/owner")" = '456 replacement' ] ;;
+  release)
+    mkdir -p "$LOCK"; printf '456 replacement\n' > "$LOCK/owner"
+    _LAND_LOCK="$LOCK"; _LAND_LOCK_OWNER='123 stale'
+    _land_lock_release
+    [ "$(cat "$LOCK/owner")" = '456 replacement' ] ;;
+  publish)
+    mv() { local a; for a in "$@"; do case "$a" in */owner.tmp) return 1 ;; esac; done; command mv "$@"; }
+    _land_lock_acquire "$REPO" test && exit 1
+    [ ! -d "$(_land_lock_dir "$REPO")" ] && [ -z "${_LAND_LOCK:-}" ] ;;
+  permission)
+    _pid_start_identity() { return 1; }
+    kill() { echo 'kill: Operation not permitted' >&2; return 1; }
+    ! _land_owner_dead 123 old ;;
+  absent)
+    _pid_start_identity() { return 1; }
+    kill() { echo 'kill: No such process' >&2; return 1; }
+    _land_owner_dead 123 old ;;
+  guard)
+    _fl_self_pid
+    mkdir -p "$LOCK" "$LOCK.steal"; printf '123 stale\n' > "$LOCK/owner"
+    printf '99999999 stale\n' > "$LOCK.steal/owner"
+    _land_lock_break "$LOCK" '123 stale' "$_FL_PID" && [ ! -d "$LOCK" ] && [ ! -d "$LOCK.steal" ] ;;
+  live_guard)
+    _fl_self_pid
+    mkdir -p "$LOCK" "$LOCK.steal"; printf '123 stale\n' > "$LOCK/owner"
+    printf '%s %s\n' "$_FL_PID" "$(_pid_start_identity "$_FL_PID")" > "$LOCK.steal/owner"
+    _land_lock_break "$LOCK" '123 stale' "$_FL_PID" && exit 1
+    [ "$(cat "$LOCK/owner")" = '123 stale' ] && [ -d "$LOCK.steal" ] ;;
+  orphan_guard)
+    lk="$(_land_lock_dir "$REPO")"
+    mkdir -p "$lk.steal"; printf '99999999 stale\n' > "$lk.steal/owner"
+    OSRC_LAND_LOCK_WAIT=2 _land_lock_acquire "$REPO" probe || exit 1
+    _land_lock_release
+    [ ! -d "$lk" ] && [ ! -d "$lk.steal" ] ;;
+  busy_guard)
+    _fl_self_pid; lk="$(_land_lock_dir "$REPO")"
+    mkdir -p "$lk.steal"
+    printf '%s %s\n' "$_FL_PID" "$(_pid_start_identity "$_FL_PID")" > "$lk.steal/owner"
+    OSRC_LAND_LOCK_WAIT=0 _land_lock_acquire "$REPO" probe && exit 1
+    [ ! -d "$lk" ] && [ -d "$lk.steal" ] ;;
+esac
+EOT
+for probe in replacement release publish permission absent guard live_guard orphan_guard busy_guard; do
+  lock="$ST/locks/probe-$probe"
+  if PROBE="$probe" LOCK="$lock" REPO="$REPO" drv source "$TMP/lock_probes.sh"; then
+    ok "S8/S21/D2/D11: lock $probe probe"
+  else bad "lock $probe probe"; fi
+done
+[ "$(drv _land_lock_dir "$REPO")" = "$(drv _land_lock_dir "$(wt_of t49)")" ] \
+  && ok "D13: linked checkouts share one merge-queue lock" || bad "per-checkout lock keys"
+
+printf 'done\r\n' > "$ST/jobs/j-t1/status"
+drv _factory_job_ok j-t1 && ok "D14: CRLF terminal status is accepted" || bad "CRLF job status"
+cat > "$TMP/crlf_probe.sh" <<'EOT'
+jq() { (set -o pipefail; command jq "$@" | sed 's/$/\r/'); }
+_factory_done_check p t1
+EOT
+out="$(drv source "$TMP/crlf_probe.sh" 2>&1)"; rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 't1 done' && ok "D4: native jq CRLF output survives done-contract comparisons" || bad "CRLF jq ($rc $out)"
+drv _fl_jq -e '.missing' <<< '{}' >/dev/null 2>&1 && bad "jq helper lost failing exit status" || ok "D4: normalized jq preserves failures"
+
+for state in held failed canceled todo; do
+  json="$(jq -cn --arg s "$state" '{state:$s}')"
+  out="$(drv _land_state_refusal t99 "$json" 0 other-plan)"
+  printf '%s' "$out" | grep -q -- '--plan other-plan' && ok "S15: $state hint names the exact plan" || bad "$state hint omits plan ($out)"
+done
 
 echo
 echo "factory land: $pass passed, $fail failed"
