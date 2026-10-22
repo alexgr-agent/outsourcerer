@@ -57,6 +57,14 @@ set --
 . "$SRC" >/dev/null 2>&1
 _pid_start_identity() { printf 'Mon Jan 1 00:00:00 2024\n'; }
 trap cleanup EXIT
+# Hermetic arm gate. A sourced suite can never arm a real beacon: SCRIPT_PATH is this (non-
+# executable) test file, so _heartbeat_start bails at its `-x` check and the relaunch reported
+# NOT-ARMED. conformance.sh masked that by exporting OSRC_HEARTBEAT_DISABLED=1 (gate rc 2), so the
+# suite passed there and failed standalone. Clear both knobs and stub the gate so standalone ==
+# conformance; the call log proves the codex relaunch still goes THROUGH the gate.
+unset OSRC_HEARTBEAT_DISABLED OSRC_FLEET_SUPERVISION
+ARM_LOG="$TMP/arm-log"; : > "$ARM_LOG"
+_heartbeat_arm_verify() { echo arm >> "$ARM_LOG"; return 0; }
 
 SESSION_NAME=effort-test
 PROVIDER=codex
@@ -73,7 +81,7 @@ after="$(wc -l < "$OSRC_SESSION_REGISTRY")"
 
 : > "$TMUX_LOG"
 out="$(session effort high 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'receipt.*relaunch' \
+if [ "$rc" -eq 0 ] && [ -s "$ARM_LOG" ] && printf '%s' "$out" | grep -q 'receipt.*relaunch' \
    && grep -q 'model_reasoning_effort=high' "$TMUX_LOG" \
    && tail -1 "$OSRC_SESSION_REGISTRY" | jq -e '.effort == "high" and .receipt == "relaunch"' >/dev/null; then
   ok "codex relaunch records effort and receipt"
