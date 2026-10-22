@@ -12760,8 +12760,10 @@ _crew_scan_staged() {
   # git on grep's early exit, and pipefail would then report a planted key as "clean" (rc 141).
   local _sd
   _sd="$(git -C "$1" diff --cached --text --no-ext-diff --no-textconv 2>/dev/null)" || return 1
-  grep -Eq 'OPENROUTER_API_KEY|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[bpoas]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AWS_SECRET[_A-Z]*|-----BEGIN [A-Z ]*PRIVATE KEY-----' <<<"$_sd"
+  grep -Eq "$OSRC_SECRET_VALUE_ERE" <<<"$_sd"
 }
+# Shared with the factory merge gate (factory-land.sh scans base..head with the same patterns).
+OSRC_SECRET_VALUE_ERE='OPENROUTER_API_KEY|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[bpoas]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AWS_SECRET[_A-Z]*|-----BEGIN [A-Z ]*PRIVATE KEY-----'
 
 # crew --check '<cmd>' [fanout routing flags] -- "task1" "task2" ...
 cmd_crew() {
@@ -20163,6 +20165,7 @@ main() {
     fanout)      cmd_fanout "$@" ;;                        # parallel N-way multi-subagent (+ status|wait|collect|list)
     fleet)       cmd_fleet "$@" ;;                         # unified managed + independent Claude Code fleet
     crew)        cmd_crew "$@" ;;                          # transactional write-swarm: fanout --worktree edit -> grade -> revert-or-promote
+    land)        cmd_land "$@" ;;                          # merge gate: done contract -> serialized no-ff merge -> re-check -> ff target (factory-land.sh)
     loop)        cmd_loop "$@" ;;                          # bounded delegate->check->retry loops (loop verify | loop escalate); recipes in references/loops.md
     status)      cmd_status "$@" ;;                        # job table / one job's state
     classify)    cmd_classify "$@" ;;                       # post-hoc verdict: REUSE-OUTPUT | RETRY-DIFFERENT-LANE | REAL-FAIL
