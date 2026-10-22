@@ -12021,6 +12021,10 @@ run_job() {
     return 1
   fi
   rm -f "$jd/setup" 2>/dev/null || true   # setup finished; normal launch-grace applies from here
+  # The worktree decision is made: these switches were for THIS job only. Leaving them exported would
+  # make every nested outsourcerer call the delegate makes inherit them (a nested job pinned to our
+  # base commit, or refusing to run without a worktree).
+  unset OSRC_WORKTREE OSRC_WORKTREE_REQUIRED OSRC_WORKTREE_BASE
   # peek model/tier for windows + meta (non-fatal)
   _consume_flags "$@" 2>/dev/null || true
   # Classify from the REAL task text (REST), not the "job:<id>" placeholder record_ledger sees.
