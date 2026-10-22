@@ -8271,15 +8271,19 @@ cmd_heartbeat() { # start | status -- the manual arm/remediation command the NOT
 }
 
 cmd_rundown() {
-  local snapshot
+  local snapshot rc
   snapshot="$(_fleet_snapshot_collect 2>/dev/null)" || snapshot="$(_heartbeat_unknown_snapshot)" || return 1
-  _fleet_digest "$snapshot"
+  _fleet_digest "$snapshot"; rc=$?
+  ! declare -F _factory_plans_digest >/dev/null 2>&1 || _factory_plans_digest   # one line per active plan
+  return "$rc"
 }
 
 cmd_bearings() {
-  local snapshot
+  local snapshot rc
   snapshot="$(_fleet_snapshot_read 2>/dev/null)" || snapshot="$(_heartbeat_unknown_snapshot)" || return 1
-  _fleet_digest "$snapshot"
+  _fleet_digest "$snapshot"; rc=$?
+  ! declare -F _factory_plans_digest >/dev/null 2>&1 || _factory_plans_digest   # one line per active plan
+  return "$rc"
 }
 
 _fleet_todo() {
@@ -20520,6 +20524,7 @@ main() {
     crew)        cmd_crew "$@" ;;                          # transactional write-swarm: fanout --worktree edit -> grade -> revert-or-promote
     land)        cmd_land "$@" ;;                          # merge gate: done contract -> serialized no-ff merge -> re-check -> ff target (factory-land.sh)
     loop)        cmd_loop "$@" ;;                          # bounded delegate->check->retry loops (loop verify | loop escalate); recipes in references/loops.md
+    flow)        cmd_flow "$@" ;;                          # factory flows: ls | show <name> | run <name> --var k=v (factory-flow.sh)
     status)      cmd_status "$@" ;;                        # job table / one job's state
     classify)    cmd_classify "$@" ;;                       # post-hoc verdict: REUSE-OUTPUT | RETRY-DIFFERENT-LANE | REAL-FAIL
     explain)     cmd_explain "$@" ;;                        # diagnose a job's terminal state: state + reason + marker + verdict
