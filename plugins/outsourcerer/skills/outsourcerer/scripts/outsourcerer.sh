@@ -576,6 +576,13 @@ $OSRC_MODEL_TABLE"
   unset _osrc_ml
 fi
 
+# CURRENT ids of the floating Claude aliases (what `-m opus` etc. runs today). Used ONLY by the exclude
+# list (#45) to decide whether excluding a specific version also refuses the bare alias: excluding an
+# OLD model (claude-opus-4-8) must leave `-m opus` usable. UPDATE THIS LINE ON EVERY CLAUDE RELEASE.
+# Other aliases need no entry: the model table above already maps them (sol -> gpt-5.6-sol, glm ->
+# z-ai/glm-5.2, swe -> swe-1.7); Gemini family aliases pick their id live and fail closed.
+OSRC_CLAUDE_CURRENT_IDS="fable|claude-fable-5-1 opus|claude-opus-5-5 sonnet|claude-sonnet-5-5 haiku|claude-haiku-5-5"
+
 # Interactive tmux session name, derived from the working directory AND, when set,
 # the owning Claude Code session id. Deriving it from the cwd alone means two
 # Claude Code sessions working in the same directory resolve to one name and can
@@ -5517,9 +5524,12 @@ _quota_note_refusal() {  # <lane-or-disp> <model> [reset]
 #     effort words (high, low, max, preview...) are the same model and still match;
 #   * a size word (mini, nano, lite, flash, lightning, air, small, micro, tiny) after a multi-word
 #     entry (gpt-5.5 does NOT cover gpt-5.5-mini; gemini-flash does NOT cover gemini-flash-lite).
-# A bare family alias (fable, opus, sonnet, haiku, gemini-pro, gemini-flash...) floats to the newest
-# model of its family, so ANY versioned entry of that family also refuses the bare alias (exclude
-# claude-fable-5 -> -m fable is refused). `claude` covers every Claude family. A glob (* and ? only;
+# A bare family alias is refused when the family word itself is excluded, or when an entry covers the
+# id the alias runs TODAY: the model table for sol/terra/luna/glm/swe..., OSRC_CLAUDE_CURRENT_IDS for
+# fable/opus/sonnet/haiku (an exact entry also covers the current id when that id is its point
+# release: claude-fable-5 refuses -m fable = claude-fable-5-1; claude-opus-4-8 leaves -m opus alone).
+# Gemini family aliases pick their id live, so any excluded version of the family refuses them (fail
+# closed, and the refusal says why). `claude` covers every Claude family. A glob (* and ? only;
 # every other character is literal) is matched against the name, its prefix-less form, its table id
 # and the canonical forms. Entries with no letter are ignored (a bare "5" must never exclude half the
 # catalog). An entry that is not a valid model name (only an unvalidated OSRC_EXCLUDE_MODELS can hold
@@ -5531,7 +5541,7 @@ _quota_note_refusal() {  # <lane-or-disp> <model> [reset]
 # =============================================================================
 OSRC_EXCLUDE_FILE="$OSRC_HOME/exclude"
 _OSRC_EXCL_KEY=""; _OSRC_EXCL_LIST=""; _OSRC_EXCL_BAD=""; _OSRC_EXCL_MEMO=""; _OSRC_EXCL_WARNED=0
-EXCL_HIT=""
+EXCL_HIT=""; EXCL_WHY=""
 
 # _exclude_load -> (re)parse the saved file + env into _OSRC_EXCL_LIST (valid entries) and
 # _OSRC_EXCL_BAD (unparsable ones). Fork-free when nothing changed since the last load.
@@ -5604,7 +5614,7 @@ _exclude_env_entries() {
 #   mode=hits  : print "<name>\t<entry>" for every excluded input line (the line is the name)
 #   mode=keep  : print every input line whose FIRST WORD is not excluded (display filters)
 _exclude_awk() {
-  OSRC_EXCL_TABLE="$OSRC_MODEL_TABLE" LC_ALL=C awk -v mode="$1" '
+  OSRC_EXCL_TABLE="$OSRC_MODEL_TABLE" OSRC_EXCL_CUR="$OSRC_CLAUDE_CURRENT_IDS" LC_ALL=C awk -v mode="$1" '
     function isnum(t) { return t ~ /^[0-9]+$/ }
     function tokstr(s,   n, a, i, o) {
       n = split(s, a, /[^a-z0-9]+/); o = ""
@@ -5643,7 +5653,7 @@ _exclude_awk() {
       for (i = 1; i <= n; i++) if (!isnum(a[i]) && !(a[i] in Q) && a[i] != "anthropic") o = o " " a[i]
       return o
     }
-    function cmatch(e, c,   ea, ca, ne, nc, i, j, ok, nx) {
+    function cmatch(e, c, relax,   ea, ca, ne, nc, i, j, ok, nx) {
       ne = split(e, ea, " "); nc = split(c, ca, " ")
       if (ne == 0 || ne > nc) return 0
       for (i = 0; i + ne <= nc; i++) {
@@ -5652,7 +5662,7 @@ _exclude_awk() {
         if (!ok) continue
         if (i + ne == nc) return 1
         nx = ca[i + ne + 1]
-        if (isnum(nx)) { if (length(nx) >= 6 || !isnum(ea[ne])) return 1; continue }
+        if (isnum(nx)) { if (relax || length(nx) >= 6 || !isnum(ea[ne])) return 1; continue }
         if (ne >= 2 && (nx in SIB)) continue
         return 1
       }
@@ -5670,22 +5680,42 @@ _exclude_awk() {
       return r "$"
     }
     function norm(s) { s = tolower(s); sub(/\[[0-9]+[a-z]*\]$/, "", s); return s }
-    function excluded(name,   x, CFm, j, k, e, cf, ef) {
-      x = norm(name)
+    # excluded(name) -> the matching entry ("" = allowed); WHY_ carries a reason worth printing.
+    function excluded(name,   x, CFm, CCm, j, k, e, cur, CCG) {
+      x = norm(name); WHY_ = ""
       if (x == "") return ""
       forms(x, CFm)
       for (k = 1; k <= G_[0]; k++) CG[k] = G_[k]; CG[0] = G_[0]
       cfl = FLOAT_; csig = SIG_
+      cur = (x in CUR) ? CUR[x] : ""
+      if (cur != "") {
+        forms(cur, CCm)
+        for (k = 1; k <= G_[0]; k++) CCG[k] = G_[k]; CCG[0] = G_[0]
+      }
       for (e = 1; e <= NE; e++) {
         if (EGLOB[e] != "") {
           for (k = 1; k <= CG[0]; k++) if (CG[k] ~ EGLOB[e]) return ENT[e]
-          if (cfl && EGSIG[e] != "" && index(csig " ", EGSIG[e] " ") == 1) return ENT[e]
+          if (cur != "") {
+            for (k = 1; k <= CCG[0]; k++) if (CCG[k] ~ EGLOB[e]) { WHY_ = x " runs " cur " today"; return ENT[e] }
+          } else if (cfl && EGSIG[e] != "" && index(csig " ", EGSIG[e] " ") == 1) {
+            WHY_ = x " picks its model id live, so outsourcerer cannot tell which version it would run (fail closed); name an exact id with -m"
+            return ENT[e]
+          }
           continue
         }
         for (j = 1; j <= EF[e, 0]; j++)
           for (k = 1; k <= CFm[0]; k++)
-            if (cmatch(EF[e, j], CFm[k])) return ENT[e]
-        if (cfl && EVER[e] && ESIG[e] != "" && ESIG[e] == csig) return ENT[e]
+            if (cmatch(EF[e, j], CFm[k], 0)) return ENT[e]
+        if (cur != "") {
+          # The bare alias runs its CURRENT id. An exact entry covers it when it names that id or the
+          # release it is a point release of (claude-fable-5 covers fable = claude-fable-5-1).
+          for (j = 1; j <= EF[e, 0]; j++)
+            for (k = 1; k <= CCm[0]; k++)
+              if (cmatch(EF[e, j], CCm[k], 1)) { WHY_ = x " runs " cur " today"; return ENT[e] }
+        } else if (cfl && EVER[e] && ESIG[e] != "" && ESIG[e] == csig) {
+          WHY_ = x " picks its model id live, so outsourcerer cannot tell which version it would run (fail closed); name an exact id with -m"
+          return ENT[e]
+        }
       }
       return ""
     }
@@ -5693,6 +5723,8 @@ _exclude_awk() {
       split("fable opus sonnet haiku", t, " "); for (i in t) CF[t[i]] = 1
       split("high low medium xhigh max min minimal thinking latest preview free fast exp experimental", t, " "); for (i in t) Q[t[i]] = 1
       split("mini nano lite flash lightning air small micro tiny", t, " "); for (i in t) SIB[t[i]] = 1
+      nr = split(ENVIRON["OSRC_EXCL_CUR"], rows, " ")
+      for (i = 1; i <= nr; i++) if (split(rows[i], f, "|") == 2) CUR[tolower(f[1])] = tolower(f[2])
       nr = split(ENVIRON["OSRC_EXCL_TABLE"], rows, "\n")
       for (i = 1; i <= nr; i++) {
         if (split(rows[i], f, "|") < 2) continue
@@ -5719,7 +5751,7 @@ _exclude_awk() {
         next
       }
       h = excluded($0)
-      if (h != "") print $0 "\t" h
+      if (h != "") print $0 "\t" h "\t" WHY_
     }'
 }
 
@@ -5751,7 +5783,7 @@ _exclude_hits() {
 # allowed. Runs in the CALLER's shell (no command substitution needed), so the per-name memo sticks:
 # each distinct name costs at most one awk per process.
 _exclude_hit() {
-  EXCL_HIT=""
+  EXCL_HIT=""; EXCL_WHY=""
   local name="${1:-}" rest r
   [ -n "$name" ] || return 1
   _exclude_active || return 1
@@ -5760,13 +5792,18 @@ _exclude_hit() {
     *$'\n'"$name"$'\t'*)
       rest="${_OSRC_EXCL_MEMO#*$'\n'"$name"$'\t'}"; r="${rest%%$'\n'*}"
       [ "$r" = "-" ] && return 1
-      EXCL_HIT="$r"; return 0 ;;
+      _exclude_hit_split "$r"; return 0 ;;
   esac
   r="$(_exclude_hits "$name")"
   r="${r#*$'\t'}"; r="${r%%$'\n'*}"
   _OSRC_EXCL_MEMO="${_OSRC_EXCL_MEMO:-$'\n'}$name"$'\t'"${r:--}"$'\n'
   [ -n "$r" ] || return 1
-  EXCL_HIT="$r"; return 0
+  _exclude_hit_split "$r"; return 0
+}
+# _exclude_hit_split "<entry>[\t<why>]" -> EXCL_HIT=<entry>, EXCL_WHY=<why> (may be empty).
+_exclude_hit_split() {
+  EXCL_HIT="${1%%$'\t'*}"; EXCL_WHY=""
+  case "$1" in *$'\t'*) EXCL_WHY="${1#*$'\t'}" ;; esac
 }
 
 # _model_excluded_by <name> -> prints the matching exclude entry and returns 0; rc1 (no output) when
@@ -5784,7 +5821,7 @@ _exclude_refuse() {
   for m in ${WORDS[@]+"${WORDS[@]}"}; do
     [ -n "$m" ] || continue
     if _exclude_hit "$m"; then
-      die "${label:+$label: }you excluded '$m' (exclude list entry: $EXCL_HIT). Pick another model with -m, or allow it again with: $0 exclude rm $EXCL_HIT"
+      die "${label:+$label: }you excluded '$m' (exclude list entry: $EXCL_HIT${EXCL_WHY:+; $EXCL_WHY}). Pick another model with -m, or allow it again with: $0 exclude rm $EXCL_HIT"
     fi
   done
   return 0
@@ -6029,7 +6066,7 @@ _OSRC_EXCL_RM
       ;;
     check)
       [ -n "${1:-}" ] || die "exclude check needs a model name"
-      if _exclude_hit "$1"; then echo "excluded: $1 (matches $EXCL_HIT)"; return 0; fi
+      if _exclude_hit "$1"; then echo "excluded: $1 (matches $EXCL_HIT${EXCL_WHY:+; $EXCL_WHY})"; return 0; fi
       echo "allowed: $1"; return 1 ;;
     -h|--help|help)
       echo "usage: $0 exclude add|rm|ls|clear|check <model-or-family>"

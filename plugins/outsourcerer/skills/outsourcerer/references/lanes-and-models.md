@@ -351,9 +351,14 @@ same model matches however it is spelled: alias, exact id, provider-prefixed id 
   size: `claude-sonnet-5` leaves `claude-sonnet-5-5` allowed, `gpt-5.5` leaves `gpt-5.5-mini` allowed,
   `gemini-flash` leaves `gemini-flash-lite` allowed. To cover point releases use a glob
   (`claude-fable-5*`) or the family word;
-- a **bare family alias** (`fable`, `opus`, `sonnet`, `haiku`, `gemini-pro`, `gemini-flash`) runs
-  whatever is newest in that family, so excluding **any** version of the family also refuses the bare
-  alias: `exclude add claude-fable-5` refuses `-m fable`. Name the exact version you want instead;
+- a **bare family alias** is refused when the family word itself is excluded, or when an entry
+  covers the model that alias runs **today**: `sol`/`terra`/`luna`/`glm`/`swe` use the alias table,
+  and `fable`/`opus`/`sonnet`/`haiku` use the current Claude ids (`claude-fable-5-1`,
+  `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`). For this check an exact id also covers
+  its point release, so `exclude add claude-fable-5` refuses `-m fable`, `claude-opus-5-5` refuses
+  `-m opus`, but excluding an old model (`claude-opus-4-8`) leaves `-m opus` usable. `gemini-pro`,
+  `gemini-flash` and `gemini-flash-lite` pick their id live, so any excluded version of that family
+  refuses them (fail closed, and the refusal says why); name an exact id with `-m` instead;
 - a **glob** (`gpt-5.6-*`; only `*` and `?` are wildcards) is matched against the name, its resolved
   id and its canonical form;
 - short family words reach further than they look: `pro` also matches `deepseek-v4-pro`, `flash`

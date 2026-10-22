@@ -197,7 +197,7 @@ xc() { bash "$SRC" exclude check "$1" >/dev/null 2>&1; }   # rc0 = excluded
   bash "$SRC" exclude add claude-fable-5 >/dev/null 2>&1
   r=0
   : > "$CALLS"; o="$(bash "$SRC" run -m fable "hi" 2>&1)"
-  printf '%s' "$o" | grep -q "you excluded 'fable' (exclude list entry: claude-fable-5)" && [ ! -s "$CALLS" ] || { echo "  -m fable: $o"; r=1; }
+  printf '%s' "$o" | grep -q "you excluded 'fable' (exclude list entry: claude-fable-5; fable runs claude-fable-5-1 today)" && [ ! -s "$CALLS" ] || { echo "  -m fable: $o"; r=1; }
   # -m claude passes the alias check, then Devin's live catalog resolves it to a Fable id: refused there.
   o="$(OSRC_SOURCED=1 bash -c '. "$1" >/dev/null 2>&1
     _devin_with_prepare() { DEVIN_WITH_PRE=""; }; need_devin() { :; }; _catalog_validate() { :; }
@@ -427,6 +427,22 @@ second_opinion "is the sky blue"'
   grep -q 'rc=1' "$TMP/f18.out" && [ "$(cat "$jd/status" 2>/dev/null)" = failed ] && grep -q 'excluded-model:fable' "$jd/reason" \
     && grep -q "did not start: you excluded 'fable'" "$jd/out.log" || { echo "  $(cat "$TMP/f18.out") status=$(cat "$jd/status" 2>/dev/null)"; exit 1; }
 ) && ok "F18: run_job marks a child failed with reason excluded-model when the list changed after launch" || bad "F18 run_job"
+
+# ---- bare alias decided by the id it runs TODAY (orchestrator refinement)
+(
+  export OSRC_HOME; OSRC_HOME="$(xh cur)"; r=0
+  ! OSRC_EXCLUDE_MODELS=claude-opus-4-8 xc opus || { echo "  old opus blocked -m opus"; r=1; }
+  o="$(OSRC_EXCLUDE_MODELS=claude-opus-4-8 bash "$SRC" run -m opus "hi" 2>&1)"; printf '%s' "$o" | grep -q "you excluded" && { echo "  run -m opus refused: $o"; r=1; }
+  o="$(OSRC_EXCLUDE_MODELS=claude-opus-5-5 bash "$SRC" run -m opus "hi" 2>&1)"
+  printf '%s' "$o" | grep -q "you excluded 'opus' (exclude list entry: claude-opus-5-5; opus runs claude-opus-5-5 today)" || { echo "  opus-5-5: $o"; r=1; }
+  o="$(OSRC_EXCLUDE_MODELS=claude-fable-5 bash "$SRC" run -m fable "hi" 2>&1)"
+  printf '%s' "$o" | grep -q "you excluded 'fable' (exclude list entry: claude-fable-5; fable runs claude-fable-5-1 today)" || { echo "  fable: $o"; r=1; }
+  OSRC_EXCLUDE_MODELS=opus xc opus && ! OSRC_EXCLUDE_MODELS='claude-opus-4*' xc opus && OSRC_EXCLUDE_MODELS='claude-opus-5*' xc opus || { echo "  family word / globs"; r=1; }
+  o="$(OSRC_EXCLUDE_MODELS=gemini-3.5-pro bash "$SRC" exclude check gemini-pro 2>&1)"
+  printf '%s' "$o" | grep -q 'picks its model id live.*fail closed' || { echo "  gemini: $o"; r=1; }
+  grep -q '^OSRC_CLAUDE_CURRENT_IDS="fable|claude-fable-5-1 opus|claude-opus-5-5 sonnet|claude-sonnet-5-5 haiku|claude-haiku-5-5"' "$SRC" || { echo "  current-id map missing"; r=1; }
+  exit "$r"
+) && ok "bare alias: claude-opus-4-8 leaves -m opus allowed, claude-opus-5-5 and claude-fable-5 refuse opus/fable with the reason, a live-picked Gemini alias fails closed and says why" || bad "bare alias current-id rule"
 
 echo "---"
 echo "test_factory_exclude: $pass passed, $fail failed"
