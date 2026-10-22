@@ -320,6 +320,8 @@ if [ -n "$jid" ] && [ -f "$OSRC_HOME/jobs/$jid/meta.json" ]; then
   check "real bg launch: the job's worktree/branch/base match what the task recorded" \
     "[ \"\$(jq -r '[.worktree,.branch,.base_sha]|join(\"|\")' \"$OSRC_HOME/jobs/$jid/meta.json\")\" = \"\$(jq -r '[.worktree,.branch,.base_sha]|join(\"|\")' \"$ej\")\" ]"
   check "real bg launch: the task is running on that job" "[ \"\$(jq -r '.state + \"|\" + .job' \"$ej\")\" = \"running|$jid\" ]"
+  check 'R3 S18 real bg launch records the attempt token in its job receipt' \
+    "[ \"\$(cat \"$OSRC_HOME/jobs/$jid/task_attempt\")\" = \"\$(jq -r .attempt_token \"$ej\")\" ]"
 else
   bad "real bg launch produced no job (jid='$jid'): $(cat "$OSRC_HOME/plans/e2e/tasks/t1/launch.log" 2>/dev/null | tail -3)"
 fi
@@ -557,13 +559,269 @@ check "#22 an absurd --retries is refused plainly" "[ $rc -ne 0 ] && printf '%s'
 # ---- #18: a delegate never inherits this job's worktree switches
 FB2="$TMP/fakebin2"; mkdir -p "$FB2"
 printf '#!/usr/bin/env bash\nenv > "$ENVDUMP"\necho "OSRC::DONE env dumped"\n' > "$FB2/droid"; chmod +x "$FB2/droid"
-( cd "$REPO" && PATH="$FB2:$PATH" ENVDUMP="$TMP/envdump" OSRC_WORKTREE=1 OSRC_WORKTREE_REQUIRED=1 OSRC_WORKTREE_BASE="$HEAD_SHA" \
+( cd "$REPO" && PATH="$FB2:$PATH" ENVDUMP="$TMP/envdump" OSRC_WORKTREE=1 OSRC_WORKTREE_REQUIRED=1 OSRC_WORKTREE_BASE="$HEAD_SHA" OSRC_TASK_REF=fx/t1 OSRC_TASK_ATTEMPT=env-token \
   OSRC_CLOUD_ACK=1 OUTSOURCERER_DEPTH=0 OSRC_NO_ADVISE=1 bash -c ". \"$LIB\"; SCRIPT_PATH=\"$SRC\"; run_job envjob droid run 'say hi'" ) >/dev/null 2>&1
 check "#18 the job itself still ran in its own worktree" "[ \"\$(jq -r '.worktree // \"\"' \"$OSRC_JOBS/envjob/meta.json\" 2>/dev/null)\" = \"$REPO/.outsourcerer/worktrees/envjob\" ]"
 check "#18 the delegate's environment has no OSRC_WORKTREE* switches" \
   "[ -s \"$TMP/envdump\" ] && ! grep -q '^OSRC_WORKTREE' \"$TMP/envdump\""
+check 'R3 S18 delegate cannot pass task linkage to nested jobs' \
+  "[ -s \"$TMP/envdump\" ] && ! grep -qE '^OSRC_TASK_(REF|ATTEMPT)=' \"$TMP/envdump\""
 git -C "$REPO" worktree remove --force "$REPO/.outsourcerer/worktrees/envjob" >/dev/null 2>&1 || true
 
 echo
+# Round 3: regressions run in subshells so injected failures never leak between cases.
+O plan new r3 --repo "$REPO" --no-use >/dev/null 2>&1
+r3_task() { _task_new r3 '{"title":"round 3"}'; }
+r3_verdict() (
+  . "$LIB"
+  local id; id="$(r3_task)"
+  _task_update r3 "$id" '.state="running" | .require_verdict=true' || exit 1
+  _factory_done_check() { echo passed; }
+  _factory_review_verdict() { echo FAIL; return 1; }
+  (cmd_task done "$id" --plan r3) >/dev/null 2>&1 && exit 1
+  [ "$(_task_get r3 "$id" | jq -r .state)" = running ] || exit 1
+  _factory_review_verdict() { echo AMBIGUOUS; return 2; }
+  (cmd_task done "$id" --plan r3) >/dev/null 2>&1 && exit 1
+  cmd_task done "$id" --force --plan r3 >/dev/null || exit 1
+  [ "$(_task_get r3 "$id" | jq -r .state)" = done ]
+)
+check 'R3 S4 manual done refuses FAIL/AMBIGUOUS; force overrides' r3_verdict
+r3_verify_owner() (
+  . "$LIB"
+  local id; id="$(r3_task)"
+  _task_update r3 "$id" '.state="running"' || exit 1
+  _factory_done_check() {
+    _task_get r3 "$id" | jq -e '.verifying_pid != null and .verifying_start != null and .verifying_at > 0' >/dev/null || return 1
+    echo checked
+  }
+  cmd_task done "$id" --plan r3 >/dev/null || exit 1
+  _task_get r3 "$id" | jq -e '.state=="done" and .verifying_pid==null and .verifying_start==null and .verifying_at==null' >/dev/null
+)
+check 'R3 S12 manual verification publishes and clears ownership' r3_verify_owner
+r3_verify_replaced() (
+  . "$LIB"
+  local id; id="$(r3_task)"
+  _task_update r3 "$id" '.state="running" | .attempt_token="old"' || exit 1
+  _factory_done_check() {
+    _task_update r3 "$id" '.attempt_token="new" | .verifying_pid="replacement" | .verifying_start="other" | .result="replacement"' || return 1
+    echo checked
+  }
+  (cmd_task done "$id" --plan r3 --result stale) >/dev/null 2>&1 && exit 1
+  _task_get r3 "$id" | jq -e '.state=="verifying" and .result=="replacement" and .verifying_pid=="replacement"' >/dev/null
+)
+check 'R3 S12 replaced verifier cannot finalize or overwrite the result' r3_verify_replaced
+r3_claim_replace() (
+  . "$LIB"
+  local id; id="$(r3_task)"
+  _task_bg_launch() {
+    mkdir -p "$OSRC_JOBS/20261022-120000-replaced"
+    echo running > "$OSRC_JOBS/20261022-120000-replaced/status"
+    _task_update r3 "$id" '.attempt_token="replacement"' || return 1
+    echo 20261022-120000-replaced
+  }
+  _task_dispatch r3 "$id" >/dev/null 2>&1 && exit 1
+  _task_get r3 "$id" | jq -e '.job=="" and .attempt_token=="replacement"' >/dev/null || exit 1
+  [ "$(cat "$OSRC_JOBS/20261022-120000-replaced/status")" = canceled ]
+)
+check 'R3 S7 replaced claim cannot adopt the original launcher job' r3_claim_replace
+r3_failure_replace() (
+  . "$LIB"
+  local id; id="$(r3_task)"
+  _task_bg_launch() { _task_update r3 "$id" '.attempt_token="replacement"'; return 1; }
+  _task_dispatch r3 "$id" >/dev/null 2>&1 && exit 1
+  _task_get r3 "$id" | jq -e '.state=="running" and .attempt_token=="replacement" and .launch_failed==false' >/dev/null
+)
+check 'R3 S7 old launch failure cannot fail a replacement claim' r3_failure_replace
+r3_adopt() (
+  . "$LIB"
+  local OSRC_JOBS="$TMP/jobs with spaces"; mkdir -p "$OSRC_JOBS"
+  local id jd; id="$(r3_task)"; jd="$OSRC_JOBS/20261022-120000-adopt"
+  _task_update r3 "$id" '.state="running" | .claimed_at=1 | .attempt_token="adopt-token"' || exit 1
+  mkdir -p "$jd"; printf 'r3/%s\n' "$id" > "$jd/task_ref"
+  echo adopt-token > "$jd/task_attempt"; echo running > "$jd/status"
+  jq -n --arg w "$REPO/.outsourcerer/worktrees/adopt" --arg s "$HEAD_SHA" \
+    '{worktree:$w,branch:"outsourcerer/adopt",base_sha:$s}' > "$jd/meta.json"
+  mkdir -p "$OSRC_JOBS/20261022-120000-nested"
+  printf 'r3/%s\n' "$id" > "$OSRC_JOBS/20261022-120000-nested/task_ref"
+  echo another-token > "$OSRC_JOBS/20261022-120000-nested/task_attempt"
+  cmd_task retry "$id" --plan r3 >/dev/null || exit 1
+  _task_get r3 "$id" | jq -e --arg s "$HEAD_SHA" '.state=="running" and .job=="20261022-120000-adopt" and .branch=="outsourcerer/adopt" and .base_sha==$s and (.worktree|endswith("/adopt"))' >/dev/null
+)
+check 'R3 S17/S18 stale retry adopts the matching attempt and full receipt' r3_adopt
+r3_model() (
+  . "$LIB"
+  local id job; id="$(r3_task)"
+  _task_update r3 "$id" '.model="sol" | .fallback=["sol","opus"]' || exit 1
+  _model_excluded() { [ "$1" = sol ]; }
+  job="$(_task_dispatch r3 "$id")" || exit 1
+  grep -qx opus "$OSRC_JOBS/$job/argv" && ! grep -qx sol "$OSRC_JOBS/$job/argv"
+)
+check 'R3 S19 manual dispatch chooses the stored allowed fallback' r3_model
+r3_publish_fail() (
+  . "$LIB"
+  mv() { case "$*" in */.lock/owner*) return 1 ;; esac; command mv "$@"; }
+  _plan_lock r3 >/dev/null 2>&1 && exit 1
+  [ ! -d "$OSRC_HOME/plans/r3/.lock" ] && [ "$_FACTORY_LOCK_DEPTH" = 0 ]
+)
+check 'R3 S21 failed owner publication fails acquisition and removes the lock' r3_publish_fail
+r3_unknown_pid() (
+  . "$LIB"
+  _pid_start_identity() { return 1; }
+  kill() { return 1; }
+  ! _factory_owner_dead 1234 unknown
+)
+check 'R3 D11 inaccessible process is not proof of death' r3_unknown_pid
+r3_rm_lock() (
+  . "$LIB"
+  cmd_plan new locked-rm --no-repo --no-use >/dev/null || exit 1
+  _plan_lock locked-rm || exit 1
+  OSRC_PLAN_LOCK_TRIES=1 O plan rm locked-rm >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 0 ] && [ -f "$OSRC_HOME/plans/locked-rm/plan.json" ]
+)
+check 'R3 D3 plan removal waits for the plan lock' r3_rm_lock
+r3_crlf() (
+  . "$LIB"
+  jq() { command jq "$@" | sed 's/$/\r/'; return "${PIPESTATUS[0]}"; }
+  local id job; id="$(r3_task)"; job="$(_task_dispatch r3 "$id")" || exit 1
+  [ -n "$job" ] && _task_get r3 "$id" | command jq -e '.state=="running" and (.job|length)>0' >/dev/null
+)
+check 'R3 D4 native jq CRLF does not break task dispatch' r3_crlf
+check 'R3 D22 task header references published documentation' "! head -n 5 \"$HERE/../factory-tasks.sh\" | grep -q CONTRACT.md"
+r3_hint() (
+  . "$LIB"
+  local id out; id="$(r3_task)"
+  out="$(cmd_task hold "$id" --plan r3 --reason decision)" || exit 1
+  printf '%s' "$out" | grep -q "task release $id --plan r3" || exit 1
+  out="$(cmd_plan show r3)" || exit 1
+  printf '%s' "$out" | grep -q "task release $id --plan r3"
+)
+check 'R3 S15 task and plan recovery hints name the selected plan' r3_hint
+r3_claim_tokens() (
+  . "$LIB"
+  local id first second; id="$(r3_task)"
+  _plan_lock r3 || exit 1
+  _task_claim_locked r3 "$id" || exit 1
+  first="$(_task_get r3 "$id" | jq -r '.attempt_token // ""')"
+  _task_update_locked r3 "$id" '.state="todo"' || exit 1
+  _task_claim_locked r3 "$id" || exit 1
+  second="$(_task_get r3 "$id" | jq -r '.attempt_token // ""')"
+  _plan_unlock r3
+  [[ "$first" =~ ^[0-9]+-[0-9]+-[0-9]+ ]] && [ "$first" != "$second" ]
+)
+check 'R3 S7 every claim has a distinct epoch-pid-random token' r3_claim_tokens
+r3_before_launch_replace() (
+  . "$LIB"
+  local id; id="$(r3_task)"
+  _task_brief() {
+    _task_update r3 "$id" '.attempt_token="replacement"' || return 1
+    echo brief > "$TMP/replaced-brief"; echo "$TMP/replaced-brief"
+  }
+  _task_bg_launch() { echo launched > "$TMP/replaced-launch"; }
+  _task_dispatch r3 "$id" >/dev/null 2>&1 && exit 1
+  [ ! -f "$TMP/replaced-launch" ]
+)
+check 'R3 S7 replacement before launch prevents spending a worker' r3_before_launch_replace
+r3_recovery_replace() (
+  . "$LIB"
+  local id; id="$(r3_task)"
+  _task_update r3 "$id" '.state="running" | .claimed_at=1 | .attempt_token="old"' || exit 1
+  _task_find_job_by_ref() { _task_update r3 "$id" '.attempt_token="new"' >/dev/null; }
+  (cmd_task retry "$id" --plan r3) >/dev/null 2>&1 && exit 1
+  _task_get r3 "$id" | jq -e '.state=="running" and .attempt_token=="new"' >/dev/null
+)
+check 'R3 S7 stale recovery cannot reset a replacement with the same timestamp' r3_recovery_replace
+r3_legacy_ambiguous() (
+  . "$LIB"
+  local id j; id="$(r3_task)"
+  _task_update r3 "$id" '.state="running" | .claimed_at=1' || exit 1
+  for j in ambiguous1 ambiguous2; do
+    mkdir -p "$OSRC_JOBS/$j"; printf 'r3/%s\n' "$id" > "$OSRC_JOBS/$j/task_ref"
+  done
+  (cmd_task retry "$id" --plan r3) >/dev/null 2>&1 && exit 1
+  _task_get r3 "$id" | jq -e '.state=="running" and .job==""' >/dev/null
+)
+check 'R3 S18 ambiguous legacy receipts are refused without resetting the task' r3_legacy_ambiguous
+r3_pid_cases() (
+  . "$LIB"
+  _pid_start_identity() { echo new; }
+  _factory_owner_dead 1234 old || exit 1
+  _factory_owner_dead 1234 new && exit 1
+  _pid_start_identity() { return 2; }
+  _factory_owner_dead 1234 old || exit 1
+  _pid_start_identity() { return 1; }
+  kill() { echo 'kill: (1234) - No such process' >&2; return 1; }
+  _factory_owner_dead 1234 old
+)
+check 'R3 D11 process identity handles reused, live, missing and ESRCH owners' r3_pid_cases
+r3_jq_status() (
+  . "$LIB"
+  _ft_jq -e 'false' <<< '{}' >/dev/null && exit 1
+  _ft_jq -e '.' <<< 'broken' >/dev/null 2>&1 && exit 1
+  _ft_jq -e 'true' <<< '{}' >/dev/null
+)
+check 'R3 D4 jq normalization preserves false and parse-error exit statuses' r3_jq_status
+r3_early_receipt() (
+  . "$LIB"
+  local id job=20261022-120000-early; id="$(r3_task)"
+  _task_update r3 "$id" '.shape="ship"' || exit 1
+  _task_bg_launch() {
+    _task_get r3 "$id" | jq -e --arg s "$OSRC_WORKTREE_BASE" '.base_sha==$s' >/dev/null || return 1
+    mkdir -p "$OSRC_JOBS/$job"
+    echo running > "$OSRC_JOBS/$job/status"
+    printf 'r3/%s\n' "$id" > "$OSRC_JOBS/$job/task_ref"
+    echo "$OSRC_TASK_ATTEMPT" > "$OSRC_JOBS/$job/task_attempt"
+    # Simulate the launcher dying before returning its id, while setup has no metadata yet.
+    _task_update r3 "$id" '.claimed_at=1' || return 1
+    cmd_task retry "$id" --plan r3 >/dev/null || return 1
+    _task_get r3 "$id" | jq -e --arg s "$OSRC_WORKTREE_BASE" \
+      '.base_sha==$s and .branch=="outsourcerer/20261022-120000-early" and (.worktree|endswith("/20261022-120000-early"))' > "$TMP/early-receipt-ok"
+    echo "$job"
+  }
+  _task_dispatch r3 "$id" >/dev/null 2>&1 || exit 1
+  grep -qx true "$TMP/early-receipt-ok" && [ "$(cat "$OSRC_JOBS/$job/status")" = running ]
+)
+check 'R3 S18 ship adoption restores its receipt even before metadata is published' r3_early_receipt
+r3_model_without_flow() (
+  . "$LIB"
+  unset -f _ff_next_model
+  _model_excluded() { if [ "$1" = sol ]; then echo sol; return 0; fi; return 1; }
+  [ "$(_task_dispatch_model '{"model":"sol","fallback":["sol","opus"]}')" = opus ]
+)
+check 'R3 S19 fallback selection without the flow module emits only the chosen model' r3_model_without_flow
+r3_retry_replaced_failure() (
+  . "$LIB"
+  local id; id="$(r3_task)"
+  _task_update r3 "$id" '.state="failed" | .attempt_token="old"' || exit 1
+  _task_claim_stale() { _task_update r3 "$id" '.attempt_token="new"'; return 1; }
+  (cmd_task retry "$id" --plan r3) >/dev/null 2>&1 && exit 1
+  _task_get r3 "$id" | jq -e '.state=="failed" and .attempt_token=="new"' >/dev/null
+)
+check 'R3 S7 retry cannot reset a different attempt that already failed' r3_retry_replaced_failure
+r3_rm_atomic() (
+  . "$LIB"
+  cmd_plan new remove-atomic --no-repo --no-use >/dev/null || exit 1
+  rm() {
+    # Recursively removing the published directory can expose it after .lock is deleted.
+    case "$*" in *"$OSRC_HOME/plans/remove-atomic"*) return 1 ;; esac
+    command rm "$@"
+  }
+  (cmd_plan rm remove-atomic) >/dev/null 2>&1 || exit 1
+  [ ! -d "$OSRC_HOME/plans/remove-atomic" ]
+)
+check 'R3 D3 plan removal unpublishes the locked directory before recursive cleanup' r3_rm_atomic
+r3_adopted_verifier() (
+  . "$LIB"
+  local id job=20261022-120000-verifying; id="$(r3_task)"
+  _task_bg_launch() {
+    mkdir -p "$OSRC_JOBS/$job"; echo running > "$OSRC_JOBS/$job/status"
+    _task_update r3 "$id" '.job=$j | .jobs=[$j] | .state="verifying"' --arg j "$job" || return 1
+    echo "$job"
+  }
+  _task_dispatch r3 "$id" >/dev/null 2>&1 || exit 1
+  [ "$(cat "$OSRC_JOBS/$job/status")" = running ] && _task_get r3 "$id" | jq -e '.state=="verifying"' >/dev/null
+)
+check 'R3 S18 returning launcher preserves its adopted job after verification begins' r3_adopted_verifier
+
 echo "factory tasks: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
