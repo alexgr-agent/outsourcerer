@@ -18,17 +18,19 @@ set -uo pipefail
 unset OSRC_AGY_FLASH_DEFAULT OSRC_AGY_PRO_DEFAULT
 # Hermetic catalog: the ids below are what this test names, so the resolver treats them as served
 # (a retired id would otherwise be healed to the newest member, which is the newer test's job).
-TMP_CAT="$(mktemp -d)"; trap 'rm -rf "$TMP_CAT"' EXIT
-export OSRC_HOME="$TMP_CAT"; mkdir -p "$OSRC_HOME/catalogs"
-printf '["gemini-3.7-flash-high","gemini-3.7-flash-medium","gemini-3.7-flash-low","gemini-3.6-flash-high","gemini-3.6-flash-medium","gemini-3.5-flash-low","gemini-3.1-pro-high","gemini-3.1-pro-low"]' > "$OSRC_HOME/catalogs/gm.json"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$SCRIPT_DIR/../outsourcerer.sh"
 [ -f "$SRC" ] || { echo "FAIL: cannot find $SRC"; exit 1; }
 bash -n "$SRC" || { echo "FAIL: bash -n failed"; exit 1; }
 
+# One temp home for the whole test. The catalog used to be written to a first temp home that the
+# line below then replaced, so the resolver fell through to the machine's real `agy models` and the
+# result depended on whatever agy served that day.
 TMP="$(mktemp -d)"; export OSRC_HOME="$TMP"
 trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$OSRC_HOME/catalogs"
+printf '["gemini-3.7-flash-high","gemini-3.7-flash-medium","gemini-3.7-flash-low","gemini-3.6-flash-high","gemini-3.6-flash-medium","gemini-3.5-flash-low","gemini-3.1-pro-high","gemini-3.1-pro-low"]' > "$OSRC_HOME/catalogs/gm.json"
 pass=0; fail=0
 ok()  { echo "PASS: $1"; pass=$((pass+1)); }
 bad() { echo "FAIL: $1"; fail=$((fail+1)); }
