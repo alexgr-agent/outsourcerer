@@ -883,6 +883,8 @@ _task_cli_show() {
     (if .hold.answer != "" then "  answer:   \(.hold.answer)" else empty end),
     (if .result != "" then "  result:   \(.result)" else empty end),
     (if .evidence != "" then "  evidence: \(.evidence)" else empty end),
+    (if .landed == true then "  landed:   yes\(if (.landed_into // "") != "" then " into " + .landed_into else "" end)\(if (.landed_sha // "") != "" then " at " + (.landed_sha | tostring | .[0:12]) else "" end)" else empty end),
+    (if (.pr // "") != "" then "  pr:       \(.pr)" else empty end),
     "  files:    \($bd)/",
     "  prompt:",
     (.prompt | split("\n") | .[0:12][] | "    " + .)'

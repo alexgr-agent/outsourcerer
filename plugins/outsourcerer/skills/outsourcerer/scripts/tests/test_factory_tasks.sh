@@ -238,6 +238,13 @@ check "done passes through verifying (logged)" \
 L "_task_update alpha $t5 '.job = \"J5\"'"; mkdir -p "$OSRC_HOME/jobs/J5"; echo done > "$OSRC_HOME/jobs/J5/status"; echo x > "$OSRC_HOME/jobs/J5/last.txt"
 out="$(bash -c ". \"$LIB\"; _factory_done_check() { echo 'contract says no: no commits'; return 1; }; cmd_task done $t5" 2>&1)"; rc=$?
 check "done uses _factory_done_check when track C defines it" "[ $rc -ne 0 ] && printf '%s' \"\$out\" | grep -q 'contract says no'"
+out="$(bash -c ". \"$LIB\"; _factory_done_check() { _task_update \"\$1\" \"\$2\" '.evidence = \$e | .head_sha = \$h' --arg e /x/evidence.json --arg h feed; echo 'contract ok'; return 0; }; cmd_task done $t5" 2>&1)"; rc=$?
+check "a done check that writes the task itself (track C style) does not deadlock and is honored" \
+  "[ $rc -eq 0 ] && [ \"\$(jq -r '.state + \"|\" + .evidence + \"|\" + .head_sha' \"$OSRC_HOME/plans/alpha/tasks/$t5.json\")\" = 'done|/x/evidence.json|feed' ]"
+L "_task_update alpha $t5 '.state = \"running\" | .landed = true | .landed_into = \"main\" | .landed_sha = \"0123456789abcdef\" | .pr = \"https://example.invalid/pr/1\"'"
+out="$(O task show "$t5" 2>&1)"
+check "task show displays landed status and PR when track C set them" \
+  "printf '%s' \"\$out\" | grep -q 'landed:   yes into main at 0123456789ab' && printf '%s' \"\$out\" | grep -q 'pr:       https://example.invalid/pr/1'"
 O task done "$t5" --force --result 'did it by hand' >/dev/null 2>&1
 check "done --force marks done by hand with a result" "[ \"\$(jq -r '.state + \"|\" + .result' \"$OSRC_HOME/plans/alpha/tasks/$t5.json\")\" = 'done|did it by hand' ]"
 out="$(O task fail t4 --reason x 2>&1)"; rc=$?
