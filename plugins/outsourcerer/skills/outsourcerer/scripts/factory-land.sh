@@ -14,6 +14,9 @@
 # file's helpers here would silently replace its JSON validation and private (umask 077) writes.
 _fl_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# Native Windows jq emits CRLF; retain jq's failure status while normalizing output.
+_fl_jq() ( set -o pipefail; jq "$@" | tr -d '\r'; )
+
 # _fl_write_json <path> <json> -> validate, refuse symlinks, then write private via tmp + mv (atomic).
 _fl_write_json() {
   local p="$1" tmp
@@ -40,7 +43,7 @@ _fl_self_pid() {
 _factory_job_status() {
   [ -n "${1:-}" ] || return 0
   case "$1" in */*|*..*) return 0 ;; esac
-  cat "$OSRC_JOBS/$1/status" 2>/dev/null | head -1
+  cat "$OSRC_JOBS/$1/status" 2>/dev/null | head -1 | tr -d '\r'
 }
 
 # _factory_job_ok <job-id> -> rc0 when the job ended in terminal success (done, or done? = exited 0
@@ -61,12 +64,13 @@ _factory_job_wait_reason() {
 }
 
 # _factory_scan_range <dir> <base> <head> -> rc0 = a live secret VALUE was added in base..head (block),
-# rc1 = clean, rc2 = the diff could not be read (callers fail closed). Same hardening as
+# rc1 = clean, rc2 = history could not be read (callers fail closed). Same hardening as
 # _crew_scan_staged: --text/--no-ext-diff/--no-textconv defeat a planted .gitattributes, and the diff
-# is captured BEFORE grep so a big diff can't SIGPIPE git into a false "clean".
+# is captured BEFORE grep so a big diff can't SIGPIPE git into a false "clean". Inspect every new
+# commit, including merge-parent diffs, so deleting a secret later cannot hide leaked history.
 _factory_scan_range() {
   local _sd
-  _sd="$(git -C "$1" diff --text --no-ext-diff --no-textconv --no-color "$2" "$3" 2>/dev/null)" || return 2
+  _sd="$(git -C "$1" log -p -m --root --format= --text --no-ext-diff --no-textconv --no-color "$2..$3" -- 2>/dev/null)" || return 2
   # Only ADDED lines, only key VALUES: removing a leaked key, or code that merely names
   # OPENROUTER_API_KEY, must never block a land.
   grep -Eq "$OSRC_SECRET_ADDED_ERE" <<<"$_sd" && return 0
@@ -146,6 +150,10 @@ _factory_gate_ship() {
       *)   _FG_REASON="the check failed in the worktree (exit $rc): $check"; return 1 ;;
     esac
   fi
+  if [ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" != "$_FG_HEAD" ] || ! _crew_worktree_clean "$wt"; then
+    _FG_REASON="the check changed HEAD or tracked files; checks must verify the committed tree without changing it"
+    return 1
+  fi
   local cmsg="no check set"; [ -n "$check" ] && cmsg="check passed"
   _FG_REASON="$_FG_AHEAD new commit(s) on $_FG_BRANCH, $cmsg, no secrets found"
   return 0
@@ -176,16 +184,16 @@ _factory_done_eval() {
   local tj; tj="$(_task_get "$plan" "$tid" 2>/dev/null)" || { _FDC_REASON="there is no task $tid in plan $plan"; return 1; }
   local pd shape job check wt base wj
   pd="$(_plan_dir "$plan")"; _FDC_TDIR="$pd/tasks/$tid"; [ -n "$outdir" ] || outdir="$_FDC_TDIR"
-  shape="$(jq -r '.shape // "ship"' <<<"$tj")"
-  job="$(jq -r '.job // ""' <<<"$tj")"; _FDC_JOB="$job"
-  check="$(jq -r '.check // ""' <<<"$tj")"; [ "$ovr_set" = 1 ] && check="$ovr"
-  wt="$(jq -r '.worktree // ""' <<<"$tj")"; base="$(jq -r '.base_sha // ""' <<<"$tj")"
+  shape="$(_fl_jq -r '.shape // "ship"' <<<"$tj")"
+  job="$(_fl_jq -r '.job // ""' <<<"$tj")"; _FDC_JOB="$job"
+  check="$(_fl_jq -r '.check // ""' <<<"$tj")"; [ "$ovr_set" = 1 ] && check="$ovr"
+  wt="$(_fl_jq -r '.worktree // ""' <<<"$tj")"; base="$(_fl_jq -r '.base_sha // ""' <<<"$tj")"
   # Fall back to the job's worktree receipt for anything the task record is missing.
   if [ -n "$job" ] && { [ -z "$wt" ] || [ -z "$base" ]; }; then
     wj="$OSRC_JOBS/$job/worktree.json"
     if [ -f "$wj" ]; then
-      [ -n "$wt" ] || wt="$(jq -r '.path // ""' "$wj" 2>/dev/null)"
-      [ -n "$base" ] || base="$(jq -r '.base_sha // ""' "$wj" 2>/dev/null)"
+      [ -n "$wt" ] || wt="$(_fl_jq -r '.path // ""' "$wj" 2>/dev/null)"
+      [ -n "$base" ] || base="$(_fl_jq -r '.base_sha // ""' "$wj" 2>/dev/null)"
     fi
   fi
   if [ "$shape" = "scout" ]; then
@@ -258,51 +266,102 @@ _factory_done_check() {
 # provably-dead owners reclaimed; a live owner is never broken by age).
 # ---------------------------------------------------------------------------------------------
 _land_lock_dir() {
-  local key; key="$(printf '%s' "$1" | cksum | awk '{print $1}')"
+  local key common
+  common="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$common" in /*|[A-Za-z]:[\\/]*) ;; *) common="$1/$common" ;; esac
+  common="$(cd "$common" && pwd -P)" || return 1
+  key="$(printf '%s' "$common" | cksum | awk '{print $1}')"
   printf '%s/locks/land-%s' "$OSRC_HOME" "$key"
+}
+
+# Missing process inspection is unknown, not death. Only ESRCH proves absence when ps is denied.
+_land_owner_dead() {
+  local pid="$1" start="$2" cur rc=0 err
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  cur="$(_pid_start_identity "$pid" 2>/dev/null)" || rc=$?
+  [ "$rc" = 2 ] && return 0
+  [ "$rc" = 0 ] && [ -n "$start" ] && [ "$cur" != "$start" ] && return 0
+  if [ "$rc" = 1 ]; then
+    err="$(LC_ALL=C kill -0 "$pid" 2>&1)" && return 1
+    case "$err" in *'No such process'*|*'no such process'*) return 0 ;; esac
+  fi
+  return 1
+}
+
+# Creation, reclamation and release use the same guard, closing the check/mkdir race too.
+_land_guard_acquire() {
+  local guard="$1.steal" me="$2" gp gs gline=""
+  if ! _mkdir_claim "$guard"; then
+    { IFS= read -r gline < "$guard/owner"; } 2>/dev/null || return 1
+    read -r gp gs <<<"$gline"
+    _land_owner_dead "$gp" "$gs" || return 1
+    # A killed reclaimer can leave its guard behind. Reclaim it with the same ownership protocol.
+    _land_lock_break "$guard" "$gline" "$me" || return 1
+    _mkdir_claim "$guard" || return 1
+  fi
+  if ! printf '%s %s\n' "$me" "$(_pid_start_identity "$me" 2>/dev/null)" > "$guard/owner"; then
+    rm -f "$guard/owner"; rmdir "$guard" 2>/dev/null; return 1
+  fi
+}
+
+_land_guard_release() {
+  rm -f "$1.steal/owner"; rmdir "$1.steal" 2>/dev/null || true
+}
+
+# Reclaimers serialize, then check the moved directory too. Never delete a replacement owner.
+_land_lock_break() {
+  local lk="$1" seen="$2" me="$3" cur="" moved="" corpse rc=1
+  _land_guard_acquire "$lk" "$me" || return 1
+  { IFS= read -r cur < "$lk/owner"; } 2>/dev/null || cur=""
+  if [ -d "$lk" ] && [ "$cur" = "$seen" ]; then
+    corpse="$lk.stale.$me.${RANDOM:-0}"
+    if mv "$lk" "$corpse" 2>/dev/null; then
+      { IFS= read -r moved < "$corpse/owner"; } 2>/dev/null || moved=""
+      if [ "$moved" = "$seen" ]; then rm -rf "$corpse"; rc=0
+      else [ -e "$lk" ] || mv "$corpse" "$lk"; fi
+    fi
+  fi
+  _land_guard_release "$lk"
+  return "$rc"
 }
 
 # _land_lock_acquire <repo-root> <holder-description> -> rc0 holding (_LAND_LOCK set), rc1 timed out.
 _land_lock_acquire() {
-  local lk wait start now said=0 o_pid o_start v_pid v_start cur idrc dead corpse holder me age grace
-  lk="$(_land_lock_dir "$1")"; mkdir -p "${lk%/*}" 2>/dev/null
+  local lk wait start now said=0 o_pid o_start o_line holder me age grace
+  lk="$(_land_lock_dir "$1")" || return 1
+  mkdir -p "${lk%/*}" 2>/dev/null
   wait="${OSRC_LAND_LOCK_WAIT:-900}"; case "$wait" in ''|*[!0-9]*) wait=900 ;; esac
   grace="${OSRC_STATE_LOCK_STALE_SECS:-30}"
   _fl_self_pid; me="$_FL_PID"; start="$(date +%s)"
   while :; do
-    if _mkdir_claim "$lk"; then
-      printf '%s %s\n' "$me" "$(_pid_start_identity "$me" 2>/dev/null)" > "$lk/owner.tmp" 2>/dev/null \
-        && mv -f "$lk/owner.tmp" "$lk/owner" 2>/dev/null
-      printf '%s (since %s)\n' "$2" "$(_fl_now)" > "$lk/holder" 2>/dev/null
-      _LAND_LOCK="$lk"; return 0
+    if _land_guard_acquire "$lk" "$me"; then
+      if _mkdir_claim "$lk"; then
+        _LAND_LOCK_OWNER="$me $(_pid_start_identity "$me" 2>/dev/null)"
+        if ! { printf '%s\n' "$_LAND_LOCK_OWNER" > "$lk/owner.tmp" 2>/dev/null \
+          && mv -f "$lk/owner.tmp" "$lk/owner" 2>/dev/null; }; then
+          rm -f "$lk/owner.tmp"; rmdir "$lk" 2>/dev/null || true
+          _land_guard_release "$lk"
+          _LAND_LOCK_OWNER=""
+          echo "[land] could not publish merge-queue ownership; nothing was changed." >&2
+          return 1
+        fi
+        printf '%s (since %s)\n' "$2" "$(_fl_now)" > "$lk/holder" 2>/dev/null
+        _LAND_LOCK="$lk"; _land_guard_release "$lk"; return 0
+      fi
+      _land_guard_release "$lk"
     fi
-    o_pid=""; o_start=""
+    o_pid=""; o_start=""; o_line=""
     if [ -f "$lk/owner" ]; then
-      { read -r o_pid o_start < "$lk/owner"; } 2>/dev/null || true
-      case "$o_pid" in
-        ''|*[!0-9]*) ;;
-        *)
-          cur="$(_pid_start_identity "$o_pid" 2>/dev/null)"; idrc=$?
-          dead=0
-          if [ "$idrc" -eq 2 ]; then dead=1
-          elif [ "$idrc" -eq 0 ] && [ -n "$o_start" ] && [ "$cur" != "$o_start" ]; then dead=1; fi
-          if [ "$dead" = 1 ]; then
-            v_pid=""; v_start=""
-            { read -r v_pid v_start < "$lk/owner"; } 2>/dev/null || true
-            if [ "$v_pid" = "$o_pid" ] && [ "$v_start" = "$o_start" ]; then
-              corpse="$lk.stale.$me.${RANDOM:-0}"
-              mv "$lk" "$corpse" 2>/dev/null && rm -rf "$corpse" 2>/dev/null
-              echo "[land] cleared a leftover merge-queue lock from a land that is no longer running (pid $o_pid)." >&2
-              continue
-            fi
-          fi ;;
-      esac
+      { IFS= read -r o_line < "$lk/owner"; } 2>/dev/null || true
+      read -r o_pid o_start <<<"$o_line"
+      if _land_owner_dead "$o_pid" "$o_start" && _land_lock_break "$lk" "$o_line" "$me"; then
+        echo "[land] cleared a leftover merge-queue lock from a land that is no longer running (pid $o_pid)." >&2
+        continue
+      fi
     else
       age="$(_mtime "$lk" 2>/dev/null)"; case "$age" in ''|*[!0-9]*) age=0 ;; esac
       if [ "$age" -gt 0 ] && [ $(( $(date +%s) - age )) -ge "$grace" ]; then
-        corpse="$lk.stale.$me.${RANDOM:-0}"
-        mv "$lk" "$corpse" 2>/dev/null && rm -rf "$corpse" 2>/dev/null
-        continue
+        _land_lock_break "$lk" "" "$me" && continue
       fi
     fi
     holder="$(head -1 "$lk/holder" 2>/dev/null)"
@@ -321,9 +380,8 @@ _land_lock_acquire() {
 
 _land_lock_release() {
   [ -n "${_LAND_LOCK:-}" ] || return 0
-  rm -f "$_LAND_LOCK/owner" "$_LAND_LOCK/holder" "$_LAND_LOCK/owner.tmp" 2>/dev/null
-  rmdir "$_LAND_LOCK" 2>/dev/null || rm -rf "$_LAND_LOCK" 2>/dev/null
-  _LAND_LOCK=""
+  [ -n "${_LAND_LOCK_OWNER:-}" ] && _land_lock_break "$_LAND_LOCK" "$_LAND_LOCK_OWNER" "${_FL_PID:-$$}"
+  _LAND_LOCK=""; _LAND_LOCK_OWNER=""
 }
 
 # _land_checkout_of <root> <branch> -> path of the worktree that has <branch> checked out (empty = none).
@@ -354,7 +412,7 @@ _land_cleanup() {
 # (SIGKILL skips the trap). Called only while holding this repo's merge-queue lock, and a scratch
 # worktree whose recorded owner is still alive is always kept.
 _land_prune_stale() {
-  local root="$1" d n own o_pid o_start cur idrc
+  local root="$1" d n own o_pid o_start
   for d in "$root/.outsourcerer/worktrees"/land-*; do
     [ -e "$d" ] || continue
     n="${d##*/}"; own="$OSRC_HOME/land/active/$n"
@@ -362,10 +420,7 @@ _land_prune_stale() {
       o_pid=""; o_start=""; { read -r o_pid o_start < "$own"; } 2>/dev/null || true
       case "$o_pid" in
         ''|*[!0-9]*) ;;
-        *) cur="$(_pid_start_identity "$o_pid" 2>/dev/null)"; idrc=$?
-           # rc1 = could not tell (ps unusable): keep it, never guess a live land is dead.
-           if [ "$idrc" -eq 1 ]; then continue; fi
-           if [ "$idrc" -eq 0 ] && { [ -z "$o_start" ] || [ "$cur" = "$o_start" ]; }; then continue; fi ;;
+        *) _land_owner_dead "$o_pid" "$o_start" || continue ;;
       esac
     fi
     git -C "$root" worktree remove --force "$d" >/dev/null 2>&1 || rm -rf "$d" 2>/dev/null
@@ -424,12 +479,12 @@ _land_untracked_collisions() {
 # landed commit contains it). Anything else got there without the merged-result check.
 _land_contained_via_land() {
   local prev="$1" into="$2" head="$3" root="$4" plan="${5:-}" f ls
-  if [ -n "$prev" ] && [ "$(jq -r '.verdict // ""' <<<"$prev" 2>/dev/null)" = landed ] \
-     && [ "$(jq -r '.into // ""' <<<"$prev" 2>/dev/null)" = "$into" ]; then return 0; fi
+  if [ -n "$prev" ] && [ "$(_fl_jq -r '.verdict // ""' <<<"$prev" 2>/dev/null)" = landed ] \
+     && [ "$(_fl_jq -r '.into // ""' <<<"$prev" 2>/dev/null)" = "$into" ]; then return 0; fi
   [ -n "$plan" ] || return 1
   for f in "$(_plan_dir "$plan")"/tasks/t*.json; do
     [ -f "$f" ] || continue
-    ls="$(jq -r --arg i "$into" 'if (.landed == true) and ((.landed_into // "") == $i) then (.landed_sha // "") else "" end' "$f" 2>/dev/null)"
+    ls="$(_fl_jq -r --arg i "$into" 'if (.landed == true) and ((.landed_into // "") == $i) then (.landed_sha // "") else "" end' "$f" 2>/dev/null)"
     [ -n "$ls" ] || continue
     git -C "$root" merge-base --is-ancestor "$head" "$ls" 2>/dev/null && return 0
   done
@@ -440,21 +495,57 @@ _land_contained_via_land() {
 # --force; todo, held and canceled never. Used as a jq guard so every task write re-checks it.
 _LAND_OK_JQ='(.state == "running" or .state == "verifying" or .state == "done" or ($force == "1" and .state == "failed"))'
 
+_land_attempt() {
+  _fl_jq -c '[.attempt_token // "", .job // "", .worktree // "", .branch // "", .base_sha // "", .attempts // 0]'
+}
+
+# Check both state and attempt before publishing anything, including PRs.
+_land_assert_current() {
+  local current refusal
+  current="$(_task_get "$1" "$2")" || die "land: task $1/$2 disappeared"
+  refusal="$(_land_state_refusal "$2" "$current" "$3" "$1")" && die "land: $refusal"
+  [ "$(printf '%s' "$current" | _land_attempt)" = "$_LAND_ATTEMPT" ] \
+    || die "land: $1/$2 changed attempts while landing; run outsourcerer land $2 --plan $(printf %q "$1") again"
+  _land_reviews_current "$1" "$2" "$4"
+}
+
+# Older plans without reviewed_head retain their existing contract. New reviews bind to a SHA.
+_land_reviews_current() {
+  local plan="$1" tid="$2" head="$3" f
+  for f in "$(_plan_dir "$plan")"/tasks/t*.json; do
+    [ -f "$f" ] || continue
+    if _fl_jq -e --arg t "$tid" --arg h "$head" \
+      '(.require_verdict == true) and ((.deps // [] | index($t)) != null) and has("reviewed_head")
+       and (.reviewed_head != $h or .state != "done")' "$f" >/dev/null; then
+      die "land: review ${f##*/} does not approve revision ${head:0:12}; run outsourcerer plan run --plan $(printf %q "$plan") before outsourcerer land $tid --plan $(printf %q "$plan")"
+    fi
+  done
+}
+
+_land_error() {
+  local plan="$1" tid="$2" why="$3"
+  _task_update "$plan" "$tid" \
+    'if ([.attempt_token // "", .job // "", .worktree // "", .branch // "", .base_sha // "", .attempts // 0] == $owner)
+     then .land_error=$r | .land_error_at=$ts else error("attempt changed") end' \
+    --argjson owner "$_LAND_ATTEMPT" --arg r "$why" --arg ts "$(_fl_now)" >/dev/null 2>&1
+}
+
 # _land_state_refusal <tid> <task-json> <force> -> rc0 + prints a plain refusal when the state forbids landing.
 _land_state_refusal() {
-  local tid="$1" tj="$2" force="$3" st
-  st="$(jq -r '.state // ""' <<<"$tj")"
+  local tid="$1" tj="$2" force="$3" st p
+  printf -v p '%q' "${4:-${plan:-<plan>}}"
+  st="$(_fl_jq -r '.state // ""' <<<"$tj")"
   case "$st" in
     running|verifying|done) return 1 ;;
     failed)
       [ "$force" = 1 ] && return 1
-      printf '%s failed (%s). Fix it and run it again (outsourcerer task retry %s), or, if you have checked the work yourself, land it anyway with: outsourcerer land %s --force' \
-        "$tid" "$(jq -r '.result // "no reason recorded"' <<<"$tj" | head -1 | cut -c1-160)" "$tid" "$tid" ;;
+      printf '%s failed (%s). Fix it and run it again (outsourcerer task retry %s --plan %s), or, if you have checked the work yourself, land it anyway with: outsourcerer land %s --plan %s --force' \
+        "$tid" "$(_fl_jq -r '.result // "no reason recorded"' <<<"$tj" | head -1 | cut -c1-160)" "$tid" "$p" "$tid" "$p" ;;
     held)
-      printf '%s is on hold (%s). Settle it first: outsourcerer task release %s --answer "..." (add --done if the work is ready), then land again' \
-        "$tid" "$(jq -r '.hold.reason // "no reason recorded"' <<<"$tj" | head -1 | cut -c1-160)" "$tid" ;;
-    canceled) printf '%s was canceled; retry it first if you still want it (outsourcerer task retry %s)' "$tid" "$tid" ;;
-    todo) printf '%s has not run yet; start it first (outsourcerer task start %s)' "$tid" "$tid" ;;
+      printf '%s is on hold (%s). Settle it first: outsourcerer task release %s --plan %s --answer "..." (add --done if the work is ready), then land again' \
+        "$tid" "$(_fl_jq -r '.hold.reason // "no reason recorded"' <<<"$tj" | head -1 | cut -c1-160)" "$tid" "$p" ;;
+    canceled) printf '%s was canceled; retry it first if you still want it (outsourcerer task retry %s --plan %s)' "$tid" "$tid" "$p" ;;
+    todo) printf '%s has not run yet; start it first (outsourcerer task start %s --plan %s)' "$tid" "$tid" "$p" ;;
     *) printf '%s is in state "%s", which is not one land can start from' "$tid" "$st" ;;
   esac
   return 0
@@ -477,6 +568,7 @@ usage: outsourcerer land <task-id|job-id> [--plan P] [--check CMD | --no-check] 
   --pr           push the branch and open a pull request instead of moving BRANCH
   --dry-run      do every step in scratch, but leave BRANCH, the task and its evidence untouched
   --force        land a task that is marked failed (never a held or canceled one)
+  Task delivery: pr acts as --pr; branch verifies and records the branch without merging.
 EOF2
 }
 
@@ -509,10 +601,11 @@ _land_run() {
   if [ "$nocheck" = 1 ]; then check=""; check_set=1; fi
 
   local mode plan="" tid="" jid="" tj="" wt="" branch="" base="" title="" repo="" evf="" ev_dir="" pd=""
+  local deliver=local _LAND_ATTEMPT="" intent="" retry_hint=""
   case "$target" in
     t[0-9]*) mode=task ;;
     *) case "$target" in */*|*..*) die "land: '$target' is not a task or job id" ;; esac
-       [ -d "$OSRC_JOBS/$target" ] || die "land: no task or job named '$target' (tasks look like t3; see: outsourcerer task ls)"
+       [ -d "$OSRC_JOBS/$target" ] || die "land: no task or job named '$target' (tasks look like t3; see: outsourcerer task ls --plan $(printf %q "${plan_arg:-<plan>}"))"
        mode=job ;;
   esac
 
@@ -521,32 +614,38 @@ _land_run() {
     plan="$(_plan_resolve ${plan_arg:+"$plan_arg"})" || exit 1
     [ -n "$plan" ] || die "land: no plan given and no current plan set (use --plan or: outsourcerer plan use <name>)"
     tid="$target"
-    tj="$(_task_get "$plan" "$tid" 2>/dev/null)" || die "land: there is no task $tid in plan $plan (see: outsourcerer task ls)"
+    tj="$(_task_get "$plan" "$tid" 2>/dev/null)" || die "land: there is no task $tid in plan $plan (see: outsourcerer task ls --plan $(printf %q "$plan"))"
+    _LAND_ATTEMPT="$(printf '%s' "$tj" | _land_attempt)"
+    deliver="$(_fl_jq -r '.deliver // "local"' <<<"$tj")"
+    [ "$deliver" = pr ] && pr=1
+    [ "$pr" = 1 ] && deliver=pr
+    intent="$(_fl_jq -c '.land_intent // empty' <<<"$tj")"
+    retry_hint="outsourcerer land $tid --plan $(printf %q "$plan")"
     pd="$(_plan_dir "$plan")"; ev_dir="$pd/tasks/$tid"; evf="$ev_dir/evidence.json"
     local shape landed refusal
-    shape="$(jq -r '.shape // "ship"' <<<"$tj")"
-    landed="$(jq -r '.landed // false' <<<"$tj")"
+    shape="$(_fl_jq -r '.shape // "ship"' <<<"$tj")"
+    landed="$(_fl_jq -r '.landed // false' <<<"$tj")"
     [ "$shape" = scout ] && die "land: $tid is a scout task; it produces a report, not code, so there is nothing to merge"
-    [ "$landed" = true ] && { echo "$tid is already landed ($(jq -r '.landed_sha // "" | .[0:12]' <<<"$tj") on $(jq -r '.landed_into // "?"' <<<"$tj")); nothing to do."; return 0; }
-    refusal="$(_land_state_refusal "$tid" "$tj" "$force")" && die "land: not landing $plan/$tid. $refusal."
-    jid="$(jq -r '.job // ""' <<<"$tj")"
-    wt="$(jq -r '.worktree // ""' <<<"$tj")"; branch="$(jq -r '.branch // ""' <<<"$tj")"
-    base="$(jq -r '.base_sha // ""' <<<"$tj")"; title="$(jq -r '.title // ""' <<<"$tj")"
-    [ "$check_set" = 1 ] || check="$(jq -r '.check // ""' <<<"$tj")"
-    repo="$(jq -r '.repo // ""' "$pd/plan.json" 2>/dev/null)"
-    [ -n "$into" ] || into="$(jq -r '.base_branch // ""' "$pd/plan.json" 2>/dev/null)"
+    [ "$landed" = true ] && { echo "$tid is already landed ($(_fl_jq -r '.landed_sha // "" | .[0:12]' <<<"$tj") on $(_fl_jq -r '.landed_into // "?"' <<<"$tj")); nothing to do."; return 0; }
+    jid="$(_fl_jq -r '.job // ""' <<<"$tj")"
+    wt="$(_fl_jq -r '.worktree // ""' <<<"$tj")"; branch="$(_fl_jq -r '.branch // ""' <<<"$tj")"
+    base="$(_fl_jq -r '.base_sha // ""' <<<"$tj")"; title="$(_fl_jq -r '.title // ""' <<<"$tj")"
+    [ "$check_set" = 1 ] || check="$(_fl_jq -r '.check // ""' <<<"$tj")"
+    repo="$(_fl_jq -r '.repo // ""' "$pd/plan.json" 2>/dev/null)"
+    [ -n "$into" ] || into="$(_fl_jq -r '.base_branch // ""' "$pd/plan.json" 2>/dev/null)"
   else
     [ "$force" = 1 ] && die "land: --force only applies to a plan task marked failed, not to a bare job"
     [ "$check_set" = 1 ] || die "land: a bare job has no check of its own. Pass --check \"<cmd>\" to verify it (or --no-check to land it unverified, on purpose)."
     jid="$target"; ev_dir="$OSRC_JOBS/$jid"; evf="$ev_dir/evidence.json"
+    retry_hint="outsourcerer land $(printf %q "$jid") --check $(printf %q "$check")"
     local wj="$OSRC_JOBS/$jid/worktree.json"
     [ -f "$wj" ] || die "land: job $jid did not run in its own worktree, so there is no branch to land (launch it with --worktree)"
-    title="$(jq -r '.task_summary // .task // ""' "$OSRC_JOBS/$jid/meta.json" 2>/dev/null | head -1 | cut -c1-72)"
+    title="$(_fl_jq -r '.task_summary // .task // ""' "$OSRC_JOBS/$jid/meta.json" 2>/dev/null | head -1 | cut -c1-72)"
   fi
   if [ -n "$jid" ] && [ -f "$OSRC_JOBS/$jid/worktree.json" ]; then
-    [ -n "$wt" ] || wt="$(jq -r '.path // ""' "$OSRC_JOBS/$jid/worktree.json")"
-    [ -n "$branch" ] || branch="$(jq -r '.branch // ""' "$OSRC_JOBS/$jid/worktree.json")"
-    [ -n "$base" ] || base="$(jq -r '.base_sha // ""' "$OSRC_JOBS/$jid/worktree.json")"
+    [ -n "$wt" ] || wt="$(_fl_jq -r '.path // ""' "$OSRC_JOBS/$jid/worktree.json")"
+    [ -n "$branch" ] || branch="$(_fl_jq -r '.branch // ""' "$OSRC_JOBS/$jid/worktree.json")"
+    [ -n "$base" ] || base="$(_fl_jq -r '.base_sha // ""' "$OSRC_JOBS/$jid/worktree.json")"
   fi
   [ -n "$wt" ] || die "land: no worktree is on record for $target, so there is nothing to merge"
   case "$wt" in *'..'*) die "land: refusing a worktree path containing '..': $wt" ;; esac
@@ -578,6 +677,46 @@ _land_run() {
   fi
   # The previous land record, read BEFORE the done check rewrites the evidence file.
   local prev_land=""; [ -s "$evf" ] && prev_land="$(jq -c '.land // empty' "$evf" 2>/dev/null)"
+  if [ "$mode" = job ] && [ -s "$evf" ]; then intent="$(_fl_jq -c '.land_intent // empty' "$evf")"; fi
+
+  # Recover a completed ref move before re-running checks or rejecting a later cancellation.
+  # The receipt describes work already published, so preserve any intervening task state.
+  local receipt_sha="" receipt_head="" recorded_head="" receipt_tip=""
+  if [ -n "$intent" ] && [ "$pr" = 0 ] && [ "$deliver" = local ]; then
+    receipt_sha="$(_fl_jq -r --arg i "$into" 'if .target == $i then .merged_sha // "" else "" end' <<<"$intent")"
+    receipt_head="$(_fl_jq -r '.verified_head // ""' <<<"$intent")"
+    if [ "$mode" = task ]; then recorded_head="$(_fl_jq -r '.head_sha // ""' <<<"$tj")"
+    else recorded_head="$(_fl_jq -r '.head_sha // ""' "$evf")"; fi
+    if [ -n "$receipt_sha" ] && [ -n "$receipt_head" ] && [ "$receipt_head" = "$recorded_head" ]; then
+      _LAND_ROOT="$root"; _LAND_IWT=""; _LAND_LOCK=""
+      trap '_land_cleanup' EXIT
+      trap 'exit 130' INT TERM
+      _land_lock_acquire "$root" "recover land $label into $into" || exit 1
+      [ "$dry" = 1 ] || _land_prune_stale "$root"
+      receipt_tip="$(git -C "$root" rev-parse "refs/heads/$into")"
+      if git -C "$root" merge-base --is-ancestor "$receipt_sha" "$receipt_tip" 2>/dev/null \
+        && git -C "$root" merge-base --is-ancestor "$receipt_head" "$receipt_sha" 2>/dev/null; then
+        if [ "$dry" = 0 ]; then
+          _land_record "$evf" "$(_fl_jq -cn --arg i "$into" --arg h "$receipt_head" --arg m "$receipt_sha" \
+            '{into:$i,head_sha:$h,merged_sha:$m,verdict:"landed",reconciled:true}')" || die "land: could not reconcile evidence; run $retry_hint again"
+          if [ "$mode" = task ]; then
+            _task_update "$plan" "$tid" \
+              "if ([.attempt_token // \"\", .job // \"\", .worktree // \"\", .branch // \"\", .base_sha // \"\", .attempts // 0] == \$owner)
+               then .landed=true | .landed_sha=\$m | .landed_into=\$i | del(.land_error, .land_error_at)
+                 | (if $_LAND_OK_JQ then .state=\"done\" else . end) else error(\"attempt changed\") end" \
+              --argjson owner "$_LAND_ATTEMPT" --arg m "$receipt_sha" --arg i "$into" --arg force "$force" >/dev/null \
+              || die "land: could not reconcile task receipt; run $retry_hint again"
+          fi
+        fi
+        echo "$label is already contained in $into by an earlier land; recovered its landing receipt (dry-run=$dry)."
+        return 0
+      fi
+      _land_lock_release
+    fi
+  fi
+  if [ "$mode" = task ]; then
+    refusal="$(_land_state_refusal "$tid" "$tj" "$force" "$plan")" && die "land: not landing $label. $refusal."
+  fi
 
   # ---- 1. Done contract (outside the queue lock). Evaluated in THIS shell: the head it verified
   #         stays in a private variable, so a concurrent write to evidence.json can't swap what we
@@ -594,7 +733,10 @@ _land_run() {
     _factory_gate_reset
     if _factory_gate_ship "$wt" "$base" "$jid" "$check" "$out_dir"; then
       if [ "$dry" = 0 ]; then
-        _fl_write_json "$evf" "$(_factory_evidence_json "$jid" ship "$jid" done "$_FG_REASON")" \
+        local job_evidence
+        job_evidence="$(_factory_evidence_json "$jid" ship "$jid" done "$_FG_REASON")"
+        if [ -n "$intent" ]; then job_evidence="$(_fl_jq --argjson receipt "$intent" '.land_intent=$receipt' <<<"$job_evidence")"; fi
+        _fl_write_json "$evf" "$job_evidence" \
           || die "land: could not save the evidence to $evf; fix the folder's permissions, then run land again"
       fi
       reason="$jid done: $_FG_REASON"
@@ -610,6 +752,23 @@ _land_run() {
     || die "land: the verified commit ${head:0:12} is not in $root; run land again"
   echo "[land] $reason" >&2
 
+  if [ "$mode" = task ]; then
+    _land_assert_current "$plan" "$tid" "$force" "$head"
+    if [ "$deliver" = branch ]; then
+      [ "$(git -C "$root" rev-parse "refs/heads/$branch" 2>/dev/null)" = "$head" ] \
+        || die "land: branch $branch no longer points at the verified head; run $retry_hint again"
+      if [ "$dry" = 0 ]; then
+        _task_update "$plan" "$tid" \
+          "if $_LAND_OK_JQ and ([.attempt_token // \"\", .job // \"\", .worktree // \"\", .branch // \"\", .base_sha // \"\", .attempts // 0] == \$owner)
+           then .delivered=\"branch\" | .delivered_branch=\$b | .delivered_head=\$h | .state=\"done\" | del(.land_error, .land_error_at)
+           else error(\"task changed\") end" --argjson owner "$_LAND_ATTEMPT" --arg force "$force" --arg b "$branch" --arg h "$head" \
+          >/dev/null || die "land: task changed before recording branch delivery; run $retry_hint again"
+      fi
+      echo "verified branch $branch for $label at ${head:0:12}; delivery mode branch leaves $into untouched (dry-run=$dry)."
+      return 0
+    fi
+  fi
+
   # ---- 2. The merge queue (per-repo lock) ----
   _LAND_ROOT="$root"; _LAND_IWT=""; _LAND_LOCK=""
   trap '_land_cleanup' EXIT
@@ -618,8 +777,7 @@ _land_run() {
   _land_prune_stale "$root"
   # The task may have been held or canceled while we waited in the queue.
   if [ "$mode" = task ]; then
-    tj="$(_task_get "$plan" "$tid" 2>/dev/null)" || die "land: task $tid disappeared from plan $plan; nothing was changed"
-    refusal="$(_land_state_refusal "$tid" "$tj" "$force")" && die "land: not landing $label. $refusal. Nothing was changed."
+    _land_assert_current "$plan" "$tid" "$force" "$head"
     [ "$dry" = 1 ] || { type _task_event >/dev/null 2>&1 && _task_event "$plan" "$tid" land_started "into $into" >/dev/null 2>&1; }
   fi
   local busy; busy="$(_land_branch_busy "$root" "$into")"
@@ -628,7 +786,7 @@ _land_run() {
   local before; before="$(git -C "$root" rev-parse "refs/heads/$into")"
   if git -C "$root" merge-base --is-ancestor "$head" "$before" 2>/dev/null; then
     if ! _land_contained_via_land "$prev_land" "$into" "$head" "$root" "$plan"; then
-      die "land: not landing $label. Its commit ${head:0:12} is already in $into, but it did not get there through land, so the merged result was never checked by the gate. Check $into yourself; if it is good, mark the task with: outsourcerer task done ${tid:-<task>} --force. Nothing was changed."
+      die "land: not landing $label. Its commit ${head:0:12} is already in $into, but it did not get there through land, so the merged result was never checked by the gate. Check $into yourself; if it is good, mark the task with: outsourcerer task done ${tid:-<task>} --plan $(printf %q "${plan:-<plan>}") --force. Nothing was changed."
     fi
     echo "$label is already contained in $into (${before:0:12}) by an earlier land; nothing to merge."
     if [ "$mode" = task ] && [ "$dry" = 0 ] && [ "$pr" = 0 ]; then
@@ -676,18 +834,15 @@ _land_run() {
       --arg mode "$( [ "$dry" = 1 ] && echo dry-run || echo merge)" \
       '{into:$into,target_before:$before,head_sha:$head,verdict:"conflict",conflicts:($files|split(" ")|map(select(.!=""))),mode:$mode,ts:$ts}')"
     _land_record "$rec_evf" "$land_json"
-    local hwhy="merge conflict with $into: ${conf:-unknown files}; rebase the task branch or retry" held=0
+    local hwhy="merge conflict with $into: ${conf:-unknown files}; rebase the task branch or retry"
     if [ "$mode" = task ] && [ "$dry" = 0 ]; then
-      # Held, not left running: the scheduler must not keep retrying a land that can only conflict.
-      FACTORY_EVENT_NOTE="$hwhy" _task_update "$plan" "$tid" \
-        "if $_LAND_OK_JQ then .state=\"held\" | .hold=((.hold // {}) + {reason:\$r, until:\"\", answer:\"\"}) | .result=\$r else error(\"state changed\") end" \
-        --arg r "$hwhy" --arg force "$force" >/dev/null 2>&1 && held=1
+      _land_error "$plan" "$tid" "$hwhy"
       type _task_event >/dev/null 2>&1 && _task_event "$plan" "$tid" land_conflict "${conf:-unknown files}" >/dev/null 2>&1
     elif [ "$mode" = job ] && [ "$dry" = 0 ]; then
       _land_wake "$label" "land $label: merge conflict with $into"
     fi
-    if [ "$held" = 1 ]; then
-      die "land: not landed. ${branch:-$label} conflicts with $into in: ${conf:-unknown files}. $tid is now held. Rebase the branch onto $into in $wt and commit, then: outsourcerer task release $tid --done --answer \"rebased\" and land again. Or let a worker redo it: outsourcerer task release $tid --answer \"rebase onto $into and resolve the conflict\". $into is untouched."
+    if [ "$mode" = task ]; then
+      die "land: not landed. ${branch:-$label} conflicts with $into in: ${conf:-unknown files}. Rebase the branch onto $into in $wt and commit, then run $retry_hint (flow reviews must approve the new revision first). $into is untouched."
     fi
     die "land: not landed. ${branch:-$label} conflicts with $into in: ${conf:-unknown files}. Bring the branch up to date with $into, then land again. $into is untouched."
   fi
@@ -704,11 +859,16 @@ _land_run() {
   fi
   _FG_CHECK_RC=""; _FG_SIG=""; _FG_TAIL=""
   local crc=0 cverdict="none"
-  if [ -n "$setup" ] && [ "$src" != 0 ]; then
+  if [ "$(git -C "$_LAND_IWT" rev-parse HEAD 2>/dev/null)" != "$merged" ] || ! _crew_worktree_clean "$_LAND_IWT"; then
+    cverdict=tree_changed
+  elif [ -n "$setup" ] && [ "$src" != 0 ]; then
     cverdict="setup_failed"
   elif [ -n "$check" ]; then
     _factory_check_run "$_LAND_IWT" "$check" "$out_dir/land-check.out"; crc=$?
     if [ "$crc" = 0 ]; then cverdict="pass"; else cverdict="fail"; fi
+  fi
+  if [ "$(git -C "$_LAND_IWT" rev-parse HEAD 2>/dev/null)" != "$merged" ] || ! _crew_worktree_clean "$_LAND_IWT"; then
+    cverdict=tree_changed
   fi
   now_ts="$(_fl_now)"
   local lmode; if [ "$dry" = 1 ]; then lmode="dry-run"; elif [ "$pr" = 1 ]; then lmode="pr"; else lmode="ff"; fi
@@ -721,8 +881,14 @@ _land_run() {
         verdict:$verdict,mode:$mode,ts:$ts} + (if $pr=="" then {} else {pr_url:$pr} end)
         + (if $setup=="" then {} else {setup:($setup|fromjson)} end)'
   }
+  if [ "$cverdict" = tree_changed ]; then
+    _land_record "$rec_evf" "$(_land_json tree_changed)"
+    [ "$mode" = task ] && [ "$dry" = 0 ] && _land_error "$plan" "$tid" "setup or check changed HEAD or tracked files"
+    die "land: setup or check changed HEAD or tracked files in the merged result; $into is untouched. Fix the command, then run ${retry_hint:-land again}."
+  fi
   if [ "$cverdict" = setup_failed ]; then
     _land_record "$rec_evf" "$(_land_json setup_failed)"
+    [ "$mode" = task ] && [ "$dry" = 0 ] && _land_error "$plan" "$tid" "setup failed (exit $src)"
     [ "$mode" = job ] && [ "$dry" = 0 ] && _land_wake "$label" "land $label: the setup command failed"
     echo "[land] last lines of the setup:" >&2; printf '%s\n' "$stail" | tail -n 8 >&2
     die "land: not landed. The --setup command failed (exit $src) in the scratch checkout of the merged result: $setup. Fix the command (it runs in a clean checkout with no untracked files), then land again. $into is untouched; output in $out_dir/land-setup.out."
@@ -732,17 +898,16 @@ _land_run() {
     local why="merge breaks check"
     case "$crc" in 124) why="merge breaks check (the check timed out)" ;; 125) why="merge breaks check (the check could not start)" ;; esac
     if [ "$mode" = task ] && [ "$dry" = 0 ]; then
-      FACTORY_EVENT_NOTE="$why" _task_update "$plan" "$tid" \
-        "if $_LAND_OK_JQ then .state=\"failed\" | .result=\$r else error(\"state changed\") end" \
-        --arg r "$why" --arg force "$force" >/dev/null 2>&1 || true
+      _land_error "$plan" "$tid" "$why"
       type _task_event >/dev/null 2>&1 && _task_event "$plan" "$tid" land_failed "$why" >/dev/null 2>&1
+      _land_wake "$label" "land $label: $why on $into"
     elif [ "$mode" = job ] && [ "$dry" = 0 ]; then
       _land_wake "$label" "land $label: $why on $into"
     fi
     echo "[land] last lines of the check:" >&2; printf '%s\n' "${_FG_TAIL:-}" | tail -n 8 >&2
     local sh_hint=" If it fails only because something is missing there (node_modules, .venv, build output), add --setup \"<install command>\"."
     [ -n "$setup" ] && sh_hint=""
-    die "land: not landed. After merging into $into the check fails (exit $crc): $check. The check runs in a clean checkout of the merged result, with none of the untracked files from the worker's worktree.$sh_hint $into is untouched; details in $out_dir/land-check.out."
+    die "land: not landed. After merging into $into the check fails (exit $crc): $check. The check runs in a clean checkout of the merged result, with none of the untracked files from the worker's worktree.$sh_hint $into is untouched; details in $out_dir/land-check.out. Fix the check, then run ${retry_hint:-land again}."
   fi
   local cnote="the check passed on the merged result"; [ "$cverdict" = none ] && cnote="no check set, merged result not re-verified"
 
@@ -758,16 +923,21 @@ _land_run() {
     have gh || die "land --pr needs the GitHub CLI (gh); install it, or land without --pr"
     [ -n "$branch" ] || die "land --pr: no branch name is on record to push"
     git -C "$root" remote get-url origin >/dev/null 2>&1 || die "land --pr: this repo has no 'origin' remote to push to"
+    [ "$mode" = task ] && _land_assert_current "$plan" "$tid" "$force" "$head"
     git -C "$root" push -q origin "$head:refs/heads/$branch" >/dev/null 2>&1 \
       || die "land --pr: could not push $branch to origin; check your access, then run land --pr again"
     local body url
     body="$(printf 'Landed by outsourcerer.\n\n- work: %s\n- head: %s\n- %s (merged against %s at %s)\n' "$label" "$head" "$cnote" "$into" "${before:0:12}")"
+    [ "$mode" = task ] && _land_assert_current "$plan" "$tid" "$force" "$head"
     url="$(cd "$root" && gh pr create --base "$into" --head "$branch" --title "$msg" --body "$body" 2>&1)" \
       || die "land --pr: gh could not open the pull request: $(printf '%s' "$url" | tail -1)"
     url="$(printf '%s\n' "$url" | grep -Eo 'https?://[^[:space:]]+' | tail -1)"
     _land_record "$evf" "$(_land_json pr_opened "$url")"
     if [ "$mode" = task ]; then
-      _task_update "$plan" "$tid" '.pr=$u' --arg u "$url" >/dev/null 2>&1 || true
+      _task_update "$plan" "$tid" \
+        'if ([.attempt_token // "", .job // "", .worktree // "", .branch // "", .base_sha // "", .attempts // 0] == $owner)
+         then .pr=$u | del(.land_error, .land_error_at) else error("attempt changed") end' \
+        --argjson owner "$_LAND_ATTEMPT" --arg u "$url" >/dev/null 2>&1 || true
       type _task_event >/dev/null 2>&1 && _task_event "$plan" "$tid" pr_opened "$url" >/dev/null 2>&1
     fi
     echo "opened a pull request for $label into $into: ${url:-?} ($cnote). $into was not moved."
@@ -777,15 +947,26 @@ _land_run() {
   # ---- 5c. Fast-forward the target, never clobbering a checkout ----
   # Last look before anything moves: the task's state, the target's tip, and any rebase/bisect.
   if [ "$mode" = task ]; then
-    tj="$(_task_get "$plan" "$tid" 2>/dev/null)" || die "land: task $tid disappeared from plan $plan; nothing was changed"
-    refusal="$(_land_state_refusal "$tid" "$tj" "$force")" \
-      && die "land: not landing $label. $refusal (it changed while landing). $into is untouched."
+    _land_assert_current "$plan" "$tid" "$force" "$head"
   fi
   local now_tip; now_tip="$(git -C "$root" rev-parse "refs/heads/$into")"
   [ "$now_tip" = "$before" ] || die "land: $into moved while landing (now ${now_tip:0:12}); nothing was changed, run land again"
   busy="$(_land_branch_busy "$root" "$into")"
   [ -z "$busy" ] || die "land: $into is in the middle of $busy. Finish or abort it there (git rebase --continue/--abort, or git bisect reset), then run land again. Nothing was changed."
   co="$(_land_checkout_of "$root" "$into")"
+  intent="$(_fl_jq -cn --arg t "$into" --arg h "$head" --arg m "$merged" --arg ts "$(_fl_now)" \
+    '{target:$t,verified_head:$h,merged_sha:$m,ts:$ts}')"
+  if [ "$mode" = task ]; then
+    _task_update "$plan" "$tid" \
+      "if $_LAND_OK_JQ and ([.attempt_token // \"\", .job // \"\", .worktree // \"\", .branch // \"\", .base_sha // \"\", .attempts // 0] == \$owner)
+       then .land_intent=\$receipt else error(\"task changed\") end" \
+      --argjson owner "$_LAND_ATTEMPT" --argjson receipt "$intent" --arg force "$force" >/dev/null \
+      || die "land: could not persist landing receipt; $into is untouched"
+  else
+    _fl_write_json "$evf" "$(_fl_jq --argjson receipt "$intent" '.land_intent=$receipt' "$evf")" \
+      || die "land: could not persist landing receipt; $into is untouched"
+  fi
+  [ "$mode" = task ] && _land_assert_current "$plan" "$tid" "$force" "$head"
   if [ -z "$co" ]; then
     git -C "$root" update-ref -m "$msg" "refs/heads/$into" "$merged" "$before" >/dev/null 2>&1 \
       || die "land: could not move $into (it changed underneath us); nothing was changed, run land again"
@@ -804,10 +985,10 @@ _land_run() {
   if [ "$mode" = task ]; then
     # The code IS on the target now, so landed is always recorded; the state only moves to done
     # from a state land may finish (a hold/cancel that slipped in after the last look is kept).
-    _task_update "$plan" "$tid" ".landed=true | .landed_sha=\$m | .landed_into=\$i | .evidence=\$e | (if $_LAND_OK_JQ then .state=\"done\" else . end)" \
+    _task_update "$plan" "$tid" ".landed=true | .landed_sha=\$m | .landed_into=\$i | .evidence=\$e | del(.land_error, .land_error_at) | (if $_LAND_OK_JQ then .state=\"done\" else . end)" \
       --arg m "$merged" --arg i "$into" --arg e "$evf" --arg force "$force" >/dev/null 2>&1 || true
     type _task_event >/dev/null 2>&1 && _task_event "$plan" "$tid" landed "$into at ${merged:0:12}" >/dev/null 2>&1
-    local fst; fst="$(_task_get "$plan" "$tid" 2>/dev/null | jq -r '.state // ""')"
+    local fst; fst="$(_task_get "$plan" "$tid" 2>/dev/null | _fl_jq -r '.state // ""')"
     [ "$fst" = done ] || echo "[land] note: $tid became $fst while landing; its code is on $into now, so it is marked landed but its state was left as $fst." >&2
   fi
   echo "landed $label on $into at ${merged:0:12} (merge of ${head:0:12}); $cnote."
@@ -820,5 +1001,5 @@ _land_record() {
   [ -s "$evf" ] && cur="$(cat "$evf" 2>/dev/null)"
   printf '%s' "$cur" | jq -e . >/dev/null 2>&1 || cur="{}"
   _fl_write_json "$evf" "$(jq -cn --argjson c "$cur" --argjson l "$2" '$c + {land:$l}')" \
-    || echo "warning: could not record the land result in $evf" >&2
+    || { echo "warning: could not record the land result in $evf" >&2; return 1; }
 }
