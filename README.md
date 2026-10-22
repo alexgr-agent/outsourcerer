@@ -116,7 +116,7 @@ The models don't think alike, so Outsourcerer doesn't prompt them alike. The rig
 - **Find the cheap seats.** Ask what's free or cheap right now across your platforms (`suggest`). It reads each catalog live, so it keeps up as new models drop (a fresh free model on Devin or OpenRouter shows up on its own).
 - **See what you're saving.** The **Tab** shows real spend vs your frontier model, per lane.
 - **Run a whole build as a plan.** Steps with dependencies, handed from worker to worker with the context each one needs, checked against a done contract and landed through a merge gate. *(Its own section below.)*
-- **Keep a model out of visible routing choices.** `exclude add <model>` blocks matching explicit requests and automatic text-model choices. Unobservable engine defaults and automatic image-backend selection are outside that guarantee.
+- **Ban a model for good.** `exclude add fable` and it is never picked again, by you or by the router. (It can't see a model an engine picks silently on its own.)
 
 All of it in plain language. The commands underneath are the sorcerer's, not yours.
 
@@ -160,11 +160,11 @@ And stopping early is not a dead end. It keeps the task, the check, and the exac
 
 Big jobs are a chain of steps: map the code, decide the approach, build it, review it, merge it. Keep that chain in one chat and it is gone the moment the session ends. Outsourcerer keeps it on disk as a **plan**, so the work survives the session and anyone can pick it up.
 
-- **Context travels on its own.** Each worker gets a brief with its spec when supplied, bounded results from direct dependencies, and decisions on those dependencies or its own task.
-- **"Done" has a checkable contract.** A code task needs commits on a named branch, a passing check when one is configured, and a clean secret scan. Checks are optional; research tasks need a report and skip shell checks.
+- **Every worker starts briefed.** It gets the spec, what the steps before it found, and the calls you made along the way.
+- **"Done" means proven.** A worker saying it's finished doesn't count. Code needs real commits, your test passing and a clean secret scan, and the proof is saved.
 - **Your decisions are part of the plan.** "Pick the winner" or "approve this migration" becomes a held step that waits for you, then passes your answer downstream.
-- **Merges wait their turn.** Finished work lands one change at a time, configured checks re-run on the merged result, and local changes are protected. A clean checkout of the target branch can be advanced.
-- **Ready-made shapes.** `council-build`, `spec-build` and `best-of-n` set up a whole plan in one line.
+- **Merges wait their turn.** Work lands one change at a time, your tests run again on the merged result, and your uncommitted edits are never touched.
+- **Ready-made shapes.** `council-build` (advisors plan, one model builds, another reviews), `spec-build`, and `best-of-n` (several try, best one wins) set up a whole plan in one line.
 
 ```bash
 outsourcerer plan new rate-limit --repo .
@@ -336,7 +336,7 @@ The model alias picks the lane automatically; `--provider` selects a different b
 | `doctor` / `models` | health check + live model list |
 | `parity` / `parity-codex` / `parity-hermes` | mirror into Devin/Antigravity/Hermes; reverse-bridge into Codex/Droid/Cursor |
 | `plan` / `task` / `flow` / `land` | the software factory: durable plans, task hand-off, ready-made flows, the merge gate |
-| `exclude` | block matching visible model choices; engine defaults and automatic image backends have limits |
+| `exclude` | ban a model or a whole family from every pick |
 
 **Lanes:** `hy3`/`glm-5.2`/`deepseek-*` (OpenRouter, via `cc` or `codex`) ·
 `sol`/`terra`/`luna` (Codex native) · `fable`/`opus`/`sonnet`/`haiku` (Claude native) ·
