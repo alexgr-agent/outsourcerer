@@ -226,7 +226,6 @@ wait
   && git -C "$REPO" merge-base --is-ancestor "$(git -C "$(wt_of t13)" rev-parse HEAD)" main \
   && git -C "$REPO" merge-base --is-ancestor "$(git -C "$(wt_of t14)" rev-parse HEAD)" main \
   && ok "land: two concurrent lands serialize and both land" || bad "concurrent lands (r13=$(cat "$TMP/r13") r14=$(cat "$TMP/r14") seq=$(tr -d '\n' < "$TMP/seq"))"
-cat "$TMP/o13" "$TMP/o14" | grep -q 'waiting in the merge queue' && ok "land: the waiter says who holds the queue" || bad "no waiting message"
 
 # ---------------- lock: live holder times out; dead holder is reclaimed ----------------
 LK="$(OSRC_HOME="$ST" bash "$TMP/driver.sh" _land_lock_dir "$(cd "$REPO" && pwd -P)")"
@@ -236,6 +235,10 @@ mkdir -p "$LK"; printf '%s %s\n' "$live" "$(OSRC_HOME="$ST" bash "$TMP/driver.sh
 out="$(OSRC_LAND_LOCK_WAIT=2 drv cmd_land t15 2>&1)"; rc=$?
 [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'gave up after 2s' && [ "$(tfield t15 .landed)" != true ] \
   && ok "land: bounded wait on a live holder, clear timeout" || bad "lock timeout (rc=$rc out=$out)"
+# The waiting line is checked here, against a holder that is provably live for the whole wait, so
+# it can't depend on how two real lands happen to interleave on a loaded machine.
+printf '%s' "$out" | grep -q 'waiting in the merge queue: land other is merging' \
+  && ok "land: the waiter says who holds the queue" || bad "no waiting message (out=$out)"
 kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
 out="$(OSRC_LAND_LOCK_WAIT=5 drv cmd_land t15 2>&1)"; rc=$?
 [ "$rc" = 0 ] && [ "$(tfield t15 .landed)" = true ] && [ ! -d "$LK" ] && ok "land: a dead holder's lock is reclaimed" || bad "stale lock reclaim (rc=$rc out=$out)"
