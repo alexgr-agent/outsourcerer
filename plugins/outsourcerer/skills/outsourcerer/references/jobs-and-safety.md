@@ -1,11 +1,23 @@
 # Jobs and safety
 
 Background job mechanics, the liveness watchdog, exit codes, stall/kill/timeout windows, and the
-orchestration rules that govern how Claude drives jobs once dispatched.
+orchestration rules that govern how you drive jobs once dispatched.
+
+## Contents
+
+- Liveness + background jobs
+- Post-hoc classification (`classify`)
+- Cloud gate + one-time consent
+- Plan-limit failover
+- Windows (Git Bash, no WSL)
+- Orchestration rules while this skill is active
+- Watch what you launch, and report on a clock
+- `fleet`: one view of every session
+- Subcommand index and failure-state notes
 
 ## Liveness + background jobs (bg / status / watch / result / logs / cancel)
 
-Long offloads no longer die with the Bash tool. Dispatch anything expected to exceed ~60s as a
+Long offloads survive the Bash tool's timeout as background jobs. Dispatch anything expected to exceed ~60s as a
 **background job**; a supervisor watches byte-growth with tier-aware stall windows and enforces an
 exit contract. Job records live in `~/.outsourcerer/jobs/<id>/` (never temp).
 
@@ -37,8 +49,7 @@ a terminal state. Non-terminal flags while alive: `stalled?` (output silence pas
 `permission-blocked` · `interrupted` · `timeout` · `wedged` · `failed` · `canceled`. Three need
 distinct handling:
 - **`no-progress-writes` (alive, talking, wrote nothing).** The stall timers measure SILENCE, so a
-  model that streams reasoning for 15 minutes while writing no file trips none of them (incident:
-  two ~17-min zero-write burns on an edit task, swapped by hand ~35 min in). The **zero-write
+  model that streams reasoning for 15 minutes while writing no file trips none of them. The **zero-write
   watchdog** tracks the no-write AGE instead: for a **write-expecting verb** (`edit`/`yolo`) that is
   alive and has produced no qualifying write (structured Write/Edit tool call, or a file newer than
   the job's `.startmark`) past `OSRC_NOPROGRESS_SECS` (default 600s; 0 disables), the job enters this
@@ -51,7 +62,7 @@ distinct handling:
   (`local`, `tokenrouter`; extend with `OSRC_TEXT_LANES`). Next step when you see it: steer the
   delegate to a concrete "write file X now" target, swap the model, or cancel; do not just wait.
 - **`permission-blocked` (exit 3, NOT the same as `blocked`).** A headless delegate hit a wall it can't
-  confirm interactively — repeated permission/sandbox denials, or a **devin print-mode hang**: in print
+  confirm interactively: repeated permission/sandbox denials, or a **devin print-mode hang**: in print
   mode (`-p`) devin can't answer a tool-exec-requires-confirmation prompt, so it rejects the tool and
   then goes silent forever. The supervisor detects devin's `chisel::repl::handler: Print mode:
   rejecting…` log line (tail-anchored, so an echo of that phrase in ordinary output never false-fires)
@@ -64,18 +75,18 @@ distinct handling:
   `permission-blocked:noninteractive-reject`) instead of `done?`. Edits made before the reject are
   kept, so `classify` still reports them as `REUSE-OUTPUT`; the step it was attempting did not run.
   Devin lane only. `OSRC_NO_PRINTMODE_ABORT=1` turns this mapping off too.
-  A devin `edit` prompt now says this up front: edits first, no test/build commands, end with the
+  A devin `edit` prompt says this up front: edits first, no test/build commands, end with the
   verification commands to run. Use `session` when the delegate itself must run tests.
   `OSRC_DEVIN_EDIT_NOTE=0` drops the note.
 - **`launching` that never reaches `running` → `failed` (stillborn).** The launcher detached but the
-  worker never wrote a process/log within the grace window (`OSRC_LAUNCH_GRACE`, default 45s) — usually a
+  worker never wrote a process/log within the grace window (`OSRC_LAUNCH_GRACE`, default 45s), usually a
   sandbox that reaps detached background jobs (e.g. running inside another agent's exec sandbox). `status`
   records an actionable reason; re-run in the foreground (`--wait`) or a shell that allows background
   processes. A stillborn/meta-less job still appears in `status --json` (never silently dropped).
 
 ## Post-hoc classification (classify)
 
-After a job terminates — especially a `wedged`/`timeout`/`failed` one — the orchestrator needs to
+After a job terminates, especially a `wedged`/`timeout`/`failed` one, the orchestrator needs to
 decide: is the output reusable, is the lane dead, or did nothing happen? `classify` answers that
 deterministically, reading the same job-dir artifacts the watchdog wrote:
 
@@ -96,29 +107,29 @@ carries the diagnostic for humans/logs:
 **Classification order** (strongest first):
 1. `done`/`done?` with a real deliverable in last.txt (not a refusal, not just routing preamble) → `REUSE-OUTPUT`.
 2. Lane-level block: quota/credit signature in out.log tail, or `permission-blocked` status → `RETRY-DIFFERENT-LANE`.
-3. False-stall: the watchdog killed it but it did work — commits between `.startmark` and `$jd/exit`, file writes in the same window, or a non-refusal last.txt → `REUSE-OUTPUT`.
+3. False-stall: the watchdog killed it but it did work, commits between `.startmark` and `$jd/exit`, file writes in the same window, or a non-refusal last.txt → `REUSE-OUTPUT`.
 4. None of the above → `REAL-FAIL`.
 
 **Bounded post-hoc window.** The false-stall FS/commit checks are bounded to the job's own runtime
-(`.startmark` to `$jd/exit` mtime). Without this bound, any write/commit after job termination — an
-orchestrator committing a fix, an editor autosave, a rerun's writes — would be counted as the
+(`.startmark` to `$jd/exit` mtime). Without this bound, any write/commit after job termination, an
+orchestrator committing a fix, an editor autosave, a rerun's writes, would be counted as the
 delegate's work. If `$jd/exit` is missing (stillborn job), the FS/commit checks are skipped entirely.
 
 **Quota scan scoping.** Scans only the tail of out.log (default 200 lines, `OSRC_CLASSIFY_TAIL`),
-with `>>> `-prefixed routing lines stripped, and is skipped entirely for `done`/`done?` jobs — a
+with `>>> `-prefixed routing lines stripped, and is skipped entirely for `done`/`done?` jobs, a
 completed job may mention "429" or "rate limit" in its output (a test report citing an upstream API)
 without that being the lane's quota refusal. The generic (non-Devin) regex is tightened to
 refusal-context forms to avoid matching prose.
 
 **Routing preamble stripping.** last.txt may contain only the routing preamble (`>>> [route]…`) if
 the delegate produced no output before being killed. `_strip_preamble` skips leading `>>> ` and
-blank lines (capped at `OSRC_PREAMBLE_MAX`, default 12 — the routing block is ~2-6 lines), then
+blank lines (capped at `OSRC_PREAMBLE_MAX`, default 12, the routing block is ~2-6 lines), then
 passes everything through verbatim. A pure-`>>>` transcript (Python REPL, doctests) survives because
 lines past the cap are preserved.
 
 **Print-mode detection.** The supervisor never writes a `reason` file for `permission-blocked` jobs
 (both abort paths write to stderr → out.log). `classify` scans out.log tail for `_printmode_needle`
-— the same assembled needle the runtime watchdog uses — to distinguish `wedge:print-mode-hang` from
+, the same assembled needle the runtime watchdog uses, to distinguish `wedge:print-mode-hang` from
 `wedge:permission-blocked`.
 
 ## Cloud gate + one-time consent
@@ -126,7 +137,7 @@ lines past the cap are preserved.
 Every cloud lane (devin/cc/codex/native/gemini/droid/cursor) runs two independent protections
 before dispatch; local ollama/lmstudio lanes skip both (nothing leaves the machine):
 
-1. **Secret-scan hard-block** — a real credential file in the delegated scope (`.env`, `id_rsa`,
+1. **Secret-scan hard-block**: a real credential file in the delegated scope (`.env`, `id_rsa`,
    `.aws/credentials`, nested variants) kills the run REGARDLESS of any consent. Runs on every
    single delegation, always. Not skippable by ack, consent file, or env.
 
@@ -139,7 +150,7 @@ before dispatch; local ollama/lmstudio lanes skip both (nothing leaves the machi
    ```
 
    When the current lane is trusted for the current repo, the credential-FILE block is skipped and the
-   disclosure banner says so, every time — a stood-down gate is the thing you most need to see named.
+   disclosure banner says so, every time: a stood-down gate is the thing you most need to see named.
    The prompt/`--with` pattern scan and the pasted-secret-VALUE block still run: trusting the
    credentials a repo already holds is a different decision from sending a live secret in a prompt.
    Default is empty, so an untouched install is exactly as strict as before. Paths resolve through
@@ -149,7 +160,7 @@ before dispatch; local ollama/lmstudio lanes skip both (nothing leaves the machi
    `--trust-lane <lane>` grants the same thing for a single invocation. It is deliberately not an
    environment variable: an exported grant is inherited by every background job and nested call, which
    would quietly widen trust far past the repo you had in mind.
-2. **Cloud disclosure consent** — "repo content leaves this machine" must be acknowledged ONCE per
+2. **Cloud disclosure consent**: "repo content leaves this machine" must be acknowledged ONCE per
    user, not once per run. Any explicit ack (interactive `y`, `--cloud-ack`, `OSRC_CLOUD_ACK=1`,
    or `consent grant`) is remembered in `~/.outsourcerer/cloud-consent`; from then on the
    disclosure banner still prints but nothing asks or refuses. `consent status|grant|revoke`
@@ -177,7 +188,7 @@ This usually means a sandboxed/corporate proxy that devin's Rust TLS client won'
 inside Claude Code's sandboxed Bash tool, re-run this call with the sandbox disabled for devin-backed verbs.
 ```
 
-This is diagnostics-only — it does not change retry, routing, fallback, or transport-vs-task
+This is diagnostics-only: it does not change retry, routing, fallback, or transport-vs-task
 classification. `doctor` proactively notes a `*_PROXY` env var when devin is installed. The hint
 flows through `delegate()` (foreground + bg, since the supervisor captures stderr into `out.log`)
 and is re-emitted by `result`/`logs` for a failed devin job when not already present.
@@ -225,12 +236,11 @@ from cmd/PowerShell and find Git Bash automatically. `session` uses the bundled 
 
 ## Orchestration rules while this skill is active
 
-(Mechanism detail for the "magic contract" in `SKILL.md`, read that first for *how* to
-talk to the user; this is *how* to run the plumbing once they've said yes.)
+`SKILL.md` covers how to talk to the user; this is how to run the plumbing once they've said yes.
 
-- Route **everything you would otherwise subagent** to the chosen Devin model via this script, instead of spawning Claude Task subagents.
-- Let Devin handle the parallelism, phrase tasks so it spawns its own subagents ("using parallel subagents, ...").
-- You (Claude) remain orchestrator: scope the task, read Devin's output, sanity-check correctness, and present the final result. Override or re-run on the chosen model if output is wrong.
+- Route **everything you would otherwise subagent** through this script to the chosen lane and model, instead of spawning Claude Task subagents.
+- On lanes that fan out internally (Devin, cc), phrase tasks so the delegate spawns its own subagents ("using parallel subagents, ..."); for separate jobs use `fanout`.
+- You remain the orchestrator: scope the task, read the delegate's output, sanity-check correctness, and present the final result. Override or re-run on another model if the output is wrong.
 - Surface the model used, the printed **tier**, and (for premium/native models) the cost implication.
 - Dispatch anything expected to exceed ~60s as `bg`, then poll `status <id>` on your own cadence
   (every 30-60s). Read `result <id>` only when state is `done`/`blocked`; never read `logs` into
@@ -246,43 +256,42 @@ talk to the user; this is *how* to run the plumbing once they've said yes.)
 - Prefer `second-opinion` for high-stakes factual/judgment calls; prefer `--with skills=…` over
   `OUTSOURCERER_LOADED=1` (least privilege, and it works on every provider).
 
-## Watch what you launch, and report on a clock (moved from SKILL.md)
+## Watch what you launch, and report on a clock
 
-**Every delegated run gets a watcher immediately, in the same turn you launch it, AND you report to the
-user on a ~2-minute cadence until it ends.** Continuous monitoring is not optional and not "when asked":
-turn it on the moment work starts. Every ~2 minutes (or when a state changes), post at least a one-line
+**Every delegated run gets a watcher immediately, in the same turn you launch it, and you report to the
+user on a ~2-minute cadence until it ends.** Turn monitoring on the moment work starts, not when asked. Every ~2 minutes (or when a state changes), post at least a one-line
 status covering **(1) what's happening now, (2) which model(s)/lane(s) are running, (3) which agent is on
-what**. Example: `⏳ 02:14 — GLM(devin) building the auth fix · Fable(cc) reviewing the diff · Sonnet(cc)
+what**. Example: `⏳ 02:14, GLM(devin) building the auth fix · Fable(cc) reviewing the diff · Sonnet(cc)
 mapping tests · all green, next check ~02:16`. A detached job nobody is observing is the failure this
 tool exists to prevent: it accepts the work, goes silent, and you find out it wedged an hour later.
-Launch, then `watch` — or `status` on that cadence if you are juggling several. Never launch and wander
+Launch, then `watch`, or `status` on that cadence if you are juggling several. Never launch and wander
 off. If you genuinely cannot watch it, say so to the user and cancel it rather than leaving it running blind.
 
 The tool enforces this from its side: a launch prints **NOW WATCH IT**, and any later invocation lists
 jobs that have been running with nobody looking. If you see that warning, you already made this mistake
-— watch or cancel before doing anything else. Watching is also what makes loops steerable: you cannot
+; watch or cancel before doing anything else. Watching is also what makes loops steerable: you cannot
 course-correct or kill a bad run you are not reading.
 
 **If you are an async / message-driven orchestrator that only takes a turn when input arrives (a
-chat/Slack/Telegram bot, or any assistant that sits idle between messages — even a long-lived process
+chat/Slack/Telegram bot, or any assistant that sits idle between messages, even a long-lived process
 counts, because staying alive is not the same as polling), watching-by-polling is impossible: nothing
 gives you a turn between inputs.** The background beacon still records status durably, but it can only
 WRITE a pulse; it cannot wake you. So arm a push: export `OSRC_HEARTBEAT_WAKE="<your notifier command>"` before you
 launch, and the beacon runs it on every state change (blocked/dead) and on the periodic digest
 (still-cooking / landed), passing the compact summary as `$1` and the full event JSON on stdin. Point it
-at whatever re-invokes you or messages the user through your OWN sanctioned send path — the plugin never
+at whatever re-invokes you or messages the user through your OWN sanctioned send path; the plugin never
 sends anything itself. A headless launch with no wake armed prints an **ASYNC SUPERVISION** warning
 naming the fix; don't ignore it, or your delegate will run silent until the user pings. (Suppress just
 the periodic-digest push with `OSRC_HEARTBEAT_WAKE_DIGEST=0`, keeping only the attention-needed wakes.)
 
 ## `fleet`: one view of every session you are running
 
-`fleet ls` prints a single list of every AI coding session Outsourcerer can see on this machine: your live **Claude Code** sessions plus **every job you delegated through Outsourcerer** (any lane — Codex, Devin/GLM, Fable, droid, cursor, warp, cline). Each row carries an honest state derived from the live process and the session's own transcript tail — `Working` / `Waiting on you` / `Maybe stuck` / `Idle` / `Done` / `Stopped mid-task` / `Failed` (never "dead") — so you can walk up to the one session that actually needs you instead of checking all of them.
+`fleet ls` prints a single list of every AI coding session Outsourcerer can see on this machine: your live **Claude Code** sessions plus **every job you delegated through Outsourcerer** (any lane: Codex, Devin/GLM, Fable, droid, cursor, warp, cline). Each row carries an honest state derived from the live process and the session's own transcript tail: `Working` / `Waiting on you` / `Maybe stuck` / `Idle` / `Done` / `Stopped mid-task` / `Failed` (never "dead"), so you can walk up to the one session that actually needs you instead of checking all of them.
 
 `fleet name` reads each session's transcript and gives it a human name via the free GLM lane (cached per session at `fleet/names.jsonl`), so `session-71` reads as `Refactor the auth retry path`. `fleet show <id>` dives into one session. `fleet supervise` (auto-armed with `OSRC_FLEET_SUPERVISION=1`) runs a background heartbeat that catches a stalled or never-initialized delegate and bounds it instead of leaving it silent.
 
-Scope today: Claude Code sessions + Outsourcerer's own delegated jobs. It does **not** enumerate sessions those other tools started independently of Outsourcerer (a Cursor agent you launched inside Cursor, say) — that cross-tool enumeration is planned, not shipped. Don't describe `fleet` as a universal cross-tool dashboard.
+Scope today: Claude Code sessions + Outsourcerer's own delegated jobs. It does **not** enumerate sessions those other tools started independently of Outsourcerer (a Cursor agent you launched inside Cursor, say); that cross-tool enumeration is planned, not shipped. Don't describe `fleet` as a universal cross-tool dashboard.
 
-## Full subcommand index and failure-state notes (moved from SKILL.md)
+## Subcommand index and failure-state notes
 
-Core: `brief` · `mode` · `consent` · `run`/`explore`/`research`/`edit`/`yolo` · `bg`/`fanout` (+ `status`/`watch`/`result`/`cancel`) · `fleet` (`ls`/`show`/`name`/`supervise` — one view of your Claude Code sessions + delegated jobs; see below) · `advise` · `doctor` · `models`. More: `suggest`/`deals` (cheap now) · `estimate` (cost quote) · `tab` (the ledger) · `second-opinion` · `image` · `continue` · `tap` (capture live limits without token-optimizer) · `sanitize` (scrub fallback-trigger vocabulary from state/todo/memory/commit prose — `--write` applies; `references/vocabulary-hygiene.md`) · `parity`/`parity-codex`/`parity-droid`/`parity-cursor`/`parity-hermes` (two-way bridges) · `posture` (show/reset remembered lane org-policy restrictions) · `classify` (post-hoc verdict for a terminated job: `REUSE-OUTPUT` / `RETRY-DIFFERENT-LANE` / `REAL-FAIL` — deterministic, zero-LLM; `references/jobs-and-safety.md`) · `cleanup`/`gc`. Failure states map to one-line user messages (`launching`→`running`→ `done`/`done?`/`blocked`/`permission-blocked`/`interrupted`/`timeout`/`wedged`/`failed`): `references/jobs-and-safety.md`. `permission-blocked` (a headless delegate hit a wall it can't confirm — e.g. devin print-mode) is NOT `blocked`: re-run with `yolo` or restructure the prompt, don't just read the result. `launching` that never becomes `running` → `failed` (stillborn: the environment killed the detached worker — run foreground).
+Core: `brief` · `mode` · `consent` · `run`/`explore`/`research`/`edit`/`yolo` · `bg`/`fanout` (+ `status`/`watch`/`result`/`cancel`) · `fleet` (`ls`/`show`/`name`/`supervise`, one view of your Claude Code sessions + delegated jobs; see below) · `advise` · `doctor` · `models`. More: `suggest`/`deals` (cheap now) · `estimate` (cost quote) · `tab` (the ledger) · `second-opinion` · `image` · `continue` · `tap` (capture live limits without token-optimizer) · `sanitize` (scrub fallback-trigger vocabulary from state/todo/memory/commit prose; `--write` applies; `references/vocabulary-hygiene.md`) · `parity`/`parity-codex`/`parity-droid`/`parity-cursor`/`parity-hermes` (two-way bridges) · `posture` (show/reset remembered lane org-policy restrictions) · `classify` (post-hoc verdict for a terminated job: `REUSE-OUTPUT` / `RETRY-DIFFERENT-LANE` / `REAL-FAIL`, deterministic, zero-LLM; see "Post-hoc classification" above) · `cleanup`/`gc`. Failure states map to one-line user messages (`launching`→`running`→ `done`/`done?`/`blocked`/`permission-blocked`/`interrupted`/`timeout`/`wedged`/`failed`), as described under "Job states" above. `permission-blocked` (a headless delegate hit a wall it can't confirm, e.g. devin print-mode) is NOT `blocked`: re-run with `yolo` or restructure the prompt, don't just read the result. `launching` that never becomes `running` → `failed` (stillborn: the environment killed the detached worker; run foreground).

@@ -1,6 +1,7 @@
 # `land` and the done contract (factory, 0.14)
 
-Reference for the docs builder. Source: `scripts/factory-land.sh`. Tests: `scripts/tests/test_factory_land.sh`.
+Flag-level reference for `land` and the done contract it enforces. Source: `scripts/factory-land.sh`.
+Tests: `scripts/tests/test_factory_land.sh`. The user-facing guide is `references/factory.md`.
 
 ## CLI
 

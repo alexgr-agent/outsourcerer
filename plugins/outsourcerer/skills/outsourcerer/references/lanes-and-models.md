@@ -4,9 +4,25 @@ Full detail behind the compact alias→lane table in `SKILL.md`: native lanes (c
 claude-native), the Gemini/Antigravity (`agy`) lane, image backends, and model-recommendation
 heuristics.
 
+## Contents
+
+- The model chooses the lane (aliases + native premium lanes)
+- Claudex lane: GPT-5.6 Sol/Terra inside the Claude Code harness
+- Engine lanes: droid (Factory) + cursor
+- Cline lane
+- Gemini / Antigravity lane
+- Local lane (Ollama / LM Studio / llama.cpp)
+- TokenRouter lane
+- Image generation
+- Choosing / recommending models
+- Never use a model: the exclude list
+- Plan limits and cross-harness failover
+- Notes (Devin's two pools)
+- Alias quick table, full rows
+
 ## The model chooses the lane (aliases + native premium lanes)
 
-You no longer type `--provider` for premium models: the **model alias selects the lane**. `-m sol`
+You don't type `--provider` for premium models: the **model alias selects the lane**. `-m sol`
 just works (codex-native). Native lanes use NO OpenRouter overrides, they ride *your own*
 ChatGPT / Claude subscription auth, so they are premium and are **never** auto-escalated to.
 
@@ -43,7 +59,7 @@ out of credits; force OpenRouter with `--provider cc|codex`. `hy3` is OpenRouter
 ## Claudex lane: GPT-5.6 Sol/Terra INSIDE the Claude Code harness (`--provider claudex`)
 
 The community "claudex" pattern (Theo's recipe): more and more users treat the **model and the
-harness as separate choices** — Claude Code's harness UX driving a ChatGPT-subscription model.
+harness as separate choices**: Claude Code's harness UX driving a ChatGPT-subscription model.
 This lane does it supervised: `--provider claudex run [-m sol|terra|luna] "task"` runs
 `claude -p --model gpt-5.6-*` with `ANTHROPIC_BASE_URL` pointed at the user's **locally-running
 CLIProxyAPI** (default `http://127.0.0.1:8317`, token = the proxy's own `api-keys` entry,
@@ -61,17 +77,17 @@ auto-parsed from `~/.cli-proxy-api/config.yaml`; override with `OSRC_CLAUDEX_URL
   through a third-party proxy breaks Anthropic's usage policy; the claude-native lane already
   serves those models first-class.
 - Verbs map like claude-native (`run` read-only, `edit` acceptEdits, `yolo` bypassPermissions,
-  `research` refused — no OS sandbox); the run VERIFIES the actual model via `modelUsage`.
+  `research` refused, no OS sandbox); the run VERIFIES the actual model via `modelUsage`.
 - **codex CLI keeps its jobs**: gpt-image generation and the codex-native/OpenRouter lanes are
   unchanged; claudex is an additional road, not a replacement.
 
-## Engine lanes: droid (Factory) + cursor — the user's OWN tools
+## Engine lanes: droid (Factory) + cursor, the user's OWN tools
 
 `--provider droid` / `--provider cursor` delegate through the agent CLI the user already runs, with
 the models THEY configured there. This is the "work with MY tools" lane: someone with free/cheap
 BYOK API lanes set up in droid (`~/.factory/settings.json` → `customModels`) or a Cursor
 subscription gets full outsourcerer supervision (bg/fanout/watchdog/ledger/cloud-gate) over their
-existing setup — zero new keys, zero migration.
+existing setup, zero new keys, zero migration.
 
 - `-m <name>` passes through **verbatim** to the engine; the alias table never rewrites it. No
   `-m` = the engine's configured default.
@@ -95,7 +111,7 @@ needs no key). Symmetrically `-m fable --provider codex` dies (Claude-backend-on
 `--provider cline` delegates through the Cline CLI (https://github.com/cline/cline) the user
 already runs, with the provider and models THEY configured in `~/.cline`. This is the "work with MY
 tools" lane for Cline users. Billing is theirs: a **ClinePass subscription** (~$9.99/mo, discounted
-access to open-weight models like GLM, DeepSeek, and Kimi) or their own API keys — the roster and
+access to open-weight models like GLM, DeepSeek, and Kimi) or their own API keys; the roster and
 pricing are cline's, not ours, so do NOT hardcode or promise a specific model or price. Full
 outsourcerer supervision (bg/fanout/watchdog/ledger/cloud-gate) applies.
 
@@ -106,9 +122,9 @@ outsourcerer supervision (bg/fanout/watchdog/ledger/cloud-gate) applies.
   across all lanes, use `suggest`/`deals` (they read each catalog live) rather than trusting a
   hardcoded list.
 - **Posture is BINARY, not graded:** `run`/`explore` → `--plan` (read-only, no edits/commands
-  applied — **version-gated**: requires cline >= 3.0.36, where Plan mode stopped falling back to
+  applied, **version-gated**: requires cline >= 3.0.36, where Plan mode stopped falling back to
   shell edits; on an older CLI the read-only tier is refused, not silently trusted); `edit`/`research`/`yolo` → default act mode with `--auto-approve true` (all tools
-  auto-approved). Cline has **no OS sandbox and no middle approval rung** — the trade is disclosed
+  auto-approved). Cline has **no OS sandbox and no middle approval rung**; the trade is disclosed
   in the posture banner, never silent. Treat `research`/`yolo` on cline as fully autonomous with no
   sandbox boundary; prefer `run` (plan mode) for read-only inspection.
 - `--effort` is **native** on cline (`--thinking none|low|medium|high|xhigh`).
@@ -213,7 +229,7 @@ outsourcerer.sh --provider local run -m <model> "..."
 - **Tier**: classified by model name (a local `qwen2.5-coder`/`llama-4` reads as `capable`; a small
   `*-mini`/`*-lite` as `budget`). Local model quality varies wildly, so pass `--tier` to correct it.
 
-## TokenRouter lane (`--provider tokenrouter`) — OpenAI-compatible gateway
+## TokenRouter lane (`--provider tokenrouter`): OpenAI-compatible gateway
 
 `--provider tokenrouter` delegates through [TokenRouter](https://www.tokenrouter.com), an
 OpenAI-compatible model gateway, using the key in `TOKENROUTER_API_KEY` (`~/.env`, single-key
@@ -225,7 +241,7 @@ outsourcerer.sh run --provider tokenrouter -m <gateway-model-id> "summarize thes
 ```
 
 - **`-m` is REQUIRED and passes through VERBATIM** to the gateway's own catalog; the alias table
-  never rewrites it. There is NO hardcoded default model — the roster is TokenRouter's, discovered
+  never rewrites it. There is NO hardcoded default model; the roster is TokenRouter's, discovered
   live, not ours. List it with
   `curl -s -H "Authorization: Bearer ***" https://api.tokenrouter.com/v1/models`.
 - **It is a CLOUD lane**: the prompt LEAVES the machine, so it flows through the same cloud-consent
@@ -299,14 +315,12 @@ Recommendation rules:
 - The **open-weight** families (`glm*`, `deepseek*`, `kimi*`, `swe*`) are usually the free / low-cost lane, recommend these when the user wants "a free model."
 - **Premium** families (`claude*`, `gpt*`, `gemini*`) typically consume Devin usage/ACUs faster. Flag this before routing heavy work to them, and confirm with the user.
 - Treat all of the above as a heuristic, not gospel. If the user needs certainty on current cost, point them to their Devin usage dashboard.
-- **Task-type routing (manual heuristic, no automated `suggest` command exists):** this skill has
-  no stubbed model-recommendation/`suggest` surface to wire into, these are rules for *you* (the
-  orchestrator) to apply by hand when picking `-m`. Visual-review / image-understanding tasks
+- **Task-type routing (apply by hand when picking `-m`):** `advise` scores models by benchmark and
+  `suggest` lists what is cheap right now, but neither knows these two task-type rules. Visual-review / image-understanding tasks
   (screenshot critique, UI/UX review, "does this match the mockup") → route to `gemini-flash` or
   `gemini-pro` (see the Gemini/Antigravity section above). Image-*generation* tasks → the `image`
   subcommand, backend auto-resolved (GPT-image/Codex preferred, nano-banana and OpenRouter as
-  fallback, see "Image generation" above). If an automated suggest/routing command gets built
-  later, wire these same two mappings into it rather than re-deriving them.
+  fallback, see "Image generation" above).
 
 ## Never use a model: the exclude list (`exclude`)
 
@@ -431,7 +445,7 @@ capacity; both are described in `jobs-and-safety.md`.
   `OSRC_DEVIN_PLAN_JOBS_WARN` (default 8): routing advice only, never a block. The older claim that
   GLM does not draw Devin limits described the ACU pool only; do not read it as "unlimited".
 
-## Alias quick table, full rows (moved from SKILL.md)
+## Alias quick table, full rows
 
 | Alias(es) | Lane |
 |---|---|
@@ -441,8 +455,8 @@ capacity; both are described in `jobs-and-safety.md`.
 | `glm` / `hy3` / `deepseek` / any OpenRouter id | OpenRouter (`--provider cc`/`codex`); `capable` tier |
 | `swe` / `swe-1.7` / `kimi` / any Devin id | devin (default); glm/deepseek self-heal here when OpenRouter is out of credits |
 | `ollama:<m>` / `local:<m>` | local (keyless, PRIVATE, $0) |
-| any TokenRouter gateway id | **tokenrouter** (`--provider tokenrouter`) — OpenAI-compatible cloud gateway, key `TOKENROUTER_API_KEY` in `~/.env`; `-m` is REQUIRED and passes through verbatim to the gateway's own catalog (no hardcoded default — the roster is the gateway's, discovered live; some models are a $0 promo RIGHT NOW, confirmed at runtime by billing errors, never a hardcoded date). TEXT delegation, cloud-gated. |
+| any TokenRouter gateway id | **tokenrouter** (`--provider tokenrouter`): OpenAI-compatible cloud gateway, key `TOKENROUTER_API_KEY` in `~/.env`; `-m` is REQUIRED and passes through verbatim to the gateway's own catalog (no hardcoded default; the roster is the gateway's, discovered live; some models are a $0 promo RIGHT NOW, confirmed at runtime by billing errors, never a hardcoded date). TEXT delegation, cloud-gated. |
 | `gpt-image` / `nano-banana` | image only (`image` subcommand) |
-| any model the USER configured | **droid** / **cursor** / **warp** / **hermes** / **cline** (`--provider droid\|cursor\|warp\|hermes\|cline`) — the user's OWN agent CLIs, THEIR models (incl. BYOK); `-m` passes through verbatim. Warp drives `oz agent run` (models via `oz model list`) and can even host the Claude/Codex harness (`OSRC_WARP_HARNESS=claude\|codex`). **Cline** runs on the user's own Cline setup: a ClinePass subscription (discounted open-weight models) or their own keys in `~/.cline`; `-m` passes through verbatim (the roster + pricing are cline's, not ours). **These are easy to forget — the user has warp AND droid AND cline installed; when they say "use warp/droid/cline," this is the lane, don't reach for devin.** |
+| any model the USER configured | **droid** / **cursor** / **warp** / **hermes** / **cline** (`--provider droid\|cursor\|warp\|hermes\|cline`): the user's OWN agent CLIs, THEIR models (incl. BYOK); `-m` passes through verbatim. Warp drives `oz agent run` (models via `oz model list`) and can even host the Claude/Codex harness (`OSRC_WARP_HARNESS=claude\|codex`). **Cline** runs on the user's own Cline setup: a ClinePass subscription (discounted open-weight models) or their own keys in `~/.cline`; `-m` passes through verbatim (the roster + pricing are cline's, not ours). **These are easy to forget; the user has warp AND droid AND cline installed; when they say "use warp/droid/cline," this is the lane, don't reach for devin.** |
 
-**A pinned Claude/GPT/Gemini model runs on ITS OWN native lane — never Devin.** `-m opus`, `-m fable`, `-m claude-opus-4-8`, `-m claude-opus-4-8[1m]`, any `claude-*`/`gpt-5.*`/`gemini-*` id resolves to the claude/codex/gemini-native lane automatically (the alias picks the lane; no `--provider` needed, and you should NOT add `--provider cc` for a Claude model — that means the OpenRouter transport, not the Claude subscription). If the user says "spin up Fable and Opus 4.8," that is `-m fable` and `-m opus` (or the pinned ids) on the claude-native lane, on their Claude subscription — putting that on Devin burns the wrong limits and is the #1 mistake to avoid.
+**A pinned Claude/GPT/Gemini model runs on ITS OWN native lane, never Devin.** `-m opus`, `-m fable`, `-m claude-opus-5-5`, `-m claude-opus-5-5[1m]`, any `claude-*`/`gpt-5.*`/`gemini-*` id resolves to the claude/codex/gemini-native lane automatically (the alias picks the lane; no `--provider` needed, and you should NOT add `--provider cc` for a Claude model; that means the OpenRouter transport, not the Claude subscription). If the user says "spin up Fable and Opus 5.5," that is `-m fable` and `-m opus` (or the pinned ids) on the claude-native lane, on their Claude subscription, putting that on Devin burns the wrong limits and is the #1 mistake to avoid.
