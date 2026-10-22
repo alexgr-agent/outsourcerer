@@ -237,8 +237,8 @@ family itself to block all its versions. Exact matching rules: `references/lanes
 
 ## Where the flags live
 
-The top-level help currently omits the factory commands. They are available; use these CLI
-references for their syntax, plus `plan run --help`, `flow --help` and `land --help`.
+`outsourcerer help` lists the factory commands. For their full syntax use these CLI references,
+plus `plan run --help`, `flow --help` and `land --help`.
 
 - `references/factory-tasks-cli.md`: `plan` and `task` subcommands and the data model.
 - `references/factory-land-cli.md`: `land` and the done contract.

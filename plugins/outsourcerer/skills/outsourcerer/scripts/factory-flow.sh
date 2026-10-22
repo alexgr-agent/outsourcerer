@@ -400,7 +400,7 @@ _ff_verdict() {
     { lines[NR] = $0 }
     END {
       n = NR
-      while (n > 0 && (lines[n] ~ /^[[:space:]]*$/ || lines[n] ~ /^OSRC::(DONE|BLOCKED|PROGRESS)([#:[:space:]]|$)/)) n--
+      while (n > 0 && (lines[n] ~ /^[[:space:]]*$/ || lines[n] ~ /^OSRC::(DONE|BLOCKED|PROGRESS)([#:[:space:]]|$)/ || lines[n] ~ /^>>> \[/)) n--
       fence = ""; width = 0
       for (i = 1; i <= n; i++) {
         s = lines[i]; sub(/^   ? ?/, "", s)
@@ -648,6 +648,10 @@ _ff_land_stage() {
   fi
   out="$( _ff_run_land "$plan" "$target" "$(_ff_land_setup "$plan" "$lt" "$target")" 2>&1 )"; rc=$?
   out="$(printf '%s' "$out" | tail -3 | tr '\n' ' ' | sed 's/^ERROR: //' | cut -c1-200)"
+  # A land step is done only when its target really merged, or when the target asked for branch/pr delivery.
+  if [ "$rc" -eq 0 ] && ! _task_get "$plan" "$target" | _ff_jq -e '(.landed // false) or ((.deliver // "local") != "local")' >/dev/null 2>&1; then
+    rc=1; out="land finished but $target is not recorded as landed: $out"
+  fi
   if [ "$rc" -eq 0 ]; then
     _task_update "$plan" "$lt" 'if .state != "running" then error("moved") else . end | .state = "done" | .result = ("landed " + $t + ": " + $o)' \
       --arg t "$target" --arg o "$out" >/dev/null 2>&1
@@ -774,7 +778,9 @@ _ff_reconcile() {   # <plan>
             base="$(printf '%s' "$receipt" | _ff_jq -r '.base_sha // ""')"
             FACTORY_EVENT_NOTE="recovered job $j" _task_update "$plan" "$tid" \
               "if ($guard) | not then error(\"moved\") else . end | .job = \$j | .jobs = ((.jobs // []) + [\$j])
-               | .worktree = \$w | .branch = \$b | .base_sha = \$s | .claimed_by = \"\"" \
+               | .worktree = (if \$w != \"\" then \$w else (.worktree // \"\") end)
+               | .branch = (if \$b != \"\" then \$b else (.branch // \"\") end)
+               | .base_sha = (if \$s != \"\" then \$s else (.base_sha // \"\") end) | .claimed_by = \"\"" \
               --arg j "$j" --arg w "$w" --arg b "$br" --arg s "$base" >/dev/null 2>&1 || continue
             printf '  %s: found its job %s (its launcher stopped before recording it)\n' "$tid" "$j"
             job="$j"; t="$(_task_get "$plan" "$tid")"; guard="$(_ff_guard "$t")"
@@ -1272,7 +1278,7 @@ _ff_flow_expand() {
            title: (($s.title // $s.id) | sub($vv)), shape: ($s.shape // "scout"), verb: ($s.verb // "run"),
            prompt: (($s.prompt // "") | sub($vv)), check: (($s.check // "") | sub($vv)), setup: (($s.setup // "") | sub($vv)),
            deps: ($s.deps // []), hold: ($s.hold // false), land: ($s.land // ""), verdict: ($s.verdict // false),
-           retries: ($s.retries // 1), deliver: ($s.deliver // (if ($s.shape // "scout") == "ship" then "branch" else "local" end)),
+           retries: ($s.retries // 1), deliver: ($s.deliver // "local"),
            provider: ($s.provider // ""),
            cands: ((if ($s.models // []) | length > 0
                     then ($s.models | length) as $L | [range(0; $L)] | map($s.models[(. + ($i | tonumber) - 1) % $L])

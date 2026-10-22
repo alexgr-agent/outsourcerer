@@ -13,7 +13,7 @@ Make your AI coding tools work as one team. Outsourcerer routes each job to the 
 ${CLAUDE_PLUGIN_ROOT}/skills/outsourcerer/scripts/outsourcerer.sh <subcommand> [args]
 ```
 
-Put `--cloud-ack` before the subcommand. For a plan worker, persist its lane with `task add ... --provider <lane>`; a leading `--provider` does not populate the task's provider field. Post-subcommand global flags are accepted only by commands whose parser supports them.
+`--cloud-ack` and `--provider` work before or after `plan`/`task`/`land`/`flow`; a task's lane is stored from `task add ... --provider <lane>` or a leading `--provider`.
 
 The user talks in plain language and you run the commands. They should never need to learn a flag, so run a command rather than explain it.
 

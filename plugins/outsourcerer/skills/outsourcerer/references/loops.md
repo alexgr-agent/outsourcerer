@@ -102,9 +102,8 @@ outsourcerer loop resume <loop-id> [--max N]
 
 Picks up a `verify` loop that ended `blocked`, `max_turns`, or `max_time`, using its saved task, check,
 model, verb, time bound, worktree, and accumulated failure feedback. Use only the loop id and optional
-`--max N` (which must raise the attempt ceiling). A loop that already succeeded is refused.
-The current parser still accepts positional replacement task text, including after `--`; avoid it,
-because that changes the task while retaining the old check and feedback.
+`--max N` (which must raise the attempt ceiling). A loop that already succeeded is refused, and so is
+any replacement task text: start a new loop for a different task.
 
 ## Recipes you drive (no engine, just compose the verbs)
 

@@ -594,6 +594,18 @@ r3_verdict() (
   [ "$(_task_get r3 "$id" | jq -r .state)" = done ]
 )
 check 'R3 S4 manual done refuses FAIL/AMBIGUOUS; force overrides' r3_verdict
+r3_review_binds() (
+  . "$LIB"
+  local b r; b="$(_task_new r3 '{"title":"build","shape":"ship"}')"
+  _task_update r3 "$b" '.state="done" | .head_sha="feedface"' || exit 1
+  r="$(_task_new r3 "$(jq -nc --arg b "$b" '{title:"review",deps:[$b]}')")"
+  _task_update r3 "$r" '.state="running" | .require_verdict=true' || exit 1
+  _factory_done_check() { echo passed; }
+  _factory_review_verdict() { echo PASS; return 0; }
+  cmd_task done "$r" --plan r3 >/dev/null || exit 1
+  _task_get r3 "$r" | jq -e --arg b "$b" '.state=="done" and .reviewed_head=="feedface" and .review_target==$b' >/dev/null
+)
+check 'R3 S3 a review closed by hand binds to the build head it approved' r3_review_binds
 r3_verify_owner() (
   . "$LIB"
   local id; id="$(r3_task)"

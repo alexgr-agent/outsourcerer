@@ -75,7 +75,7 @@ A flow is a reusable recipe of tasks. `flow run` turns it into tasks in a plan, 
 - `--repo`: git repo for build tasks (default: the repo you are in). A flow that builds code refuses to run without one.
   Adding to an existing plan with a different `--repo` is refused.
 - All or nothing: the flow is validated and expanded in full first; if adding a task fails part way, the tasks this
-  run added (or the plan it created) are removed.
+  run added are removed. A plan the run created stays, empty; remove it with `plan rm` if unwanted.
 - `--var k=v`: fill a flow variable. Missing required vars and unknown names (typos) are refused before anything is written.
   Values are inserted as plain text: quotes, `$( )` and backticks are never run. (The `check` var IS a shell
   command by design: the done check runs it in the task's worktree.)

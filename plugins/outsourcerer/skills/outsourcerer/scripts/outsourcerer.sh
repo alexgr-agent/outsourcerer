@@ -8,7 +8,7 @@
 #   mode [status|auto|manual|hybrid|reset]   The copilot driving mode (persisted, remembered once).
 #   consent status|grant|revoke    Cloud-disclosure consent, remembered ONCE in ~/.outsourcerer
 #                                  (the secret-scan still runs on every delegation regardless).
-#   exclude add|rm|ls|clear MODEL  Never use a model or family (e.g. fable): -m refused, never auto-picked.
+#   exclude add|rm|ls|clear MODEL  Never use a model (or a whole family, e.g. fable): -m refused, never auto-picked.
 #   plan new|ls|show|use|rm|run    Software factory: a task graph on disk that outlives the session (references/factory.md)
 #   task add|start|done|hold|...   Plan steps: deps, spec, check; workers get a brief with earlier results
 #   land <tid> [--pr|--dry-run]    Merge gate: verify, merge one at a time, re-check, never clobber

@@ -30,6 +30,9 @@ mkdir -p "$OSRC_JOBS/verdict-regression"
 printf 'Review complete\nVERDICT: PASS\n\nOSRC::PROGRESS#abc done\nOSRC::DONE#abc complete\n' > "$OSRC_JOBS/verdict-regression/last.txt"
 _ff_verdict verdict-regression
 [ "$_FF_VERDICT" = pass ] && ok 'D1: completion metadata follows a valid verdict' || bad 'D1: completion metadata follows a valid verdict'
+printf 'Review complete\nVERDICT: PASS\nOSRC::DONE#abc complete\n>>> [receipt] job 123 ok\n' > "$OSRC_JOBS/verdict-regression/last.txt"
+_ff_verdict verdict-regression
+[ "$_FF_VERDICT" = pass ] && ok 'D1: a trailing engine receipt line does not hide the verdict' || bad "D1: receipt line made verdict $_FF_VERDICT"
 printf '```text\nVERDICT: PASS\n' > "$OSRC_JOBS/verdict-regression/last.txt"
 _ff_verdict verdict-regression
 [ "$_FF_VERDICT" != pass ] && ok 'S22: unfinished fence cannot approve' || bad 'S22: unfinished fence cannot approve'
@@ -137,7 +140,7 @@ _factory_done_check() {
   if [ -f "$TMP/donefail-$2" ]; then echo "no commits beyond base"; return 1; fi
   echo "done: job finished"; return 0
 }
-cmd_land() { echo "$1" >> "$TMP/landed"; echo "$*" >> "$TMP/landargs"; [ -f "$TMP/landfail-$1" ] && { echo "merge breaks check"; return 1; }; echo "landed $1"; return 0; }
+cmd_land() { echo "$1" >> "$TMP/landed"; echo "$*" >> "$TMP/landargs"; [ -f "$TMP/landfail-$1" ] && { echo "merge breaks check"; return 1; }; _task_update "$3" "$1" '.landed = true' >/dev/null; echo "landed $1"; return 0; }
 
 REPO="$TMP/repo"; mkdir -p "$REPO"; git -C "$REPO" init -q; git -C "$REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 REPO="$(cd "$REPO" && pwd -P)"
@@ -837,6 +840,25 @@ mkplan su4 't1||ship|1'
 ( cmd_land() { _hold_land "$1" x "$3"; }; cmd_plan_run su4 --interval 1 --auto-land >/dev/null 2>&1 )
 _task_get su4 t1 | jq -e '.state == "held" and (.hold.reason | test("merge conflict")) and (.land_error | test("merge conflict"))' >/dev/null \
   && ok "a merge-conflict hold from land is kept; the failure is recorded beside it" || bad "conflict hold: $(_task_get su4 t1 | jq -c '{state,hold,land_error}')"
+
+# N1: a land step is done only when its target really merged.
+mkplan falseland 't1||ship|0' 't2|t1|scout|0'
+_task_update falseland t1 '.state="done"' >/dev/null
+( cmd_land() { echo "verified branch only"; return 0; }; _ff_land_stage falseland t2 t1 ) >/dev/null
+[ "$(st falseland t2)" = held ] && ok 'N1: land step that did not merge is held, not done' || bad "N1: land step became $(st falseland t2) without a merge"
+mkplan branchland 't1||ship|0' 't2|t1|scout|0'
+_task_update branchland t1 '.state="done" | .deliver="branch"' >/dev/null
+( cmd_land() { echo "verified branch"; return 0; }; _ff_land_stage branchland t2 t1 ) >/dev/null
+[ "$(st branchland t2)" = done ] && ok 'N1: an explicit branch delivery still completes its land step' || bad "N1: branch delivery stage is $(st branchland t2)"
+grep -q 'deliver: ($s.deliver // "local")' "$FLOW" && ok 'N1: flow ship stages default to merging' || bad 'N1: flow ship stages still default to branch'
+
+# S18: adopting an orphan job early never erases saved branch fields.
+mkplan keepbase 't1||ship|0'
+_task_update keepbase t1 '.state="running" | .job="" | .attempt_token="kb" | .claimed_at="2000-01-01T00:00:00Z" | .updated="2000-01-01T00:00:00Z" | .base_sha="cafe" | .branch="b1" | .worktree="/w"' >/dev/null
+mkdir -p "$OSRC_JOBS/kbjob"; echo running > "$OSRC_JOBS/kbjob/status"; printf 'keepbase/t1\n' > "$OSRC_JOBS/kbjob/task_ref"; printf 'kb\n' > "$OSRC_JOBS/kbjob/task_attempt"
+( OSRC_FACTORY_LAUNCH_GRACE=0 _ff_reconcile keepbase ) >/dev/null 2>&1
+_task_get keepbase t1 | jq -e '.job=="kbjob" and .base_sha=="cafe" and .branch=="b1" and .worktree=="/w"' >/dev/null \
+  && ok 'S18: early adoption keeps base, branch and worktree' || bad "S18: adoption result $(_task_get keepbase t1 | jq -c '{job,base_sha,branch,worktree}')"
 
 echo "---"
 echo "test_factory_flow: $pass passed, $fail failed"

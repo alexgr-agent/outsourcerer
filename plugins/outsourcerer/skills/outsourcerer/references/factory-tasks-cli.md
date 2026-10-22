@@ -30,9 +30,9 @@ Plan names: letters, digits, `.`, `-`, `_`, up to 64 characters, not `current`, 
 ## Tasks
 
 Every task command takes `--plan <name>`; without it the current plan is used.
-For workers, put `--provider <lane>` on `task add` so it is stored on the task. A leading
-`--provider` does not set that field. Put `--cloud-ack` before the top-level subcommand;
-`plan` and `task` do not accept it as a trailing option.
+`--provider <lane>` on `task add` is stored on the task. A leading `--provider` (before `task`)
+works too and is stored when the task names no lane itself. `--cloud-ack` and `--provider` are
+accepted before or after the `plan`, `task`, `land` and `flow` subcommands.
 
 | Command | What it does |
 |---|---|

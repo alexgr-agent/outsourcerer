@@ -1353,8 +1353,16 @@ _task_cli_done() {
   fi
   if [ "$rc" -eq 0 ]; then
     _plan_lock "$_TASK_PLAN" || { _task_done_interrupted; }
+    # A review closed by hand binds to the build it approved, so a replacement build needs a new review.
+    local rtarget="" rhead=""
+    if [ "$(printf '%s' "$t" | _ft_jq -r '.require_verdict // false')" = true ] && declare -F _ff_review_target >/dev/null; then
+      rtarget="$(_ff_review_target "$t" "$(_task_list "$_TASK_PLAN")")"
+      [ -n "$rtarget" ] && rhead="$(_task_get "$_TASK_PLAN" "$rtarget" | _ft_jq -r '.head_sha // ""')"
+    fi
     if ! FACTORY_EVENT_NOTE="$why" _task_done_update \
-         '.state = "done" | if $r != "" then .result = $r else . end' --arg r "$result" 2>/dev/null; then
+         '.state = "done" | if $r != "" then .result = $r else . end
+          | if $rt != "" and (has("reviewed_head") | not) then .reviewed_head = $rh | .review_target = $rt else . end' \
+         --arg r "$result" --arg rt "$rtarget" --arg rh "$rhead" 2>/dev/null; then
       _plan_unlock "$_TASK_PLAN"
       trap - INT TERM HUP; _TASK_DONE_TID=""
       die "$tid passed its check, but it was changed meanwhile (now $(_task_get "$_TASK_PLAN" "$tid" 2>/dev/null | _ft_jq -r '.state // "?"')), so it was left as is."
