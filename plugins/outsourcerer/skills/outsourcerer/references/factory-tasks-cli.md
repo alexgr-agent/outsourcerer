@@ -18,18 +18,21 @@ generated brief, so the orchestrator never relays context by hand. Needs `jq`.
 
 | Command | What it does |
 |---|---|
-| `plan new <name> [--goal "..."] [--repo <path> \| --no-repo] [--base <branch>] [--no-use]` | Create a plan. Repo defaults to the git repo you are in (absolute toplevel); base defaults to its current branch. Becomes the current plan unless `--no-use`. Without a repo the plan can hold scout tasks only. |
+| `plan new <name> [--goal "..."] [--repo <path> \| --no-repo] [--base <branch>] [--no-use]` | Create a plan. Repo defaults to the git repo you are in (absolute toplevel); base defaults to its current branch. Becomes the current plan unless `--no-use`. Without a repo, ship tasks can be recorded but are refused at dispatch. |
 | `plan ls` | All plans, `*` on the current one, task counts by state. |
 | `plan show [name] [--json]` | Four buckets: **Captain's Call** (held + failed, with the release/retry command), **Done** (done, landed, canceled), **Underway** (running, verifying, with job id), **Next** (ready, and blocked with the blocking task and its state named). Then a `Dependencies` list (`t3 <- t1, t2`). |
 | `plan use <name>` | Set the current plan (`$OSRC_HOME/plans/current`). |
 | `plan rm <name> [--force]` | Delete a plan's records. Refuses while a task is running or verifying unless `--force`. Never touches git worktrees or branches. |
 | `plan run ...` | The scheduler, provided by `factory-flow.sh`. If that script is missing, it stops with "plan run needs factory-flow.sh next to outsourcerer.sh". |
 
-Plan names: letters, digits, `.`, `-`, `_`, up to 64 characters, not `current`.
+Plan names: letters, digits, `.`, `-`, `_`, up to 64 characters, not `current`, and no leading dot.
 
 ## Tasks
 
 Every task command takes `--plan <name>`; without it the current plan is used.
+For workers, put `--provider <lane>` on `task add` so it is stored on the task. A leading
+`--provider` does not set that field. Put `--cloud-ack` before the top-level subcommand;
+`plan` and `task` do not accept it as a trailing option.
 
 | Command | What it does |
 |---|---|
@@ -46,6 +49,10 @@ Every task command takes `--plan <name>`; without it the current plan is used.
 | `task cancel <tid>` | Mark canceled (stops a live job). Dependents stay blocked. |
 | `task retry <tid>` | Failed or canceled back to todo; clears job, worktree, branch, base/head, evidence; keeps history (`jobs`, `attempts`, last `result`). The next brief carries an "Earlier attempt" section with that result. |
 
+For a flow reviewer with `require_verdict: true`, ordinary `task done` also requires a PASS
+under the verdict rules in `factory-flow-cli.md`. FAIL or ambiguous output requires a new review
+or an explicit `--force` override.
+
 ### `task add` options
 
 | Option | Meaning | Default |
@@ -54,10 +61,10 @@ Every task command takes `--plan <name>`; without it the current plan is used.
 | `--shape ship\|scout` | ship = changes code in its own git worktree and commits; scout = investigates and writes up, changes nothing. | ship if `--verb edit\|yolo`, else scout |
 | `--deps t1,t2` (alias `--after`) | Must be done first. Only existing tasks, so the graph cannot loop. | none |
 | `--spec <file>` | Spec handed to the worker (stored as an absolute path). | none |
-| `--check "cmd"` | Command that must pass (exit 0) at the repo top for the task to count as done. | none |
+| `--check "cmd"` | Optional command that must pass (exit 0) at the ship worktree root. Scouts skip shell checks even if this is set. | none |
 | `--verb run\|research\|edit\|yolo` | How the worker is launched. | ship: edit, scout: run |
 | `-m <model>` / `--provider <lane>` | Model and lane for the worker. | the normal routing |
-| `--deliver local\|branch\|pr` | How finished work lands (used by `land`). | local |
+| `--deliver local\|branch\|pr` | `land` merges locally, verifies and records the branch without merging, or pushes and opens a PR, respectively. | local |
 | `--retries N` | Automatic retries the scheduler may spend. | 1 |
 | `--hold "question"` | Create the task already held for a decision. | not held |
 | `--flow <name> --stage <id>` | Provenance when a flow made the task. | empty |
@@ -84,8 +91,9 @@ dependency not done. A failed or canceled dependency keeps its dependents blocke
 
 ## The brief (context handoff)
 
-`tasks/<tid>/brief.md` is the exact prompt the worker receives and the only context it gets
-beyond the repo:
+`tasks/<tid>/brief.md` is the generated task handoff. It is inlined into the launch prompt up to
+16,384 bytes by default (`OSRC_BRIEF_INLINE_MAX`); larger briefs are referenced by path, which
+the worker must be able to read. The lane also supplies its normal instructions.
 
 1. Title, plan goal, repo and base branch, task type.
 2. `## Your task`: the prompt.
@@ -93,12 +101,16 @@ beyond the repo:
 4. `## Done when`: shape rules (ship: commit on your worktree branch, nothing uncommitted, no
    push/merge/PR, no secrets; scout: change nothing, final message is the deliverable), the
    check command, and "end with a short summary".
-5. `## Inputs from finished work`: for each direct dependency, its title, shape and state, its
-   result summary, its output (report.md, else the job's last.txt, trimmed to ~4,000 characters
+5. `## Inputs from finished work`: up to 12 direct dependencies by default (`OSRC_BRIEF_MAX_DEPS`),
+   each with its title, shape and state, result summary capped at 2,000 characters,
+   output (report.md, else the job's last.txt, trimmed to 4,000 characters
    with a visible marker), branch and head commit for ship dependencies, the path to the full
    report, and any captain decision made on that dependency.
 6. `## Decision from the captain`: this task's own held question and answer.
 7. `## Earlier attempt`: on a retry, what went wrong last time.
+
+Decisions are included from this task and its direct dependencies, not every ancestor.
+Dependencies beyond the cap are listed with paths for reading their full reports.
 
 ## Files
 

@@ -13,7 +13,7 @@ Make your AI coding tools work as one team. Outsourcerer routes each job to the 
 ${CLAUDE_PLUGIN_ROOT}/skills/outsourcerer/scripts/outsourcerer.sh <subcommand> [args]
 ```
 
-Global flags (`--provider`, `--cloud-ack`) work anywhere, before or after the subcommand.
+Put `--cloud-ack` before the subcommand. For a plan worker, persist its lane with `task add ... --provider <lane>`; a leading `--provider` does not populate the task's provider field. Post-subcommand global flags are accepted only by commands whose parser supports them.
 
 The user talks in plain language and you run the commands. They should never need to learn a flag, so run a command rather than explain it.
 
@@ -58,7 +58,7 @@ Set it with `mode auto|manual|hybrid` (A/B/C accepted). The user re-steers anyti
 
 When the user hasn't named a model, run `advise`: it scores live benchmarks against cost, returns the best capable-tier value that clears the bar, then runs it on the cheapest lane that serves that exact model. It is the model-selection step in every mode; the mode only decides whether you ask first. Cheap is not dumb: `glm`/`hy3`/`deepseek`/`kimi` are `capable` tier and get flagship-grade prompting. Details: `references/model-advisory.md`, `references/effort-and-tiers.md`.
 
-Models on the user's exclude list (`brief` prints it; `exclude add|rm|ls`) are never picked, and `-m` with one is refused. When the user says "never use X", run `exclude add X`; saying it in chat does not persist. See `references/lanes-and-models.md`.
+The exclude list (`brief` prints it; `exclude add|rm|ls`) filters visible model choices and refuses matching `-m` requests. Unobservable engine defaults and automatic image-backend selection are outside that guarantee. When the user says "never use X", run `exclude add X`; chat alone does not persist it. See `references/lanes-and-models.md`.
 
 ## The verbs (verb = permission mode)
 
@@ -117,7 +117,9 @@ Core: `brief` · `mode` · `consent` · `run`/`explore`/`research`/`edit`/`yolo`
 
 ## Factory: plans for multi-step work
 
-For multi-step work with dependencies, use a **plan** rather than a chain of one-off delegations: it lives on disk, survives the session, and hands each worker its spec plus the results of the tasks it depends on (`plan new` → `task add` with deps, spec, check → `plan run`). Mark each task `ship` (must commit; checked by the done contract) or `scout` (reports only), and verify with evidence, not the worker's word. Human decisions are **held tasks** rather than chat questions; release them with the answer and the plan continues. Only the three escalations above become holds. Code reaches a branch only through **`land`**: serialized per repo, re-checked on the merged result, never clobbers a dirty checkout, `--pr` only when asked. After a crash, rerun `plan run`; it reconciles first. Guide and flows (council-build, spec-build, best-of-n): `references/factory.md`.
+For multi-step work, use a **plan**: disk-backed tasks receive a supplied spec and bounded results from direct dependencies (`plan new` → `task add` → `plan run`). Mark each task `ship` (commits plus the done contract) or `scout` (report only, no shell check). Ship checks are optional; configure `--check` to require one. Human decisions become **held tasks**; release them with an answer. **`land`** serializes delivery and re-runs configured checks on the merged result, protecting local changes while allowing a clean target checkout to advance. Remote publication requires `--pr` or task `--deliver pr`. After a crash, rerun `plan run --plan <name>`. Guide: `references/factory.md`.
+
+**Worktrees isolate files, not permissions.** An unsandboxed worker runs with your user's rights, including access outside its worktree and to shared Git state. Use sandboxed verbs and lanes for untrusted work.
 
 ## References
 
