@@ -118,12 +118,16 @@ check "ship launch runs in the plan repo with OSRC_WORKTREE=1 pinned to the base
   "[ \"\$line\" = \"$jid|$REPO|1|$HEAD_SHA|alpha/t2\" ]"
 check "the launch passes the task's verb and model" \
   "[ \"\$(sed -n 1,3p \"$OSRC_HOME/jobs/$jid/argv\" | tr '\n' '|')\" = 'edit|-m|glm|' ]"
-# #8: the worker's command-line prompt is short and points at the absolute brief path.
+# #8: a small brief goes inline (lanes that can't read outside their workspace still get it);
+# a large one goes by absolute path so the command line stays bounded.
 argvp="$(sed -n '4,$p' "$OSRC_HOME/jobs/$jid/argv")"
-check "the worker prompt is short and names the task title and plan goal" \
-  "[ \"\$(printf '%s' \"\$argvp\" | wc -c | tr -d ' ')\" -lt 1200 ] && printf '%s' \"\$argvp\" | grep -q '^Task alpha/t2: build login\$' && printf '%s' \"\$argvp\" | grep -q '^Plan goal: ship the thing\$'"
-check "the worker prompt tells it to read the absolute brief path first" \
-  "printf '%s' \"\$argvp\" | grep -qF \"read your full brief: $OSRC_HOME/plans/alpha/tasks/t2/brief.md\" && grep -q '^# Task alpha/t2: build login' \"$OSRC_HOME/plans/alpha/tasks/t2/brief.md\""
+check "the worker prompt names the task title and plan goal" \
+  "printf '%s' \"\$argvp\" | grep -q '^Task alpha/t2: build login\$' && printf '%s' \"\$argvp\" | grep -q '^Plan goal: ship the thing\$'"
+check "a small brief is passed inline, with the saved copy's path" \
+  "printf '%s' \"\$argvp\" | grep -q '^# Task alpha/t2: build login' && printf '%s' \"\$argvp\" | grep -qF \"Saved copy: $OSRC_HOME/plans/alpha/tasks/t2/brief.md\""
+bigp="$(OSRC_BRIEF_INLINE_MAX=10 L "_task_worker_prompt alpha t2 '$OSRC_HOME/plans/alpha/tasks/t2/brief.md'")"
+check "a brief over the inline cap is passed by absolute path, and the prompt stays short" \
+  "printf '%s' \"\$bigp\" | grep -qF \"read your full brief: $OSRC_HOME/plans/alpha/tasks/t2/brief.md\" && ! printf '%s' \"\$bigp\" | grep -q '^# Task alpha' && [ \"\$(printf '%s' \"\$bigp\" | wc -c | tr -d ' ')\" -lt 1200 ]"
 check "the job dir gets a task_ref back-link" "[ \"\$(cat \"$OSRC_HOME/jobs/$jid/task_ref\")\" = alpha/t2 ]"
 out="$(L '_task_dispatch alpha t2' 2>&1)"; rc=$?
 check "dispatching a running task is refused" "[ $rc -ne 0 ] && printf '%s' \"\$out\" | grep -q 'already underway'"

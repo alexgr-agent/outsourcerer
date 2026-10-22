@@ -644,6 +644,15 @@ _task_worker_prompt() {
   goal="$(jq -r "$firstline .goal | line(300)" "$(_plan_dir "$plan")/plan.json" 2>/dev/null)"
   printf 'Task %s/%s: %s\n' "$plan" "$tid" "$title"
   [ -n "$goal" ] && printf 'Plan goal: %s\n' "$goal"
+  # Inline the brief when it fits: some lanes (sandboxed or chat-only) cannot read a file outside
+  # their own workspace, and the brief lives under OSRC_HOME. 16KB keeps the whole command line well
+  # under the Windows 32,767-character limit. Larger briefs go by path.
+  local bsize; bsize="$(wc -c < "$brief" 2>/dev/null | tr -d ' ')"
+  if [ -n "$bsize" ] && [ "$bsize" -le "${OSRC_BRIEF_INLINE_MAX:-16384}" ]; then
+    printf '\nYour full brief follows. It is the whole assignment: the task, the spec, the rules for when you are done, and the results of earlier work you build on. Follow it exactly. (Saved copy: %s)\n\n' "$brief"
+    cat "$brief"
+    return 0
+  fi
   printf '\nBefore anything else, read your full brief: %s\n' "$brief"
   printf 'It is the whole assignment: the task, the spec, the rules for when you are done, and the results of earlier work you build on. Follow it exactly.\n'
 }
