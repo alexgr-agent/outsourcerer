@@ -11,7 +11,8 @@ FLOW="$HERE/../factory-flow.sh"
 [ -f "$SRC" ] && [ -f "$FLOW" ] || { echo "FAIL: cannot find $SRC or $FLOW"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not installed"; exit 0; }
 
-TMP="$(mktemp -d "$PWD/.test-factory-flow.XXXXXX")"
+TMP="$(mktemp -d "$HOME/.test-factory-flow.XXXXXX")"
+export GIT_CEILING_DIRECTORIES="$TMP"
 HOME="$TMP/home"; export HOME; mkdir -p "$HOME"
 export OSRC_HOME="$TMP/state"; mkdir -p "$OSRC_HOME/jobs"
 SLEEPERS=""
@@ -23,6 +24,15 @@ bad() { echo "FAIL: $1"; fail=$((fail + 1)); }
 OSRC_SOURCED=1 . "$SRC" >/dev/null 2>&1
 . "$FLOW"
 export OSRC_HEARTBEAT_DISABLED=1
+
+# Review content precedes the engine's completion protocol. Fenced examples are never verdicts.
+mkdir -p "$OSRC_JOBS/verdict-regression"
+printf 'Review complete\nVERDICT: PASS\n\nOSRC::PROGRESS#abc done\nOSRC::DONE#abc complete\n' > "$OSRC_JOBS/verdict-regression/last.txt"
+_ff_verdict verdict-regression
+[ "$_FF_VERDICT" = pass ] && ok 'D1: completion metadata follows a valid verdict' || bad 'D1: completion metadata follows a valid verdict'
+printf '```text\nVERDICT: PASS\n' > "$OSRC_JOBS/verdict-regression/last.txt"
+_ff_verdict verdict-regression
+[ "$_FF_VERDICT" != pass ] && ok 'S22: unfinished fence cannot approve' || bad 'S22: unfinished fence cannot approve'
 
 # ------------------------------------------------------------------ task store (Track B)
 # When factory-tasks.sh sits next to the engine (after integration) the REAL task store is used and
@@ -151,6 +161,179 @@ st() { _task_get "$1" "$2" | jq -r .state; }
 wakes() { cat "$OSRC_WAKE_QUEUE" 2>/dev/null | grep -c "$1" | tr -d ' '; }
 twakes() { cat "$OSRC_WAKE_QUEUE" 2>/dev/null | grep '"kind":"factory-task"' | grep "\"plan\":\"$1\"" | grep "\"task\":\"$2\"" | grep -c "\"task_state\":\"$3\"" | tr -d ' '; }
 mkdir -p "$TMP/outcomes"
+
+# Round-three regressions. These seams inject cancellation/crashes without launching models.
+_FF_DEADLINE=0; _FF_AUTO_LAND=0
+for text in '```text
+VERDICT: PASS
+```' '~~~
+VERDICT: PASS' 'VERDICT: FAIL - PASS is also possible'; do
+  printf '%s\n' "$text" > "$OSRC_JOBS/verdict-regression/last.txt"
+  _ff_verdict verdict-regression
+  [ "$_FF_VERDICT" != pass ] && [ "$_FF_VERDICT" != fail ] && ok 'S22/C1: fenced or contradictory verdict is ambiguous' || bad 'S22/C1: unsafe verdict accepted'
+done
+mkplan sharedverdict 't1||scout|0'
+_task_update sharedverdict t1 '.job = "verdict-regression"' >/dev/null
+for verdict in PASS FAIL; do
+  printf 'VERDICT: %s\nOSRC::DONE#abc complete\n' "$verdict" > "$OSRC_JOBS/verdict-regression/last.txt"
+  out="$(_factory_review_verdict sharedverdict t1)"; rc=$?
+  [ "$out" = "$verdict" ] && { [ "$verdict:$rc" = PASS:0 ] || [ "$verdict:$rc" = FAIL:1 ]; } && ok "D1/C1: shared verdict $verdict" || bad "shared verdict: $out/$rc"
+done
+
+for opt in --max-parallel --interval --max-minutes --plan; do
+  ( cmd_plan_run "$opt" > "$TMP/option.log" 2>&1 ) & cp=$!
+  ( sleep 2; kill -TERM "$cp" 2>/dev/null ) & watch=$!
+  wait "$cp"; rc=$?; kill "$watch" 2>/dev/null; wait "$watch" 2>/dev/null
+  [ "$rc" = 1 ] && ok "S20/D5: missing $opt returns promptly" || bad "missing $opt rc=$rc"
+done
+for opt in --plan --repo; do
+  ( cmd_flow run spec-build "$opt" > "$TMP/option.log" 2>&1 ) & cp=$!
+  ( sleep 2; kill -TERM "$cp" 2>/dev/null ) & watch=$!
+  wait "$cp"; rc=$?; kill "$watch" 2>/dev/null; wait "$watch" 2>/dev/null
+  [ "$rc" = 1 ] && ok "S20/D5: flow missing $opt returns promptly" || bad "flow missing $opt rc=$rc"
+done
+mkplan decimal
+( cmd_plan_run decimal --once --max-minutes 08 --interval 01 --max-parallel 02 >/dev/null 2>&1 ); rc=$?
+[ "$rc" = 0 ] && ok 'D5: leading-zero limits use decimal arithmetic' || bad "decimal rc=$rc"
+
+out="$( jq() { command jq "$@" | awk '{printf "%s\r\n", $0}'; }; _ff_flow_load spec-build )"; rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | command jq -e '.name == "spec-build"' >/dev/null && ok 'D4: native jq CRLF does not reject a valid flow' || bad "CRLF flow rc=$rc"
+out="$( jq() { command jq "$@" | awk '{printf "%s\r\n", $0}'; }; _ff_next_model '{"model":"sol","fallback":["sol","opus"]}' dispatch )"
+[ "$out" = sol ] && ok 'D4: model comparisons strip native jq CR' || bad "CRLF model: [$out]"
+mkdir -p "$TMP/unknown.lock"; printf '99999999 unknown\n' > "$TMP/unknown.lock/owner"
+( _pid_start_identity() { return 1; }; kill() { return 1; }; _ff_lock_acquire "$TMP/unknown.lock" ); rc=$?
+[ "$rc" = 1 ] && [ -f "$TMP/unknown.lock/owner" ] && ok 'D11: denied process inspection never proves death' || bad 'D11: unknown owner lock stolen'
+( unset BASHPID; _ff_lock_acquire "$TMP/subshell.lock"; sh -c 'echo $PPID' > "$TMP/real-pid"; cut -d ' ' -f1 "$TMP/subshell.lock/owner" > "$TMP/lock-pid"; _ff_lock_release )
+[ "$(cat "$TMP/real-pid")" = "$(cat "$TMP/lock-pid")" ] && [ ! -d "$TMP/subshell.lock" ] && ok 'D12: lock records and releases the actual subshell PID' || bad 'D12: lock owner is parent PID'
+
+mkplan retrylaunch 't1||scout|1'
+_task_update retrylaunch t1 '.state="failed" | .launch_failed=true | .attempts=1 | .attempt_token="attempt-one"' >/dev/null
+_ff_reconcile retrylaunch >/dev/null
+[ "$(st retrylaunch t1)" = todo ] && ok 'S16: persisted failed launch consumes remaining retry' || bad 'S16: failed launch stranded'
+mkplan pendingland 't1||ship|1'
+_task_update pendingland t1 '.state="done" | .auto_land_pending=true' >/dev/null
+rm -f "$TMP/landed"; _ff_reconcile pendingland >/dev/null
+[ "$(cat "$TMP/landed")" = t1 ] && _task_get pendingland t1 | jq -e '.auto_land_complete == true and ((.auto_land_pending // false) | not)' >/dev/null && ok 'S11: restart reconciles durable auto-land intent' || bad 'S11: pending land skipped'
+_ff_reconcile pendingland >/dev/null
+[ "$(wc -l < "$TMP/landed" | tr -d ' ')" = 1 ] && ok 'S11: recovered auto-land runs once' || bad 'S11: duplicate recovered land'
+mkplan boundaryland 't1||ship|1'; _task_update boundaryland t1 '.state="done"' >/dev/null
+( _FF_AUTO_LAND=1; _ff_reconcile boundaryland >/dev/null )
+_task_get boundaryland t1 | jq -e '.auto_land_complete == true' >/dev/null && ok 'S11: legacy done-before-land boundary is reconciled' || bad 'S11: boundary state skipped'
+
+mkplan revision 't1||ship|1' 't2|t1|scout|1'
+_task_update revision t1 '.state="done" | .head_sha="new"' >/dev/null
+_task_update revision t2 '.state="done" | .require_verdict=true | .reviewed_head="old" | .attempts=1' >/dev/null
+_ff_reconcile revision >/dev/null
+[ "$(st revision t2)" = todo ] && ok 'S3: changed build invalidates completed review' || bad 'S3: old approval retained'
+_ff_dispatch revision 1 >/dev/null
+_task_get revision t2 | jq -e '.reviewed_head == "new" and .review_target == "t1"' >/dev/null && ok 'S3: reviewer launch records the build revision' || bad 'S3: review revision absent'
+
+mkdir -p "$OSRC_JOBS/ownership-check"
+printf 'done\n' > "$OSRC_JOBS/ownership-check/status"
+printf 'VERDICT: FAIL - bug\nOSRC::DONE#abc complete\n' > "$OSRC_JOBS/ownership-check/last.txt"
+mkplan cancelreview 't1||ship|1' 't2|t1|scout|1'
+_task_update cancelreview t1 '.state="done"' >/dev/null
+_task_update cancelreview t2 '.state="verifying" | .require_verdict=true | .job="ownership-check" | .attempt_token="old"' >/dev/null
+( _factory_done_check() { _task_update "$1" "$2" '.state="canceled"' >/dev/null; echo checked; }; _ff_verify cancelreview t2 "$(_task_list cancelreview)" ) >/dev/null
+[ "$(st cancelreview t2)" = canceled ] && [ "$(st cancelreview t1)" = done ] && ok 'S6: cancellation during check never resurrects reviewer or build' || bad 'S6: cancellation overwritten'
+_task_update cancelreview t2 '.state="verifying" | .verifying_token="original"' >/dev/null
+( _factory_done_check() { _task_update "$1" "$2" '.verifying_token="replacement"' >/dev/null; echo checked; }; _ff_verify cancelreview t2 "$(_task_list cancelreview)" ) >/dev/null
+_task_get cancelreview t2 | jq -e '.state == "verifying" and .verifying_token == "replacement"' >/dev/null && ok 'C2/C3: displaced checker cannot complete a replacement claim' || bad 'C3: replacement checker overwritten'
+
+# Simulate a crash after only the build reset landed, then recover the paired transaction.
+mkplan paircrash 't1||ship|1' 't2|t1|scout|1'
+_task_update paircrash t1 '.state="done"' >/dev/null
+_task_update paircrash t2 '.state="verifying" | .require_verdict=true | .job="ownership-check"' >/dev/null
+eval "_saved_write_json() $(declare -f _factory_write_json | tail -n +2)"
+( _factory_write_json() { case "$1" in */paircrash/tasks/t2.json) return 1 ;; esac; _saved_write_json "$@"; }
+  _FF_VERDICT_LINE='VERDICT: FAIL - bug'; _ff_review_failed paircrash t2 "$(_task_list paircrash)" ) >/dev/null
+[ -f "$OSRC_HOME/plans/paircrash/review-transaction.json" ] && [ "$(st paircrash t1)" = todo ] && ok 'S6: interrupted paired reset retains recovery journal' || bad 'S6: reset journal missing'
+_ff_reconcile paircrash >/dev/null
+[ "$(st paircrash t1)" = todo ] && [ "$(st paircrash t2)" = todo ] && [ ! -f "$OSRC_HOME/plans/paircrash/review-transaction.json" ] && ok 'S6: paired reset completes before redispatch' || bad 'S6: incomplete paired reset'
+
+mkplan staleverify 't1||scout|0'
+_task_update staleverify t1 '.state="verifying" | .job="ownership-check" | .verifying_pid=$p | .verifying_at=1 | .verifying_start=$start' --arg p "$$" --arg start "$(_pid_start_identity "$$")" >/dev/null
+: > "$TMP/donechecks"; _ff_reconcile staleverify >/dev/null
+[ "$(st staleverify t1)" = done ] && [ "$(cat "$TMP/donechecks")" = staleverify/t1 ] && ok 'D17: stale verification can be taken over despite a live PID' || bad 'D17: live stale checker blocks forever'
+_task_get staleverify t1 | jq -e 'has("verifying_pid") == false and has("verifying_start") == false and has("verifying_at") == false' >/dev/null && ok 'C3: completion clears all checker ownership fields' || bad 'C3: stale checker fields remain'
+_task_update staleverify t1 '.state="verifying" | .verifying_pid=$p | .verifying_at=$now | .verifying_start="reused-pid"' --arg p "$$" --argjson now "$(date +%s)" >/dev/null
+_ff_reconcile staleverify >/dev/null
+[ "$(st staleverify t1)" = done ] && ok 'D17: PID identity mismatch permits immediate takeover' || bad 'D17: reused PID blocks takeover'
+
+mkplan adoptspace 't1||ship|0'
+_task_update adoptspace t1 '.state="running" | .claimed_at=1 | .attempt_token="current"' >/dev/null
+SPACE_JOBS="$TMP/state with spaces/jobs"; mkdir -p "$SPACE_JOBS/parent" "$SPACE_JOBS/nested"
+printf 'adoptspace/t1\n' > "$SPACE_JOBS/parent/task_ref"; printf 'current\n' > "$SPACE_JOBS/parent/task_attempt_token"
+printf 'adoptspace/t1\n' > "$SPACE_JOBS/nested/task_ref"; printf 'obsolete\n' > "$SPACE_JOBS/nested/task_attempt_token"
+printf 'running\n' > "$SPACE_JOBS/parent/status"; printf '%s\n' "$$" > "$SPACE_JOBS/parent/pid"
+printf '{"path":"/work tree","branch":"feature","base_sha":"base"}\n' > "$SPACE_JOBS/parent/worktree.json"
+( OSRC_JOBS="$SPACE_JOBS"; _ff_reconcile adoptspace ) >/dev/null
+_task_get adoptspace t1 | jq -e '.job == "parent" and .worktree == "/work tree" and .branch == "feature" and .base_sha == "base"' >/dev/null && ok 'S18/D10: adoption restores receipt and matches attempt in paths with spaces' || bad 'S18: incomplete or incorrect adoption'
+_task_update adoptspace t1 '.job="" | .jobs=[]' >/dev/null
+( OSRC_JOBS="$SPACE_JOBS"; _ff_find_job_by_ref() { _task_update "$1" "$2" '.attempt_token="replacement"' >/dev/null; echo parent; }; _ff_reconcile adoptspace ) >/dev/null
+_task_get adoptspace t1 | jq -e '.attempt_token == "replacement" and .job == ""' >/dev/null && ok 'C2/S18: old recovery cannot attach to replacement attempt' || bad 'C2: orphan attached to replacement'
+printf 'current\n' > "$SPACE_JOBS/nested/task_attempt_token"
+out="$( OSRC_JOBS="$SPACE_JOBS"; _ff_find_job_by_ref adoptspace t1 '{"attempt_token":"current"}' )"
+[ -z "$out" ] && ok 'S18: multiple matching receipts are never guessed' || bad 'S18: ambiguous orphan selected'
+
+mkplan incompleteflow 't1||scout|0' 't2||scout|0'
+_task_update incompleteflow t1 '.state="held" | .flow_expansion="interrupted"' >/dev/null
+printf '{"token":"interrupted","flow":"spec-build"}\n' > "$OSRC_HOME/plans/incompleteflow/flow-expansion.json"
+( cmd_plan_run incompleteflow --once > "$TMP/incomplete.log" 2>&1 ); rc=$?
+[ "$rc" = 3 ] && [ "$(st incompleteflow t2)" = todo ] && ok 'S23/D3: incomplete expansion blocks scheduling' || bad 'S23: partial flow scheduled'
+( _plan_lock incompleteflow; _ff_flow_rollback incompleteflow; _plan_unlock incompleteflow )
+[ "$(_task_list incompleteflow | jq -c '[.[].id]')" = '["t2"]' ] && [ -f "$OSRC_HOME/plans/incompleteflow/plan.json" ] && ok 'D3: rollback preserves concurrent unrelated tasks and plan' || bad 'D3: rollback deleted unrelated work'
+
+mkplan conflictstage 't1||ship|0' 't2|t1|scout|0'
+_task_update conflictstage t1 '.state="done"' >/dev/null
+( _ff_run_land() { _task_update "$1" "$2" '.state="held"' >/dev/null; echo conflict; return 1; }; _ff_land_stage conflictstage t2 t1 ) >/dev/null
+_task_get conflictstage t2 | jq -e '.hold.reason | test("task release t1.*--plan conflictstage.*plan run conflictstage.*task release t2.*--plan conflictstage")' >/dev/null && ok 'S14: conflict hints resolve build before releasing land stage, with explicit plan' || bad 'S14: invalid conflict recovery order'
+mkplan landerror 't1||ship|0'; _task_update landerror t1 '.state="done"' >/dev/null
+( _ff_run_land() { echo 'integration check failed'; return 1; }; _ff_auto_land landerror t1 ) >/dev/null
+_task_get landerror t1 | jq -e '.state == "done" and .land_error_at > 0 and (.land_error | test("integration check failed")) and .auto_land_pending == false' >/dev/null && ok 'S13: integration error is separate from done state and stops automatic retry' || bad 'S13: landing outcome contract violated'
+
+# Cancel after observing job completion but before acquiring the verifying claim.
+mkplan outcome_cancel 't1||scout|0'
+_task_update outcome_cancel t1 '.state="running" | .job="ownership-check" | .attempt_token="same"' >/dev/null
+( _ff_job_outcome() { _task_update outcome_cancel t1 '.state="canceled"' >/dev/null; _FF_OUT=ok; }; _ff_reconcile outcome_cancel ) >/dev/null
+[ "$(st outcome_cancel t1)" = canceled ] && ok 'S6/C2: cancellation between outcome read and verifying claim wins' || bad 'S6: canceled task reclaimed as verifying'
+
+# The reviewer must also be reset when the build moves while its checker runs.
+mkplan duringreview 't1||ship|1' 't2|t1|scout|1'
+_task_update duringreview t1 '.state="done" | .head_sha="before"' >/dev/null
+_task_update duringreview t2 '.state="verifying" | .require_verdict=true | .reviewed_head="before" | .job="ownership-check"' >/dev/null
+printf 'VERDICT: PASS\nOSRC::DONE#abc complete\n' > "$OSRC_JOBS/ownership-check/last.txt"
+( _factory_done_check() { _task_update duringreview t1 '.head_sha="after"' >/dev/null; echo checked; }; _ff_verify duringreview t2 "$(_task_list duringreview)" ) >/dev/null
+[ "$(st duringreview t2)" = todo ] && ok 'S3: build changing during review cannot acquire approval' || bad 'S3: in-flight stale review approved'
+
+( jq() { return 7; }; _ff_jq -r . >/dev/null ); rc=$?
+[ "$rc" = 7 ] && ok 'D4: CRLF normalization preserves jq failure status' || bad 'D4: jq error hidden'
+
+# Kill the expansion owner after a task is written, before its caller records the returned tid.
+# Both tasks are still held, and the durable marker survives the exact SIGKILL boundary.
+eval "_crash_task_new() $(declare -f _task_new | tail -n +2)"
+( _task_new() {
+    local result owner
+    result="$(_crash_task_new "$@")" || return 1
+    if [ "$result" = t2 ]; then
+      read -r owner _ < "$(_plan_dir "$1")/.lock/owner"
+      kill -KILL "$owner"
+    fi
+    printf '%s\n' "$result"
+  }
+  cmd_flow run council-build --plan killedflow --repo "$REPO" --var goal=g >/dev/null 2>&1
+) 2>/dev/null
+[ -f "$OSRC_HOME/plans/killedflow/flow-expansion.json" ] && _task_list killedflow | jq -e 'length == 2 and all(.[]; .state == "held")' >/dev/null && ok 'S23: SIGKILL leaves an incomplete marker and only held tasks' || bad 'S23: killed expansion exposed runnable tasks'
+( cmd_plan_run killedflow --once >/dev/null 2>&1 ); rc=$?
+[ "$rc" = 3 ] && ok 'S23: scheduler refuses a physically interrupted expansion' || bad "S23: killed expansion scheduler rc=$rc"
+( cmd_flow run council-build --plan killedflow --repo "$REPO" --var goal=g >/dev/null 2>&1 ); rc=$?
+[ "$rc" = 0 ] && [ ! -f "$OSRC_HOME/plans/killedflow/flow-expansion.json" ] && _task_list killedflow | jq -e 'length == 6 and all(.[]; .state == "todo")' >/dev/null && ok 'D3/S23: rerun replaces only the interrupted expansion' || bad 'S23: interrupted expansion could not recover'
+
+rm -f "$TMP/landed" "$TMP/landargs" "$TMP/donechecks"
+if [ "${OSRC_FLOW_REGRESSION_ONLY:-0}" = 1 ]; then
+  echo "test_factory_flow regressions: $pass passed, $fail failed"
+  [ "$fail" = 0 ]; exit $?
+fi
 
 # ================================================================== scheduler
 # 1. success chain, deps respected, exit 0, finished wake
@@ -370,7 +553,8 @@ out="$( cmd_plan_run c3 --interval 1 2>&1 )"; rc=$?
 # --- 2 + 14. run lock: steal guard, unwritable owner, distinct busy code
 mkplan l1 't1||scout|1'; echo running > "$TMP/outcomes/t1"
 mkdir -p "$OSRC_HOME/plans/l1/run.lock"; echo "99999 Mon Jan  1 00:00:00 2001" > "$OSRC_HOME/plans/l1/run.lock/owner"
-( kill() { if [ "${1:-}" = -0 ] && [ ! -f "$TMP/b-slept" ]; then touch "$TMP/b-slept"; sleep 2; fi; command kill "$@"; }
+eval "_saved_pid_identity() $(declare -f _pid_start_identity | tail -n +2)"
+( _pid_start_identity() { if [ "${1:-}" = 99999 ] && [ ! -f "$TMP/b-slept" ]; then touch "$TMP/b-slept"; sleep 2; fi; _saved_pid_identity "$@"; }
   cmd_plan_run l1 --interval 1 --max-minutes 1 > "$TMP/B.out" 2>&1 ) & BPID=$!
 sleep 0.5
 ( cmd_plan_run l1 --interval 30 --max-minutes 1 > "$TMP/A.out" 2>&1 ) & APID=$!
@@ -500,7 +684,7 @@ mflow notobj 'one JSON object' '[1,2]'
 eval "_real_task_new() $(declare -f _task_new | tail -n +2)"
 ( _task_new() { if [ "$(ls "$OSRC_HOME/plans/$1/tasks" 2>/dev/null | grep -c '\.json$')" -ge 2 ]; then return 1; fi; _real_task_new "$@"; }
   cmd_flow run council-build --plan at1 --repo "$REPO" --var goal=g >/dev/null 2>&1 ); rc=$?
-[ "$rc" != 0 ] && [ ! -d "$OSRC_HOME/plans/at1" ] && ok "a flow run that fails mid-way removes the plan it created" || bad "partial new plan left: rc=$rc $(ls "$OSRC_HOME/plans/at1/tasks" 2>/dev/null)"
+[ "$rc" != 0 ] && [ "$(_task_list at1 | jq length)" = 0 ] && ok "a flow run that fails mid-way removes its tasks and preserves the plan" || bad "partial new plan left: rc=$rc $(ls "$OSRC_HOME/plans/at1/tasks" 2>/dev/null)"
 mkplan at2 't1||scout|1'
 ( _task_new() { if [ "$(ls "$OSRC_HOME/plans/$1/tasks" 2>/dev/null | grep -c '\.json$')" -ge 3 ]; then return 1; fi; _real_task_new "$@"; }
   cmd_flow run council-build --plan at2 --repo "$REPO" --var goal=g >/dev/null 2>&1 ); rc=$?
@@ -608,7 +792,7 @@ mkplan gt2 't1||scout|1'; _task_update gt2 t1 '.gate = true | .state = "todo"' >
 mkplan cc 't1||ship|1'
 sleep 60 & CHK=$!; SLEEPERS="$SLEEPERS $CHK"
 J4="20000101-000000-chk$RANDOM"; mkdir -p "$OSRC_JOBS/$J4"; echo done > "$OSRC_JOBS/$J4/status"; echo ok > "$OSRC_JOBS/$J4/last.txt"
-_task_update cc t1 '.state = "verifying" | .job = $j | .jobs = [$j] | .verifying_pid = $p | .verifying_at = "2000-01-01T00:00:00Z"' --arg j "$J4" --arg p "$CHK" >/dev/null
+_task_update cc t1 '.state = "verifying" | .job = $j | .jobs = [$j] | .verifying_pid = $p | .verifying_at = $now' --argjson now "$(date +%s)" --arg j "$J4" --arg p "$CHK" >/dev/null
 : > "$TMP/donechecks"; rm -f "$TMP/landed"
 ( cmd_plan_run cc --once --auto-land >/dev/null 2>&1 )
 [ ! -s "$TMP/donechecks" ] && [ ! -s "$TMP/landed" ] && [ "$(st cc t1)" = verifying ] && ok "a live checker's task is left alone" || bad "double check: $(cat "$TMP/donechecks") $(st cc t1)"
