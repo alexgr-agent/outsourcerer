@@ -1106,6 +1106,8 @@ _task_cli_add() {
     esac
   done
   [ -n "$title" ] || die "task add needs a title, e.g. outsourcerer task add \"map the auth flow\" --shape scout"
+  # A global --provider (before or after the subcommand) is the lane for a task that names none.
+  [ -z "$provider" ] && [ "${PROVIDER_EXPLICIT:-0}" = "1" ] && provider="${PROVIDER:-}"
   case "$verb" in ''|run|research|edit|yolo) ;; *) die "task add: --verb must be run, research, edit or yolo." ;; esac
   if [ -z "$shape" ]; then case "$verb" in edit|yolo) shape=ship ;; *) shape=scout ;; esac; fi
   case "$shape" in ship|scout) ;; *) die "task add: --shape must be ship (changes code) or scout (investigates)." ;; esac

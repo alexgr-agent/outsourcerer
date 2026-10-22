@@ -226,7 +226,9 @@ _ff_find_job_by_ref() {
     [ "$linked" = "$plan/$tid" ] || [ "$linked" = "$plan/$tid/$tok" ] || continue
     j="${f%/task_ref}"; j="${j##*/}"
     if [ -n "$tok" ] && [ "$linked" != "$plan/$tid/$tok" ]; then
-      linked="$(cat "$OSRC_JOBS/$j/task_attempt_token" 2>/dev/null | tr -d '\r\n')"
+      # factory-tasks.sh and the engine write the link as task_attempt; older names kept as fallbacks.
+      linked="$(cat "$OSRC_JOBS/$j/task_attempt" 2>/dev/null | tr -d '\r\n')"
+      [ -n "$linked" ] || linked="$(cat "$OSRC_JOBS/$j/task_attempt_token" 2>/dev/null | tr -d '\r\n')"
       [ -n "$linked" ] || linked="$(cat "$OSRC_JOBS/$j/attempt_token" 2>/dev/null | tr -d '\r\n')"
       [ "$linked" = "$tok" ] || continue
     fi

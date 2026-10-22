@@ -276,6 +276,11 @@ printf 'current\n' > "$SPACE_JOBS/nested/task_attempt_token"
 out="$( OSRC_JOBS="$SPACE_JOBS"; _ff_find_job_by_ref adoptspace t1 '{"attempt_token":"current"}' )"
 [ -z "$out" ] && ok 'S18: multiple matching receipts are never guessed' || bad 'S18: ambiguous orphan selected'
 
+# The engine and factory-tasks.sh name the link file task_attempt; adoption must read that name.
+mkdir -p "$SPACE_JOBS/engine"; printf 'adoptspace/t1\n' > "$SPACE_JOBS/engine/task_ref"; printf 'enginetok\n' > "$SPACE_JOBS/engine/task_attempt"
+eout="$( OSRC_JOBS="$SPACE_JOBS"; _ff_find_job_by_ref adoptspace t1 '{"attempt_token":"enginetok"}' )"
+case "$eout" in *engine*) ok "adoption reads the engine's task_attempt link file" ;; *) bad "adoption ignored task_attempt (got '$eout')" ;; esac
+
 mkplan incompleteflow 't1||scout|0' 't2||scout|0'
 _task_update incompleteflow t1 '.state="held" | .flow_expansion="interrupted"' >/dev/null
 printf '{"token":"interrupted","flow":"spec-build"}\n' > "$OSRC_HOME/plans/incompleteflow/flow-expansion.json"

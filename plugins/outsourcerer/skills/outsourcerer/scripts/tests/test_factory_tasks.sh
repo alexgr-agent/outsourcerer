@@ -330,6 +330,14 @@ i=0; while [ "$i" -lt 100 ]; do case "$(cat "$OSRC_HOME/jobs/$jid/status" 2>/dev
 i=0; while [ "$i" -lt 150 ] && pgrep -f "$TMP" >/dev/null 2>&1; do sleep 0.1; i=$((i+1)); done
 git -C "$REPO" worktree remove --force "$REPO/.outsourcerer/worktrees/$jid" >/dev/null 2>&1 || true
 
+# ---- global flags work with the factory commands like every other command
+O plan new gflags --no-repo --cloud-ack >/dev/null 2>&1; rc=$?
+check "plan new accepts --cloud-ack anywhere" "[ $rc -eq 0 ] && [ -f \"$OSRC_HOME/plans/gflags/plan.json\" ]"
+gt1="$(bash "$SRC" --provider droid task add "lead" --plan gflags 2>/dev/null | head -1)"
+gt2="$(O task add "own" --plan gflags --provider cursor 2>/dev/null | head -1)"
+check "a leading global --provider becomes the task's lane" "[ \"\$(jq -r .provider \"$OSRC_HOME/plans/gflags/tasks/$gt1.json\")\" = droid ]"
+check "a task's own --provider still wins" "[ \"\$(jq -r .provider \"$OSRC_HOME/plans/gflags/tasks/$gt2.json\")\" = cursor ]"
+
 # ---- a ship worker that cannot get its own worktree must never fall back to the caller's checkout
 # Outside every repo, and git told not to look above it.
 NOGIT="$(mktemp -d)"; NOGIT="$(cd "$NOGIT" && pwd -P)"

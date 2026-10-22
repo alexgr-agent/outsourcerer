@@ -9,6 +9,10 @@
 #   consent status|grant|revoke    Cloud-disclosure consent, remembered ONCE in ~/.outsourcerer
 #                                  (the secret-scan still runs on every delegation regardless).
 #   exclude add|rm|ls|clear MODEL  Never use a model or family (e.g. fable): -m refused, never auto-picked.
+#   plan new|ls|show|use|rm|run    Software factory: a task graph on disk that outlives the session (references/factory.md)
+#   task add|start|done|hold|...   Plan steps: deps, spec, check; workers get a brief with earlier results
+#   land <tid> [--pr|--dry-run]    Merge gate: verify, merge one at a time, re-check, never clobber
+#   flow ls|show|run NAME          Ready-made plans: council-build, spec-build, best-of-n
 #   models                         Print the LIVE list of selectable Devin models (+ plan-cost heuristic)
 #   run     [-m MODEL] "<task>"    One-shot delegation (permission: auto / read-only auto-approve)
 #   explore [-m MODEL] "<task>"    Alias for run, read-only fan-out (NOTE: 'auto' blocks tool EXEC)
@@ -12336,11 +12340,27 @@ _fg_run_cost() {
 _osrc_git_exclude_state() {
   local common ex
   common="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 0
-  case "$common" in /*) ;; *) common="$1/$common" ;; esac
+  case "$common" in /*|[A-Za-z]:[/\\]*) ;; *) common="$1/$common" ;; esac
   ex="$common/info/exclude"
   grep -qxF '/.outsourcerer/' "$ex" 2>/dev/null && return 0
   mkdir -p "$common/info" 2>/dev/null || return 0
   printf '\n# outsourcerer worker worktrees (local, added automatically)\n/.outsourcerer/\n' >> "$ex" 2>/dev/null || true
+}
+
+# _factory_global_flags <args...> -> _FGF_ARGS without the global flags, which the factory commands
+# accept anywhere like every other command: --cloud-ack (remembered for this run) and --provider X
+# (becomes the default lane for tasks created by this command when they don't name their own).
+_factory_global_flags() {
+  _FGF_ARGS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cloud-ack) export OSRC_CLOUD_ACK=1; shift ;;
+      --provider)
+        [ -n "${2:-}" ] || die "--provider needs a value (a lane name, e.g. droid)"
+        PROVIDER="$2"; PROVIDER_EXPLICIT=1; shift 2 ;;
+      *) _FGF_ARGS+=("$1"); shift ;;
+    esac
+  done
 }
 
 # _worktree_setup <job-id> -> "path<TAB>branch<TAB>base_sha" + rc 0 when OSRC_WORKTREE=1 and we're in a
@@ -20446,9 +20466,11 @@ Recipes are composed from the existing verbs, not a workflow engine: see referen
                 [ -n "${2:-}" ] || die "loop verify: --verb needs edit|yolo"; verb="$2"; shift 2 ;;
     --worktree) [ "$resume" != "1" ] || die "loop resume: the worktree is fixed by the original loop"
                 use_worktree=1; shift ;;
-    --)         shift; task="$*"; break ;;
+    --)         [ "$resume" != "1" ] || die "loop resume: the task is fixed by the original loop; start a new loop for different work"
+                shift; task="$*"; break ;;
     -*)         die "loop verify: unknown flag '$1'" ;;
-    *)          task="$1"; shift ;;
+    *)          [ "$resume" != "1" ] || die "loop resume: the task is fixed by the original loop; start a new loop for different work"
+                task="$1"; shift ;;
   esac; done
   [ -n "$task" ]  || die "loop verify needs a task, e.g.: loop verify -m glm --check \"npm test\" \"make the auth tests pass\""
   [ -n "$check" ] || die "loop verify needs a --check command. External verification is MANDATORY — a loop that trusts the model's own 'done' is not a loop, it's a hope."
@@ -21018,14 +21040,14 @@ main() {
     edit)        route_delegate "accept-edits" "$cmd" "$@" ;;
     yolo)        route_delegate "dangerous" "$cmd" "$@" ;;
     bg)          cmd_bg "$@" ;;                            # background: detach a supervised job, print id
-    plan)        cmd_plan "$@" ;;                          # factory: durable plan graph (plan new|ls|show|use|rm|run)
-    task)        cmd_task "$@" ;;                          # factory: tasks in a plan (add|ls|show|ready|start|hold|release|done|fail|cancel|retry)
+    plan) _factory_global_flags "$@"; set -- ${_FGF_ARGS[@]+"${_FGF_ARGS[@]}"}; cmd_plan "$@" ;;                          # factory: durable plan graph (plan new|ls|show|use|rm|run)
+    task) _factory_global_flags "$@"; set -- ${_FGF_ARGS[@]+"${_FGF_ARGS[@]}"}; cmd_task "$@" ;;                          # factory: tasks in a plan (add|ls|show|ready|start|hold|release|done|fail|cancel|retry)
     fanout)      cmd_fanout "$@" ;;                        # parallel N-way multi-subagent (+ status|wait|collect|list)
     fleet)       cmd_fleet "$@" ;;                         # unified managed + independent Claude Code fleet
     crew)        cmd_crew "$@" ;;                          # transactional write-swarm: fanout --worktree edit -> grade -> revert-or-promote
-    land)        cmd_land "$@" ;;                          # merge gate: done contract -> serialized no-ff merge -> re-check -> ff target (factory-land.sh)
+    land) _factory_global_flags "$@"; set -- ${_FGF_ARGS[@]+"${_FGF_ARGS[@]}"}; cmd_land "$@" ;;                          # merge gate: done contract -> serialized no-ff merge -> re-check -> ff target (factory-land.sh)
     loop)        cmd_loop "$@" ;;                          # bounded delegate->check->retry loops (loop verify | loop escalate); recipes in references/loops.md
-    flow)        cmd_flow "$@" ;;                          # factory flows: ls | show <name> | run <name> --var k=v (factory-flow.sh)
+    flow) _factory_global_flags "$@"; set -- ${_FGF_ARGS[@]+"${_FGF_ARGS[@]}"}; cmd_flow "$@" ;;                          # factory flows: ls | show <name> | run <name> --var k=v (factory-flow.sh)
     status)      cmd_status "$@" ;;                        # job table / one job's state
     classify)    cmd_classify "$@" ;;                       # post-hoc verdict: REUSE-OUTPUT | RETRY-DIFFERENT-LANE | REAL-FAIL
     explain)     cmd_explain "$@" ;;                        # diagnose a job's terminal state: state + reason + marker + verdict
@@ -21059,7 +21081,8 @@ main() {
       [ "$PROVIDER" = "devin" ] || die "parity syncs into Devin only. cc inherits your Claude skills/MCP natively; codex uses its own AGENTS.md + MCP."
       parity ;;
     ""|-h|--help|help)
-      sed -n '2,118p' "$0" | sed 's/^# \{0,1\}//'
+      # The whole leading comment block, so the help never ends mid-sentence as the header grows.
+      awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'
       ;;
     *) case "$cmd" in
          -*) die "'$cmd' looks like a flag, not a subcommand. Global flags (--provider X, --cloud-ack) are accepted before OR after the subcommand, but a subcommand is required. Example: $0 run --provider cc --cloud-ack \"task\"" ;;
