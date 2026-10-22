@@ -524,7 +524,7 @@ _task_dispatch() {
 
   errf="$(_task_dir "$plan" "$tid")/launch.log"
   out="$( export OSRC_WORKTREE="$wt" OSRC_TASK_REF="$plan/$tid"
-          if [ "$wt" = 1 ]; then export OSRC_WORKTREE_BASE="$base_sha"; else unset OSRC_WORKTREE_BASE; fi
+          if [ "$wt" = 1 ]; then export OSRC_WORKTREE_BASE="$base_sha" OSRC_WORKTREE_REQUIRED=1; else unset OSRC_WORKTREE_BASE OSRC_WORKTREE_REQUIRED; fi
           _task_bg_launch "$wd" "${args[@]}" 2>"$errf" )" || rc=$?
   jid="$(printf '%s\n' "$out" | grep -E '^[0-9]{8}-[0-9]{6}-[0-9A-Za-z]+$' | tail -n 1)"
   if [ "$rc" -ne 0 ] || [ -z "$jid" ]; then

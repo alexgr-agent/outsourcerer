@@ -315,6 +315,14 @@ i=0; while [ "$i" -lt 100 ]; do case "$(cat "$OSRC_HOME/jobs/$jid/status" 2>/dev
 i=0; while [ "$i" -lt 150 ] && pgrep -f "$TMP" >/dev/null 2>&1; do sleep 0.1; i=$((i+1)); done
 git -C "$REPO" worktree remove --force "$REPO/.outsourcerer/worktrees/$jid" >/dev/null 2>&1 || true
 
+# ---- a ship worker that cannot get its own worktree must never fall back to the caller's checkout
+# Outside every repo (TMP lives inside this checkout), and git told not to look above it.
+NOGIT="$(mktemp -d)"; NOGIT="$(cd "$NOGIT" && pwd -P)"
+( cd "$NOGIT" && GIT_CEILING_DIRECTORIES="$(dirname "$NOGIT")" OSRC_WORKTREE=1 OSRC_WORKTREE_REQUIRED=1 bash -c ". \"$LIB\"; run_job wtreq droid edit 'touch SHOULD_NOT_EXIST'" ) >/dev/null 2>&1
+check "required worktree unavailable: the job fails closed" "[ \"\$(cat \"$OSRC_HOME/jobs/wtreq/status\" 2>/dev/null)\" = failed ] && grep -q worktree-required-unavailable \"$OSRC_HOME/jobs/wtreq/reason\""
+check "required worktree unavailable: nothing ran in the caller's folder" "[ ! -e \"$NOGIT/SHOULD_NOT_EXIST\" ]"
+rm -rf "$NOGIT"
+
 echo
 echo "factory tasks: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

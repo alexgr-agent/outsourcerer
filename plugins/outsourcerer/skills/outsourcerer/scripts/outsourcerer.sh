@@ -11992,6 +11992,16 @@ run_job() {
       wt=""; wbr=""; wbase=""
     fi
   fi
+  # OSRC_WORKTREE_REQUIRED=1 (factory ship tasks, crew): isolation is the safety contract, so a worker
+  # that could not get its own worktree must NOT fall back to editing the caller's checkout.
+  if [ "${OSRC_WORKTREE:-0}" = "1" ] && [ "${OSRC_WORKTREE_REQUIRED:-0}" = "1" ] && [ -z "$wt" ]; then
+    echo "[outsourcerer] job $id did not start: it needs its own git worktree and one could not be created. Nothing touched your checkout. Check 'git worktree list' and free disk, then retry." >&2
+    rm -f "$jd/setup" 2>/dev/null || true
+    printf 'worktree-required-unavailable\n' > "$jd/reason" 2>/dev/null || true
+    echo 1 > "$jd/exit" 2>/dev/null || true
+    echo failed > "$jd/status"
+    return 1
+  fi
   rm -f "$jd/setup" 2>/dev/null || true   # setup finished; normal launch-grace applies from here
   # peek model/tier for windows + meta (non-fatal)
   _consume_flags "$@" 2>/dev/null || true
@@ -13087,7 +13097,7 @@ cmd_crew() {
   # --- Launch workers isolated, all branched from the SAME pinned base ---
   jq -cn '$ARGS.positional' --args "${tasks[@]}" > "$cdir/tasks.json"   # newline-safe task list
   local gid
-  gid="$(OSRC_WORKTREE_BASE="$base_sha" cmd_fanout --worktree --verb edit ${passthru[@]+"${passthru[@]}"} -- "${tasks[@]}")" || true
+  gid="$(OSRC_WORKTREE_REQUIRED=1 OSRC_WORKTREE_BASE="$base_sha" cmd_fanout --worktree --verb edit ${passthru[@]+"${passthru[@]}"} -- "${tasks[@]}")" || true
   gid="$(printf '%s' "$gid" | tail -1)"
   case "$gid" in fanout-*) ;; *) git -C "$root" worktree remove --force "$iwt" 2>/dev/null; git -C "$root" branch -D "$ibr" 2>/dev/null; die "crew: worker fanout failed to launch (gid='$gid')" ;; esac
   echo "$gid" > "$cdir/fanout_gid"
