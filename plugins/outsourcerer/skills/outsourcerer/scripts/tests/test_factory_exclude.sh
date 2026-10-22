@@ -197,7 +197,7 @@ xc() { bash "$SRC" exclude check "$1" >/dev/null 2>&1; }   # rc0 = excluded
   bash "$SRC" exclude add claude-fable-5 >/dev/null 2>&1
   r=0
   : > "$CALLS"; o="$(bash "$SRC" run -m fable "hi" 2>&1)"
-  printf '%s' "$o" | grep -q "you excluded 'fable' (exclude list entry: claude-fable-5; fable runs claude-fable-5-1 today)" && [ ! -s "$CALLS" ] || { echo "  -m fable: $o"; r=1; }
+  printf '%s' "$o" | grep -q "you excluded 'fable' (exclude list entry: claude-fable-5; fable runs claude-fable-5-1 today, a point release of claude-fable-5)" && [ ! -s "$CALLS" ] || { echo "  -m fable: $o"; r=1; }
   # -m claude passes the alias check, then Devin's live catalog resolves it to a Fable id: refused there.
   o="$(OSRC_SOURCED=1 bash -c '. "$1" >/dev/null 2>&1
     _devin_with_prepare() { DEVIN_WITH_PRE=""; }; need_devin() { :; }; _catalog_validate() { :; }
@@ -219,7 +219,7 @@ xc() { bash "$SRC" exclude check "$1" >/dev/null 2>&1; }   # rc0 = excluded
   export OSRC_HOME; OSRC_HOME="$(xh f1)"
   OSRC_EXCLUDE_MODELS=claude-fable-5 xc anthropic/claude-5-fable && OSRC_EXCLUDE_MODELS=claude-fable-5 xc claude-fable-5-high \
   && OSRC_EXCLUDE_MODELS=anthropic/claude-5-fable xc fable && OSRC_EXCLUDE_MODELS=anthropic/claude-5-fable xc claude-fable-5 \
-  && OSRC_EXCLUDE_MODELS=claude-opus-5 xc opus \
+  && ! OSRC_EXCLUDE_MODELS=claude-opus-5 xc opus && OSRC_EXCLUDE_MODELS=claude-opus-5-5 xc opus \
   && OSRC_EXCLUDE_MODELS=claude xc fable && OSRC_EXCLUDE_MODELS=claude xc opus && OSRC_EXCLUDE_MODELS=claude xc sonnet && OSRC_EXCLUDE_MODELS=claude xc haiku \
   && ! OSRC_EXCLUDE_MODELS=claude xc claudex && ! OSRC_EXCLUDE_MODELS=claude xc gpt-5.5 \
   && OSRC_EXCLUDE_MODELS=z-ai/glm-5.2 xc glm-5.2 && OSRC_EXCLUDE_MODELS=z-ai/glm-5.2 xc glm-5-2 && OSRC_EXCLUDE_MODELS=z-ai/glm-5.2 xc glm \
@@ -436,13 +436,18 @@ second_opinion "is the sky blue"'
   o="$(OSRC_EXCLUDE_MODELS=claude-opus-5-5 bash "$SRC" run -m opus "hi" 2>&1)"
   printf '%s' "$o" | grep -q "you excluded 'opus' (exclude list entry: claude-opus-5-5; opus runs claude-opus-5-5 today)" || { echo "  opus-5-5: $o"; r=1; }
   o="$(OSRC_EXCLUDE_MODELS=claude-fable-5 bash "$SRC" run -m fable "hi" 2>&1)"
-  printf '%s' "$o" | grep -q "you excluded 'fable' (exclude list entry: claude-fable-5; fable runs claude-fable-5-1 today)" || { echo "  fable: $o"; r=1; }
+  printf '%s' "$o" | grep -q "you excluded 'fable' (exclude list entry: claude-fable-5; fable runs claude-fable-5-1 today, a point release of claude-fable-5)" || { echo "  fable: $o"; r=1; }
   OSRC_EXCLUDE_MODELS=opus xc opus && ! OSRC_EXCLUDE_MODELS='claude-opus-4*' xc opus && OSRC_EXCLUDE_MODELS='claude-opus-5*' xc opus || { echo "  family word / globs"; r=1; }
   o="$(OSRC_EXCLUDE_MODELS=gemini-3.5-pro bash "$SRC" exclude check gemini-pro 2>&1)"
   printf '%s' "$o" | grep -q 'picks its model id live.*fail closed' || { echo "  gemini: $o"; r=1; }
+  ! OSRC_EXCLUDE_MODELS=claude-sonnet-5 xc sonnet && OSRC_EXCLUDE_MODELS=claude-sonnet-5 xc claude-sonnet-5 || { echo "  sonnet-5 vs sonnet"; r=1; }
+  o="$(OSRC_EXCLUDE_MODELS=claude-sonnet-5 bash "$SRC" run -m sonnet "hi" 2>&1)"; printf '%s' "$o" | grep -q "you excluded" && { echo "  run -m sonnet refused: $o"; r=1; }
+  o="$(OSRC_EXCLUDE_MODELS=claude-sonnet-5 bash "$SRC" run -m claude-sonnet-5 "hi" 2>&1)"; printf '%s' "$o" | grep -q "you excluded 'claude-sonnet-5'" || { echo "  run -m claude-sonnet-5 allowed: $o"; r=1; }
+  o="$(OSRC_EXCLUDE_MODELS=claude-opus-5 bash "$SRC" run -m opus "hi" 2>&1)"; printf '%s' "$o" | grep -q "you excluded" && { echo "  opus-5 blocked -m opus: $o"; r=1; }
+  grep -q '^OSRC_CLAUDE_POINT_RELEASES="claude-fable-5-1:claude-fable-5"' "$SRC" || { echo "  point-release list missing"; r=1; }
   grep -q '^OSRC_CLAUDE_CURRENT_IDS="fable|claude-fable-5-1 opus|claude-opus-5-5 sonnet|claude-sonnet-5-5 haiku|claude-haiku-5-5"' "$SRC" || { echo "  current-id map missing"; r=1; }
   exit "$r"
-) && ok "bare alias: claude-opus-4-8 leaves -m opus allowed, claude-opus-5-5 and claude-fable-5 refuse opus/fable with the reason, a live-picked Gemini alias fails closed and says why" || bad "bare alias current-id rule"
+) && ok "bare alias: claude-opus-4-8/claude-opus-5/claude-sonnet-5 leave -m opus/-m sonnet allowed (-m claude-sonnet-5 still refused), claude-opus-5-5 and claude-fable-5 (listed point release) refuse opus/fable with the reason, a live-picked Gemini alias fails closed and says why" || bad "bare alias current-id rule"
 
 echo "---"
 echo "test_factory_exclude: $pass passed, $fail failed"

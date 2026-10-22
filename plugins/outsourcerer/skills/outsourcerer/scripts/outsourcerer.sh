@@ -582,6 +582,10 @@ fi
 # Other aliases need no entry: the model table above already maps them (sol -> gpt-5.6-sol, glm ->
 # z-ai/glm-5.2, swe -> swe-1.7); Gemini family aliases pick their id live and fail closed.
 OSRC_CLAUDE_CURRENT_IDS="fable|claude-fable-5-1 opus|claude-opus-5-5 sonnet|claude-sonnet-5-5 haiku|claude-haiku-5-5"
+# Point releases, "<point release>:<its parent>". Excluding the parent also refuses a bare alias whose
+# current id is listed here (exclude claude-fable-5 -> -m fable refused). Never inferred from version
+# shape: claude-sonnet-5-5 is NOT a point release of claude-sonnet-5. UPDATE ON EVERY CLAUDE RELEASE.
+OSRC_CLAUDE_POINT_RELEASES="claude-fable-5-1:claude-fable-5"
 
 # Interactive tmux session name, derived from the working directory AND, when set,
 # the owning Claude Code session id. Deriving it from the cwd alone means two
@@ -5526,8 +5530,9 @@ _quota_note_refusal() {  # <lane-or-disp> <model> [reset]
 #     entry (gpt-5.5 does NOT cover gpt-5.5-mini; gemini-flash does NOT cover gemini-flash-lite).
 # A bare family alias is refused when the family word itself is excluded, or when an entry covers the
 # id the alias runs TODAY: the model table for sol/terra/luna/glm/swe..., OSRC_CLAUDE_CURRENT_IDS for
-# fable/opus/sonnet/haiku (an exact entry also covers the current id when that id is its point
-# release: claude-fable-5 refuses -m fable = claude-fable-5-1; claude-opus-4-8 leaves -m opus alone).
+# fable/opus/sonnet/haiku (an entry also covers the current id when that id is LISTED in
+# OSRC_CLAUDE_POINT_RELEASES as its point release: claude-fable-5 refuses -m fable = claude-fable-5-1;
+# claude-sonnet-5 and claude-opus-4-8 leave -m sonnet / -m opus alone).
 # Gemini family aliases pick their id live, so any excluded version of the family refuses them (fail
 # closed, and the refusal says why). `claude` covers every Claude family. A glob (* and ? only;
 # every other character is literal) is matched against the name, its prefix-less form, its table id
@@ -5614,7 +5619,7 @@ _exclude_env_entries() {
 #   mode=hits  : print "<name>\t<entry>" for every excluded input line (the line is the name)
 #   mode=keep  : print every input line whose FIRST WORD is not excluded (display filters)
 _exclude_awk() {
-  OSRC_EXCL_TABLE="$OSRC_MODEL_TABLE" OSRC_EXCL_CUR="$OSRC_CLAUDE_CURRENT_IDS" LC_ALL=C awk -v mode="$1" '
+  OSRC_EXCL_TABLE="$OSRC_MODEL_TABLE" OSRC_EXCL_CUR="$OSRC_CLAUDE_CURRENT_IDS" OSRC_EXCL_PR="$OSRC_CLAUDE_POINT_RELEASES" LC_ALL=C awk -v mode="$1" '
     function isnum(t) { return t ~ /^[0-9]+$/ }
     function tokstr(s,   n, a, i, o) {
       n = split(s, a, /[^a-z0-9]+/); o = ""
@@ -5653,7 +5658,7 @@ _exclude_awk() {
       for (i = 1; i <= n; i++) if (!isnum(a[i]) && !(a[i] in Q) && a[i] != "anthropic") o = o " " a[i]
       return o
     }
-    function cmatch(e, c, relax,   ea, ca, ne, nc, i, j, ok, nx) {
+    function cmatch(e, c,   ea, ca, ne, nc, i, j, ok, nx) {
       ne = split(e, ea, " "); nc = split(c, ca, " ")
       if (ne == 0 || ne > nc) return 0
       for (i = 0; i + ne <= nc; i++) {
@@ -5662,7 +5667,7 @@ _exclude_awk() {
         if (!ok) continue
         if (i + ne == nc) return 1
         nx = ca[i + ne + 1]
-        if (isnum(nx)) { if (relax || length(nx) >= 6 || !isnum(ea[ne])) return 1; continue }
+        if (isnum(nx)) { if (length(nx) >= 6 || !isnum(ea[ne])) return 1; continue }
         if (ne >= 2 && (nx in SIB)) continue
         return 1
       }
@@ -5681,16 +5686,17 @@ _exclude_awk() {
     }
     function norm(s) { s = tolower(s); sub(/\[[0-9]+[a-z]*\]$/, "", s); return s }
     # excluded(name) -> the matching entry ("" = allowed); WHY_ carries a reason worth printing.
-    function excluded(name,   x, CFm, CCm, j, k, e, cur, CCG) {
+    function excluded(name,   x, CFm, CCm, CPm, j, k, e, cur, par, CCG) {
       x = norm(name); WHY_ = ""
       if (x == "") return ""
       forms(x, CFm)
       for (k = 1; k <= G_[0]; k++) CG[k] = G_[k]; CG[0] = G_[0]
       cfl = FLOAT_; csig = SIG_
-      cur = (x in CUR) ? CUR[x] : ""
+      cur = (x in CUR) ? CUR[x] : ""; par = ""; CPm[0] = 0
       if (cur != "") {
         forms(cur, CCm)
         for (k = 1; k <= G_[0]; k++) CCG[k] = G_[k]; CCG[0] = G_[0]
+        if (cur in PAR) { par = PAR[cur]; forms(par, CPm) }
       }
       for (e = 1; e <= NE; e++) {
         if (EGLOB[e] != "") {
@@ -5705,13 +5711,18 @@ _exclude_awk() {
         }
         for (j = 1; j <= EF[e, 0]; j++)
           for (k = 1; k <= CFm[0]; k++)
-            if (cmatch(EF[e, j], CFm[k], 0)) return ENT[e]
+            if (cmatch(EF[e, j], CFm[k])) return ENT[e]
         if (cur != "") {
-          # The bare alias runs its CURRENT id. An exact entry covers it when it names that id or the
-          # release it is a point release of (claude-fable-5 covers fable = claude-fable-5-1).
-          for (j = 1; j <= EF[e, 0]; j++)
+          # The bare alias runs its CURRENT id. An entry covers it when it covers that id exactly, or
+          # when that id is LISTED as a point release of what the entry covers (OSRC_CLAUDE_POINT_RELEASES:
+          # claude-fable-5 covers fable = claude-fable-5-1). Never inferred from the version shape:
+          # claude-sonnet-5 is a different model from claude-sonnet-5-5.
+          for (j = 1; j <= EF[e, 0]; j++) {
             for (k = 1; k <= CCm[0]; k++)
-              if (cmatch(EF[e, j], CCm[k], 1)) { WHY_ = x " runs " cur " today"; return ENT[e] }
+              if (cmatch(EF[e, j], CCm[k])) { WHY_ = x " runs " cur " today"; return ENT[e] }
+            for (k = 1; k <= CPm[0]; k++)
+              if (cmatch(EF[e, j], CPm[k])) { WHY_ = x " runs " cur " today, a point release of " par; return ENT[e] }
+          }
         } else if (cfl && EVER[e] && ESIG[e] != "" && ESIG[e] == csig) {
           WHY_ = x " picks its model id live, so outsourcerer cannot tell which version it would run (fail closed); name an exact id with -m"
           return ENT[e]
@@ -5725,6 +5736,8 @@ _exclude_awk() {
       split("mini nano lite flash lightning air small micro tiny", t, " "); for (i in t) SIB[t[i]] = 1
       nr = split(ENVIRON["OSRC_EXCL_CUR"], rows, " ")
       for (i = 1; i <= nr; i++) if (split(rows[i], f, "|") == 2) CUR[tolower(f[1])] = tolower(f[2])
+      nr = split(ENVIRON["OSRC_EXCL_PR"], rows, " ")
+      for (i = 1; i <= nr; i++) if (split(rows[i], f, ":") == 2) PAR[tolower(f[1])] = tolower(f[2])
       nr = split(ENVIRON["OSRC_EXCL_TABLE"], rows, "\n")
       for (i = 1; i <= nr; i++) {
         if (split(rows[i], f, "|") < 2) continue
