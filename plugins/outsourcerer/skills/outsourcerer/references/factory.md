@@ -188,7 +188,7 @@ outsourcerer.sh plan run onboarding-copy
 outsourcerer.sh task release t5 --answer "Candidate 2"
 outsourcerer.sh land t3
 ```
-<!-- TODO-merge: confirm best-of-n's variable for the candidate count and the stage-to-tid numbering (factory-flow-cli.md). -->
+With `n=3` the plan gets t1 to t3 (candidates), t4 (compare) and t5 (your pick).
 
 Flows are plain JSON (`name`, `description`, `vars`, and `stages` with `id`, `title`, `shape`, `verb`,
 `model`, `deps`, `prompt`, `check`, `hold`). Copy one to make your own.
@@ -227,5 +227,4 @@ so a new orchestrator sees it before it routes anything.
 - `references/factory-tasks-cli.md`: `plan` and `task` subcommands and the data model.
 - `references/factory-land-cli.md`: `land` and the done contract.
 - `references/factory-flow-cli.md`: `plan run`, `flow`, and the flow JSON format.
-  <!-- TODO-merge: file name assumed. -->
 - `exclude` is covered above and in `lanes-and-models.md`.

@@ -135,3 +135,4 @@ For multi-step work with dependencies, use a **plan** rather than a chain of one
 - `references/factory.md`: plans, done contract, held decisions, merge gate, flows, crash recovery
 - `references/factory-tasks-cli.md`: every `plan` and `task` flag, the brief, plan files
 - `references/factory-land-cli.md`: every `land` flag, done-contract rules, `evidence.json`
+- `references/factory-flow-cli.md`: `plan run`, `flow`, and the flow JSON format

@@ -28,7 +28,7 @@ much hand-holding a model needs, NOT how much it costs. Cost is tracked separate
 | Tier | Models | Wrapper | Stall windows (warn/kill/hard) |
 |---|---|---|---|
 | `frontier` | Opus/Fable, GPT-5.6 (sol/terra), gemini-pro | thin, full autonomy | 300 / 900 / 3600 s |
-| `capable` | **GLM-5.2, Hy3, DeepSeek-v4-pro** (frontier CAPABILITY, budget PRICE, ~Opus-4.8 class) | thin, full autonomy (SAME as frontier) | 300 / 900 / 3600 s |
+| `capable` | **GLM-5.2, Hy3, DeepSeek-v4-pro** (frontier CAPABILITY, budget PRICE, near-frontier) | thin, full autonomy (SAME as frontier) | 300 / 900 / 3600 s |
 | `mid` | Sonnet, Luna, gemini-flash | plans before acting | 150 / 420 / 1800 s |
 | `budget` | Haiku, gemini-flash-lite, `*-mini`/`*-nano`/`*-lite` | strict work-order (do exactly this, don't improvise) | 90 / 240 / 900 s |
 

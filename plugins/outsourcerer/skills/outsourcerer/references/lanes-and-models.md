@@ -39,8 +39,8 @@ ChatGPT / Claude subscription auth, so they are premium and are **never** auto-e
 | `gemini-flash-lite` | newest `gemini-*-flash-lite` (live; agy has no lite tier, so flash there) | gemini | budget | cheapest Gemini text tier |
 | `gpt-image` / `codex-image` | `gpt-image-2` | codex-image | budget | **PREFERRED** image backend, **NOT** a text lane, use `image`; KEYLESS (Codex/ChatGPT sub) |
 | `nano-banana` | newest `gemini-*-flash-image` the API serves (live) | gemini-image | budget | image FALLBACK #2, **NOT** a text lane, use `image`; needs `GEMINI_API_KEY` |
-| `glm` | `z-ai/glm-5.2` | OpenRouter | **capable** | frontier CAPABILITY, budget PRICE (~Opus-4.8 class); default cheap lane (`--provider cc`/`codex`) |
-| `hy3` | `tencent/hy3:free` | OpenRouter | **capable** | ~Opus-4.8 class; `:free` = provider may train on inputs |
+| `glm` | `z-ai/glm-5.2` | OpenRouter | **capable** | frontier CAPABILITY, budget PRICE (near-frontier); default cheap lane (`--provider cc`/`codex`) |
+| `hy3` | `tencent/hy3:free` | OpenRouter | **capable** | near-frontier; `:free` = provider may train on inputs |
 | `deepseek` | `deepseek/deepseek-v4-pro` | OpenRouter | **capable** | strongest cheap lane, pro reasoning flagship |
 | any other OpenRouter id | itself | OpenRouter | by cached price, then name | see tiers below |
 | `glm-5.2` under `--provider devin` | Devin's id | devin | table/name | Devin path unchanged |
@@ -309,7 +309,7 @@ Recommendation rules:
   note below). For agentic/edit work `advise` now prefers **`glm-5.3-flash-high`** (lighter, same
   capability class) when it is available.
 - **Cheap ≠ dumb.** `glm-5.2`/`hy3`/`deepseek-v4-pro` are the **`capable`** tier: frontier capability
-  at budget price (~Opus-4.8 class). They are valid for high-stakes reasoning, security review, and
+  at budget price (near-frontier). They are valid for high-stakes reasoning, security review, and
   deep judgment, not just grunt work. See `effort-and-tiers.md`. Pair them with `--effort high`/`max`
   when the task is hard. Only route AWAY from genuinely *small* models (`haiku`/`gemini-flash-lite`/`*-mini`).
 - The **open-weight** families (`glm*`, `deepseek*`, `kimi*`, `swe*`) are usually the free / low-cost lane, recommend these when the user wants "a free model."
