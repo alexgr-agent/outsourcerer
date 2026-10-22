@@ -20078,6 +20078,13 @@ $feedback"
   case "$state" in success) return 0 ;; blocked) return 3 ;; *) return 2 ;; esac   # max_turns/max_time share 2: both mean "ran out of room, not converged"
 }
 
+# ---- software factory (0.14.0): plan/task graph, done contract + land gate, flows ----
+# Load the factory files from THIS script's real folder. $SCRIPT_DIR comes from $0, which is wrong
+# both through a PATH launcher symlink and when this file is sourced (tests, OSRC_SOURCED=1, where $0
+# is the caller), so resolve BASH_SOURCE with symlinks followed and fall back to $SCRIPT_DIR.
+_OSRC_FACTORY_DIR="$(_osrc_realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null)" && _OSRC_FACTORY_DIR="$(dirname "$_OSRC_FACTORY_DIR")" || _OSRC_FACTORY_DIR="$SCRIPT_DIR"
+for _f in factory-tasks factory-land factory-flow; do [ -f "$_OSRC_FACTORY_DIR/$_f.sh" ] && . "$_OSRC_FACTORY_DIR/$_f.sh"; done; unset _f
+
 main() {
   # Mint this run's marker id once, and export it so the prompt the delegate receives and every
   # supervisor that grades its output agree on the same value. A detached bg job re-enters this
@@ -20162,6 +20169,8 @@ main() {
     edit)        route_delegate "accept-edits" "$cmd" "$@" ;;
     yolo)        route_delegate "dangerous" "$cmd" "$@" ;;
     bg)          cmd_bg "$@" ;;                            # background: detach a supervised job, print id
+    plan)        cmd_plan "$@" ;;                          # factory: durable plan graph (plan new|ls|show|use|rm|run)
+    task)        cmd_task "$@" ;;                          # factory: tasks in a plan (add|ls|show|ready|start|hold|release|done|fail|cancel|retry)
     fanout)      cmd_fanout "$@" ;;                        # parallel N-way multi-subagent (+ status|wait|collect|list)
     fleet)       cmd_fleet "$@" ;;                         # unified managed + independent Claude Code fleet
     crew)        cmd_crew "$@" ;;                          # transactional write-swarm: fanout --worktree edit -> grade -> revert-or-promote
