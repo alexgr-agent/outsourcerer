@@ -33,6 +33,13 @@ _factory_need_jq() {
   have jq || die "the plan and task commands need jq. Install it (brew install jq, apt install jq, or winget install jqlang.jq) and try again."
 }
 
+# _factory_optval <option> <args-left> -> die plainly when an option that takes a value is the last
+# argument. Every option parser calls this before `shift 2`: bash refuses `shift 2` with one argument
+# left and, without set -e, the parse loop would spin forever on the same option.
+_factory_optval() {
+  [ "${2:-0}" -ge 2 ] 2>/dev/null || die "$1 needs a value after it (for example: $1 \"...\")."
+}
+
 _plans_root() { printf '%s/plans' "$OSRC_HOME"; }
 
 _plan_name_ok() {
@@ -88,49 +95,108 @@ _factory_write_file() {
 
 # ---------------------------------------------------------------- the plan lock
 # mkdir is the portable atomic (no flock on stock macOS). The owner file records "pid start-identity"
-# so a waiter can prove the holder died and reclaim, the same pattern as _state_lock_acquire. Two
-# extra escape hatches: an ownerless lock older than 30s (holder killed between mkdir and publishing),
-# and any lock older than OSRC_PLAN_LOCK_STALE_SECS (default 120s): nothing legitimately holds a plan
-# lock that long, because worker launches happen OUTSIDE the lock. The lock is re-entrant within one
-# process tree (a nested call made while we hold it, including from a command substitution, proceeds).
+# so a waiter can prove the holder died and reclaim, the same pattern as _state_lock_acquire and the
+# land queue lock. A LIVE holder is never robbed, however long it holds: the only escape hatches are a
+# provably dead (or recycled) owner pid, and an ownerless lock older than 30s (holder killed between
+# mkdir and publishing). The owner pid is the holder's REAL pid even inside a subshell on bash 3.2
+# (no BASHPID there), so a subshell that dies holding the lock is reclaimable while its parent lives.
+# The lock is re-entrant within one process tree (a nested call made while we hold it, including
+# from a command substitution, proceeds).
 _FACTORY_LOCK_PLAN=""
 _FACTORY_LOCK_DEPTH=0
+_FACTORY_LOCK_OWNER=""
+
+# _factory_self_pid [scratch-dir] -> sets _FACTORY_SELF_PID to this process's own pid, also inside a
+# subshell on bash 3.2 (no BASHPID there, and $$ is the PARENT's pid). `sh -c 'echo $PPID'` run as a
+# plain command is forked by THIS shell, so its parent is us. It sets a variable instead of printing
+# because a $(...) around it would itself be the forking subshell and report the wrong pid.
+_FACTORY_SELF_PID=""
+_factory_self_pid() {
+  if [ -n "${BASHPID:-}" ]; then _FACTORY_SELF_PID="$BASHPID"; return 0; fi
+  local d="${1:-$OSRC_HOME}" f p=""
+  f="$d/.selfpid.$$.${RANDOM:-0}"
+  sh -c 'echo $PPID' > "$f" 2>/dev/null && { read -r p < "$f"; } 2>/dev/null
+  rm -f "$f" 2>/dev/null
+  case "$p" in ''|*[!0-9]*) p="$$" ;; esac
+  _FACTORY_SELF_PID="$p"
+}
+
+# _factory_owner_dead <pid> <start-identity> -> rc0 only when the owner is PROVABLY gone (ps works and
+# the pid is absent, or the pid now belongs to a process with a different start time).
+_factory_owner_dead() {
+  local o_pid="$1" o_start="$2" cur _rc=0
+  case "$o_pid" in ''|*[!0-9]*) return 1 ;; esac
+  cur="$(_pid_start_identity "$o_pid" 2>/dev/null)" || _rc=$?
+  [ "$_rc" -eq 2 ] && return 0
+  [ "$_rc" -eq 0 ] && [ -n "$o_start" ] && [ "$cur" != "$o_start" ] && return 0
+  # ps unusable (rc1): fall back to kill -0, which can only prove absence.
+  [ "$_rc" -eq 1 ] && ! kill -0 "$o_pid" 2>/dev/null && return 0
+  return 1
+}
+
+# _factory_lock_break <lock> <observed-owner-line|""> <me> -> remove a stale lock, but only if it is
+# still the exact lock we judged. Breakers serialize on a steal guard ($lock.steal, itself a mkdir
+# lock): inside it the owner is re-read, and the lock is moved aside only if unchanged (an ownerless
+# lock: only if still ownerless). Without the guard, two waiters that both judged the same dead owner
+# could each break in turn, and the second would delete the FIRST one's freshly acquired live lock.
+# The moved corpse is re-read once more; if it is not the stale record, it goes back.
+_factory_lock_break() {
+  local lock="$1" seen="$2" me="$3" now_line="" corpse_line="" corpse guard gage rc=1
+  guard="$lock.steal"
+  if ! _mkdir_claim "$guard"; then
+    # A breaker killed inside the guard would wedge every later break: the guard is held for
+    # milliseconds, so one older than 30s is abandoned.
+    gage="$(_mtime "$guard" 2>/dev/null || echo 0)"; case "$gage" in ''|*[!0-9]*) gage=0 ;; esac
+    if [ "$gage" -gt 0 ] && [ $(( $(date +%s) - gage )) -ge 30 ]; then rmdir "$guard" 2>/dev/null || rm -rf "$guard" 2>/dev/null; fi
+    return 1
+  fi
+  if [ -d "$lock" ]; then
+    { IFS= read -r now_line < "$lock/owner"; } 2>/dev/null || now_line=""
+    if [ "$now_line" = "$seen" ] && { [ -n "$seen" ] || [ ! -f "$lock/owner" ]; }; then
+      corpse="$lock.stale.$me.${RANDOM:-0}"
+      if mv "$lock" "$corpse" 2>/dev/null; then
+        { IFS= read -r corpse_line < "$corpse/owner"; } 2>/dev/null || corpse_line=""
+        if [ "$corpse_line" = "$seen" ]; then
+          rm -rf "$corpse" 2>/dev/null; rc=0
+        else
+          [ -e "$lock" ] || mv "$corpse" "$lock" 2>/dev/null
+        fi
+      fi
+    fi
+  fi
+  rmdir "$guard" 2>/dev/null || true
+  return "$rc"
+}
 
 _plan_lock() {
-  local plan="$1" lock owner tries=0 o_pid o_start cur _rc age stale me corpse
+  local plan="$1" lock owner tries=0 o_pid o_start o_line age me
   if [ "$_FACTORY_LOCK_PLAN" = "$plan" ] && [ "$_FACTORY_LOCK_DEPTH" -gt 0 ]; then
     _FACTORY_LOCK_DEPTH=$((_FACTORY_LOCK_DEPTH + 1)); return 0
   fi
   lock="$(_plan_dir "$plan")/.lock"; owner="$lock/owner"
-  stale="${OSRC_PLAN_LOCK_STALE_SECS:-120}"; case "$stale" in ''|*[!0-9]*) stale=120 ;; esac
-  me="${BASHPID:-$$}"
+  me=""
   while [ "$tries" -lt "${OSRC_PLAN_LOCK_TRIES:-150}" ]; do
-    if mkdir "$lock" 2>/dev/null; then
-      printf '%s %s\n' "$me" "$(_pid_start_identity "$me" 2>/dev/null)" > "$lock/owner.$me" 2>/dev/null \
+    if _mkdir_claim "$lock"; then
+      [ -n "$me" ] || { _factory_self_pid "$lock"; me="$_FACTORY_SELF_PID"; }
+      _FACTORY_LOCK_OWNER="$me $(_pid_start_identity "$me" 2>/dev/null)"
+      printf '%s\n' "$_FACTORY_LOCK_OWNER" > "$lock/owner.$me" 2>/dev/null \
         && mv -f "$lock/owner.$me" "$owner" 2>/dev/null
       _FACTORY_LOCK_PLAN="$plan"; _FACTORY_LOCK_DEPTH=1
       return 0
     fi
-    age="$(_mtime "$lock" 2>/dev/null || echo 0)"; case "$age" in ''|*[!0-9]*) age=0 ;; esac
-    [ "$age" -gt 0 ] && age=$(( $(date +%s) - age )) || age=0
     if [ -f "$owner" ]; then
-      o_pid=""; o_start=""
-      { read -r o_pid o_start < "$owner"; } 2>/dev/null || true
-      case "$o_pid" in
-        ''|*[!0-9]*) ;;
-        *)
-          _rc=0; cur="$(_pid_start_identity "$o_pid" 2>/dev/null)" || _rc=$?
-          if [ "$_rc" -eq 2 ] || { [ "$_rc" -eq 0 ] && [ -n "$o_start" ] && [ "$cur" != "$o_start" ]; } \
-             || ! kill -0 "$o_pid" 2>/dev/null || [ "$age" -ge "$stale" ]; then
-            corpse="$lock.stale.$me.${RANDOM:-0}"
-            mv "$lock" "$corpse" 2>/dev/null && rm -rf "$corpse" 2>/dev/null
-            continue
-          fi ;;
-      esac
-    elif [ "$age" -ge 30 ]; then
-      corpse="$lock.stale.$me.${RANDOM:-0}"
-      mv "$lock" "$corpse" 2>/dev/null && rm -rf "$corpse" 2>/dev/null
-      continue
+      o_line=""; { IFS= read -r o_line < "$owner"; } 2>/dev/null || o_line=""
+      o_pid="${o_line%% *}"; o_start=""; case "$o_line" in *" "*) o_start="${o_line#* }" ;; esac
+      if [ -n "$o_line" ] && _factory_owner_dead "$o_pid" "$o_start"; then
+        [ -n "$me" ] || me="${BASHPID:-$$}"
+        _factory_lock_break "$lock" "$o_line" "$me" && continue
+      fi
+    else
+      age="$(_mtime "$lock" 2>/dev/null || echo 0)"; case "$age" in ''|*[!0-9]*) age=0 ;; esac
+      if [ "$age" -gt 0 ] && [ $(( $(date +%s) - age )) -ge 30 ]; then
+        [ -n "$me" ] || me="${BASHPID:-$$}"
+        _factory_lock_break "$lock" "" "$me" && continue
+      fi
     fi
     sleep 0.1
     tries=$((tries + 1))
@@ -140,14 +206,20 @@ _plan_lock() {
 }
 
 _plan_unlock() {
-  local plan="$1" lock
+  local plan="$1" lock cur=""
   [ "$_FACTORY_LOCK_PLAN" = "$plan" ] || return 0
   _FACTORY_LOCK_DEPTH=$((_FACTORY_LOCK_DEPTH - 1))
   [ "$_FACTORY_LOCK_DEPTH" -gt 0 ] && return 0
   lock="$(_plan_dir "$plan")/.lock"
-  rm -f "$lock/owner" "$lock"/owner.* 2>/dev/null
-  rmdir "$lock" 2>/dev/null || true
-  _FACTORY_LOCK_PLAN=""; _FACTORY_LOCK_DEPTH=0
+  # Only remove the lock if it is still ours: if a waiter wrongly broke it and someone else now holds
+  # the path, removing it would let a third writer in. No owner record at all means our own publish
+  # failed (disk full), so the lock is still ours to remove.
+  { IFS= read -r cur < "$lock/owner"; } 2>/dev/null || cur=""
+  if [ -z "$_FACTORY_LOCK_OWNER" ] || [ -z "$cur" ] || [ "$cur" = "$_FACTORY_LOCK_OWNER" ]; then
+    rm -f "$lock/owner" "$lock"/owner.* 2>/dev/null
+    rmdir "$lock" 2>/dev/null || true
+  fi
+  _FACTORY_LOCK_PLAN=""; _FACTORY_LOCK_DEPTH=0; _FACTORY_LOCK_OWNER=""
 }
 
 # ---------------------------------------------------------------- events + wake
@@ -278,11 +350,26 @@ _task_update() {
   return "$rc"
 }
 
+# Fields a caller of _task_new may not set: identity, bookkeeping the dispatcher and done contract own,
+# and landing records. They are reset to their defaults whatever the caller passed.
+_FACTORY_TASK_PROTECTED='["schema","id","plan","attempts","job","jobs","worktree","branch","base_sha","head_sha","evidence","created","updated","landed","landed_into","landed_sha","pr","claimed_at","claimed_by","launch_failed"]'
+
 # _task_new <plan> <json-object> -> allocate the next tid under the lock, merge the fields over the
 # defaults, validate deps exist, write the task, print the tid. Deps can only name tasks that already
-# exist, so the graph is acyclic by construction.
+# exist, so the graph is acyclic by construction. Protected fields (see above) are ignored; a new task
+# starts todo, or held when the caller asks for a decision up front (state "held").
 _task_new() {
-  local plan="$1" fields="$2" n max=0 f tid now task missing
+  local plan="$1" fields="$2" n max=0 f tid now task missing d bad="" st
+  fields="$(printf '%s' "$fields" | jq -c 'if type == "object" then . else error("not an object") end' 2>/dev/null)" \
+    || { echo "outsourcerer: a new task must be described by a JSON object." >&2; return 1; }
+  st="$(printf '%s' "$fields" | jq -r '.state // "todo"')"
+  case "$st" in todo|held) ;; *) echo "outsourcerer: a new task starts as todo or held, not '$st'." >&2; return 1 ;; esac
+  printf '%s' "$fields" | jq -e '(.deps // []) | type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 \
+    || { echo "outsourcerer: a task's deps must be a list of task ids (t1, t2, ...)." >&2; return 1; }
+  for d in $(printf '%s' "$fields" | jq -r '(.deps // [])[]'); do
+    _task_id_ok "$d" || bad="$bad $d"
+  done
+  [ -z "$bad" ] || { echo "outsourcerer: '${bad# }' is not a task id (they look like t1, t2, ...)." >&2; return 1; }
   _plan_lock "$plan" || return 1
   for f in "$(_plan_dir "$plan")"/tasks/t*.json "$(_plan_dir "$plan")"/tasks/t*; do
     [ -e "$f" ] || continue
@@ -291,20 +378,22 @@ _task_new() {
     [ "$n" -gt "$max" ] && max="$n"
   done
   tid="t$((max + 1))"
-  missing="$(printf '%s' "$fields" | jq -r '(.deps // [])[]' | while IFS= read -r d; do
-    [ -f "$(_task_file "$plan" "$d")" ] || printf '%s ' "$d"; done)"
+  missing=""
+  for d in $(printf '%s' "$fields" | jq -r '(.deps // [])[]'); do
+    [ -f "$(_task_file "$plan" "$d")" ] || missing="$missing$d "
+  done
   if [ -n "$missing" ]; then
     _plan_unlock "$plan"
     echo "outsourcerer: the dependency ${missing% } does not exist in plan '$plan'. Add that task first (see: outsourcerer task ls)." >&2
     return 1
   fi
   now="$(_factory_now)"
-  task="$(jq -cn --arg id "$tid" --arg plan "$plan" --arg now "$now" --argjson f "$fields" '
-    {schema:1,id:$id,plan:$plan,title:"",shape:"scout",state:"todo",deps:[],prompt:"",spec:"",check:"",
+  task="$(printf '%s' "$fields" | jq -c --arg id "$tid" --arg plan "$plan" --arg now "$now" --argjson prot "$_FACTORY_TASK_PROTECTED" '
+    . as $f | {schema:1,id:$id,plan:$plan,title:"",shape:"scout",state:"todo",deps:[],prompt:"",spec:"",check:"",
      verb:"",model:"",provider:"",deliver:"local",retries:1,attempts:0,job:"",jobs:[],
      worktree:"",branch:"",base_sha:"",head_sha:"",hold:{reason:"",until:"",answer:""},
      result:"",evidence:"",flow:{name:"",stage:""},created:$now,updated:$now}
-    * $f | .id = $id | .plan = $plan
+    * ($f | delpaths([$prot[] | [.]])) | .id = $id | .plan = $plan
     | if .verb == "" then .verb = (if .shape == "ship" then "edit" else "run" end) else . end
     | if .prompt == "" then .prompt = .title else . end')" || { _plan_unlock "$plan"; return 1; }
   mkdir -p "$(_task_dir "$plan" "$tid")" 2>/dev/null
@@ -321,7 +410,7 @@ _task_new() {
 # _factory_trim <max-chars> < text -> text capped at max chars (by character, not byte, so UTF-8
 # never splits), with a visible marker when cut.
 _factory_trim() {
-  jq -Rrs --argjson n "$1" 'if length > $n then .[0:$n] + "\n[... trimmed; the full text is at the path below]" else . end'
+  jq -Rrs --argjson n "$1" --arg w "${2:-at the path below}" 'if length > $n then .[0:$n] + "\n[... trimmed; the full text is \($w)]" else . end'
 }
 
 # _task_output_path <plan> <task-json> -> the best full-output file for a task: its report.md, else
@@ -338,24 +427,31 @@ _task_output_path() {
 # _task_brief <plan> <tid> -> write tasks/<tid>/brief.md and print its path. This is the ONLY context
 # a worker gets beyond the repo, so it carries: the plan goal, the task, the spec, the done rules,
 # every direct dependency's result (bounded, with the path to the full text), and the captain's
-# decisions. Bounded: spec inline up to 64KB, each dependency's output up to ~4KB.
+# decisions. Complete but bounded, so a brief never balloons whatever the inputs hold: spec inline up
+# to 64KB (else linked), the prompt 32KB, the goal 2KB, each dependency's summary 2KB and output 4KB,
+# each captain answer 4KB, and at most OSRC_BRIEF_MAX_DEPS (12) dependency sections; the rest are
+# listed by id with where their reports live. Every cut says where the full text is.
+_FACTORY_BRIEF_MAX_DEPS_DEFAULT=12
 _task_brief() {
   local plan="$1" tid="$2" t pj goal repo base title shape prompt spec check deps d dt dshape dtitle
   local dres out_path out_txt dbr dhead djob ans dans ddir brief attempts prev reason until sz
+  local maxdeps ndeps shown more tdir_all
   t="$(_task_get "$plan" "$tid")" || return 1
   pj="$(jq -c . "$(_plan_dir "$plan")/plan.json" 2>/dev/null)" || pj='{}'
-  goal="$(printf '%s' "$pj" | jq -r '.goal // ""')"
+  goal="$(printf '%s' "$pj" | jq -r '.goal // ""' | _factory_trim 2000 "in $(_plan_dir "$plan")/plan.json")"
   repo="$(printf '%s' "$pj" | jq -r '.repo // ""')"
   base="$(printf '%s' "$pj" | jq -r '.base_branch // ""')"
-  title="$(printf '%s' "$t" | jq -r '.title // ""')"
+  title="$(printf '%s' "$t" | jq -r '.title // "" | .[0:300]')"
   shape="$(printf '%s' "$t" | jq -r '.shape // "scout"')"
-  prompt="$(printf '%s' "$t" | jq -r '.prompt // ""')"
+  prompt="$(printf '%s' "$t" | jq -r '.prompt // ""' | _factory_trim 32000 "in $(_task_file "$plan" "$tid") (field prompt)")"
   spec="$(printf '%s' "$t" | jq -r '.spec // ""')"
   check="$(printf '%s' "$t" | jq -r '.check // ""')"
   attempts="$(printf '%s' "$t" | jq -r '.attempts // 0')"
-  prev="$(printf '%s' "$t" | jq -r '.result // ""')"
-  ans="$(printf '%s' "$t" | jq -r '.hold.answer // ""')"
-  reason="$(printf '%s' "$t" | jq -r '.hold.reason // ""')"
+  prev="$(printf '%s' "$t" | jq -r '.result // ""' | _factory_trim 2000 "in $(_task_file "$plan" "$tid") (field result)")"
+  ans="$(printf '%s' "$t" | jq -r '.hold.answer // ""' | _factory_trim 4000 "in $(_task_file "$plan" "$tid") (field hold.answer)")"
+  reason="$(printf '%s' "$t" | jq -r '.hold.reason // ""' | _factory_trim 2000 "in $(_task_file "$plan" "$tid") (field hold.reason)")"
+  maxdeps="${OSRC_BRIEF_MAX_DEPS:-$_FACTORY_BRIEF_MAX_DEPS_DEFAULT}"; case "$maxdeps" in ''|*[!0-9]*) maxdeps=$_FACTORY_BRIEF_MAX_DEPS_DEFAULT ;; esac
+  tdir_all="$(_plan_dir "$plan")/tasks"
   ddir="$(_task_dir "$plan" "$tid")"; mkdir -p "$ddir" 2>/dev/null
   brief="$ddir/brief.md"
   {
@@ -397,11 +493,20 @@ _task_brief() {
     if [ -n "$deps" ]; then
       printf '## Inputs from finished work\n\n'
       printf 'These tasks finished before yours and feed into it. Build on them; do not redo them.\n\n'
+      ndeps="$(printf '%s\n' "$deps" | grep -c .)"; shown=0
       for d in $deps; do
+        if [ "$shown" -ge "$maxdeps" ]; then
+          more=$((ndeps - shown))
+          printf '### %s more finished input(s) not shown here\n\n' "$more"
+          printf 'They are: %s. Read each one'"'"'s full report at %s/<id>/report.md (or its brief.md for what it was asked).\n\n' \
+            "$(printf '%s\n' "$deps" | sed -n "$((shown + 1)),\$p" | head -n 50 | tr '\n' ' ' | sed 's/ $//;s/ /, /g')$( [ "$more" -gt 50 ] && echo ', ...')" "$tdir_all"
+          break
+        fi
+        shown=$((shown + 1))
         dt="$(_task_get "$plan" "$d" 2>/dev/null)" || { printf '### %s (missing)\nThis dependency could not be read.\n\n' "$d"; continue; }
-        dtitle="$(printf '%s' "$dt" | jq -r '.title // ""')"
+        dtitle="$(printf '%s' "$dt" | jq -r '.title // "" | .[0:300]')"
         dshape="$(printf '%s' "$dt" | jq -r '.shape // "scout"')"
-        dres="$(printf '%s' "$dt" | jq -r '.result // ""')"
+        dres="$(printf '%s' "$dt" | jq -r '.result // ""' | _factory_trim 2000 "in $(_task_file "$plan" "$d") (field result)")"
         dbr="$(printf '%s' "$dt" | jq -r '.branch // ""')"
         dhead="$(printf '%s' "$dt" | jq -r '.head_sha // ""')"
         djob="$(printf '%s' "$dt" | jq -r '.job // ""')"
@@ -420,7 +525,7 @@ _task_brief() {
         elif [ -n "$djob" ]; then
           printf 'Full output: outsourcerer result %s\n\n' "$djob"
         fi
-        dans="$(printf '%s' "$dt" | jq -r '.hold.answer // ""')"
+        dans="$(printf '%s' "$dt" | jq -r '.hold.answer // ""' | _factory_trim 4000 "in $(_task_file "$plan" "$d") (field hold.answer)")"
         [ -n "$dans" ] && printf 'Captain decided on %s: %s\n\n' "$d" "$dans"
       done
     fi
@@ -449,41 +554,110 @@ _task_bg_launch() {
   cmd_bg "$@"
 }
 
-# _task_claim_locked <plan> <tid> -> rc0 after moving a READY todo task to running (attempts+1,
-# job cleared). Caller holds the lock. Prints the refusal reason on stderr otherwise.
+# _task_deps_blocking <plan> <task-json> -> "t1 (failed), t3 (missing)" for every dep that is not done;
+# empty when all are done. Reads only the task's own dep files in ONE jq pass (cheap enough to run
+# under the plan lock, even with hundreds of tasks on Git-Bash). rc1 when a dep file is unreadable.
+_task_deps_blocking() {
+  local plan="$1" t="$2" deps d f
+  deps="$(printf '%s' "$t" | jq -r '(.deps // [])[]')"
+  [ -n "$deps" ] || return 0
+  for d in $deps; do
+    f="$(_task_file "$plan" "$d")"
+    if [ -f "$f" ]; then cat "$f"; printf '\n'; else printf '{"id":"%s","state":"missing"}\n' "$d"; fi
+  done | jq -rs 'map(select(.state != "done") | "\(.id) (\(.state))") | join(", ")' 2>/dev/null
+}
+
+# _task_claim_locked <plan> <tid> [claimer] -> rc0 after moving a READY todo task to running
+# (attempts+1, job cleared, claimed_at/claimed_by recorded). Caller holds the lock. Prints the refusal
+# reason on stderr otherwise. Captain decisions, decision gates and land steps are never dispatched
+# as workers: plan run (or land) handles those.
 _task_claim_locked() {
-  local plan="$1" tid="$2" t st bl
+  local plan="$1" tid="$2" claimer="${3:-}" t st bl kind
   t="$(_task_get "$plan" "$tid")" || return 1
   st="$(printf '%s' "$t" | jq -r .state)"
   case "$st" in
     todo) ;;
     held) echo "outsourcerer: $tid is held for a decision ($(printf '%s' "$t" | jq -r '.hold.reason // ""')). Release it first: outsourcerer task release $tid --answer \"...\"" >&2; return 1 ;;
-    running|verifying) echo "outsourcerer: $tid is already underway (job $(printf '%s' "$t" | jq -r '.job // "?"'))." >&2; return 1 ;;
+    running|verifying)
+      if [ "$st" = running ] && [ -z "$(printf '%s' "$t" | jq -r '.job // ""')" ]; then
+        echo "outsourcerer: $tid is being launched right now (claimed $(printf '%s' "$t" | jq -r '.claimed_at // "?" | tostring')). If that launch died, recover it with: outsourcerer task retry $tid" >&2
+      else
+        echo "outsourcerer: $tid is already underway (job $(printf '%s' "$t" | jq -r '.job // "?"'))." >&2
+      fi
+      return 1 ;;
     *) echo "outsourcerer: $tid is $st, not waiting to start. To run it again: outsourcerer task retry $tid" >&2; return 1 ;;
   esac
-  bl="$(_task_list "$plan" | jq -r --arg id "$tid" "$_FACTORY_JQ_VIEW view | .[] | select(.id == \$id) | .blocked_by | map(\"\(.id) (\(.state))\") | join(\", \")")"
+  kind="$(printf '%s' "$t" | jq -r 'if (.land_target // "") != "" then "land:" + .land_target
+                                    elif (.gate // false) == true or (.hold_after_deps // false) == true then "decision"
+                                    else "" end')"
+  case "$kind" in
+    land:*) echo "outsourcerer: $tid is the land step for ${kind#land:}, not work for a worker. Run it with: outsourcerer land ${kind#land:} --plan $plan  (or let: outsourcerer plan run $plan)" >&2; return 1 ;;
+    decision) echo "outsourcerer: $tid is a captain decision, not work for a worker. outsourcerer plan run $plan asks you when its inputs are ready; then answer with: outsourcerer task release $tid --answer \"...\"" >&2; return 1 ;;
+  esac
+  bl="$(_task_deps_blocking "$plan" "$t")" || { echo "outsourcerer: cannot read the dependencies of $tid (a task file is damaged). See: outsourcerer task ls --plan $plan" >&2; return 1; }
   if [ -n "$bl" ]; then
     echo "outsourcerer: $tid is not ready; it waits on $bl." >&2; return 1
   fi
   FACTORY_EVENT_NOTE="claimed for dispatch" _task_update_locked "$plan" "$tid" \
-    'if .state != "todo" then error("not todo") else .state = "running" | .attempts = ((.attempts // 0) + 1) | .job = "" | .head_sha = "" | .evidence = "" end'
+    'if .state != "todo" then error("not todo") else .state = "running" | .attempts = ((.attempts // 0) + 1) | .job = ""
+       | .head_sha = "" | .evidence = "" | .launch_failed = false | .claimed_at = $at | .claimed_by = $by end' \
+    --argjson at "$(date +%s)" --arg by "$claimer"
+}
+
+# _task_claim_stale <task-json> -> rc0 when a running task has no job and its claimer is provably gone
+# (the dispatching process died between claim and recording the job) or the claim is older than
+# OSRC_TASK_CLAIM_STALE_SECS (900s; a launch takes seconds, worktree setup on a huge repo minutes).
+_task_claim_stale() {
+  local t="$1" st job by at o_pid o_start lim
+  st="$(printf '%s' "$t" | jq -r .state)"; job="$(printf '%s' "$t" | jq -r '.job // ""')"
+  [ "$st" = running ] && [ -z "$job" ] || return 1
+  by="$(printf '%s' "$t" | jq -r '.claimed_by // ""')"; at="$(printf '%s' "$t" | jq -r '.claimed_at // 0 | if type == "number" then floor else 0 end | tostring')"
+  case "$at" in ''|*[!0-9]*) at=0 ;; esac
+  lim="${OSRC_TASK_CLAIM_STALE_SECS:-900}"; case "$lim" in ''|*[!0-9]*) lim=900 ;; esac
+  [ "$at" -eq 0 ] && return 0                     # claimed by an older version: no record, so nothing live to protect
+  [ $(( $(date +%s) - at )) -ge "$lim" ] && return 0
+  o_pid="${by%% *}"; o_start=""; case "$by" in *" "*) o_start="${by#* }" ;; esac
+  [ -n "$by" ] && _factory_owner_dead "$o_pid" "$o_start" && return 0
+  return 1
 }
 
 # _task_dispatch_fail <plan> <tid> <reason> -> a claimed task that cannot start is failed with the
-# reason (so the captain sees it and a wake fires), never left stuck in running.
+# reason (so the captain sees it and a wake fires), never left stuck in running. launch_failed:true
+# tells the scheduler this was a launch problem, retryable within the task's retries budget (the
+# attempt stays counted). Guarded: a task canceled meanwhile stays canceled.
 _task_dispatch_fail() {
-  FACTORY_EVENT_NOTE="$3" _task_update "$1" "$2" '.state = "failed" | .result = $r' --arg r "$3" >/dev/null 2>&1 || true
+  FACTORY_EVENT_NOTE="launch failed: $3" _task_update "$1" "$2" \
+    'if .state != "running" then error("moved on") else .state = "failed" | .result = ("launch failed: " + $r) | .launch_failed = true end' \
+    --arg r "$3" >/dev/null 2>&1 || true
   echo "outsourcerer: $2 could not start: $3" >&2
+}
+
+# _task_worker_prompt <plan> <tid> <brief-path> -> the SHORT prompt passed on the worker's command
+# line: the task title, the plan goal's first line, and the absolute path of the full brief to read
+# first. The brief itself can be large (spec, dependency results), and a command line cannot: Linux
+# caps one argument at 128KB and Windows a whole command line at 32,767 characters.
+_task_worker_prompt() {
+  local plan="$1" tid="$2" brief="$3" title goal
+  # Task and plan JSON go through stdin, never jq's own argv (a huge prompt would hit the same limit).
+  local firstline='def line(n): (. // "" | tostring | split("\n") | map(select(test("\\S"))) | (.[0] // "") | if length > n then .[0:n] + "..." else . end);'
+  title="$(_task_get "$plan" "$tid" 2>/dev/null | jq -r "$firstline .title | line(200)" 2>/dev/null)"
+  goal="$(jq -r "$firstline .goal | line(300)" "$(_plan_dir "$plan")/plan.json" 2>/dev/null)"
+  printf 'Task %s/%s: %s\n' "$plan" "$tid" "$title"
+  [ -n "$goal" ] && printf 'Plan goal: %s\n' "$goal"
+  printf '\nBefore anything else, read your full brief: %s\n' "$brief"
+  printf 'It is the whole assignment: the task, the spec, the rules for when you are done, and the results of earlier work you build on. Follow it exactly.\n'
 }
 
 # _task_dispatch <plan> <tid> -> claim, brief, launch. Prints the job id; rc1 with a reason if the
 # task is not ready, is held, is already claimed, or the launch failed (the task is then failed with
-# the reason, so the captain sees it).
+# the reason, so the captain sees it). A cancel that lands while the worker launches wins: the
+# just-launched job is stopped and never attached to the canceled task.
 _task_dispatch() {
-  local plan="$1" tid="$2" t pj repo base shape verb model provider brief prompt wd wt=0 base_sha="" jid out errf rc=0
+  local plan="$1" tid="$2" t pj repo base shape verb model provider brief prompt wd wt=0 base_sha="" jid out errf rc=0 me now_st
   _factory_need_jq
+  _factory_self_pid "$(_plan_dir "$plan")"; me="$_FACTORY_SELF_PID"
   _plan_lock "$plan" || return 1
-  _task_claim_locked "$plan" "$tid" || rc=1
+  _task_claim_locked "$plan" "$tid" "$me $(_pid_start_identity "$me" 2>/dev/null)" || rc=1
   _plan_unlock "$plan"
   [ "$rc" -eq 0 ] || return 1
 
@@ -514,7 +688,15 @@ _task_dispatch() {
   fi
 
   brief="$(_task_brief "$plan" "$tid")" || { _task_dispatch_fail "$plan" "$tid" "could not write the brief"; return 1; }
-  prompt="$(cat "$brief")"
+  case "$brief" in /*) ;; *) brief="$(cd "$(dirname "$brief")" 2>/dev/null && pwd -P)/$(basename "$brief")" ;; esac
+  prompt="$(_task_worker_prompt "$plan" "$tid" "$brief")"
+
+  # Last look before spending a worker: a cancel (or a scheduler reset) since the claim wins.
+  now_st="$(_task_get "$plan" "$tid" 2>/dev/null | jq -r '.state // ""')"
+  if [ "$now_st" != running ]; then
+    echo "outsourcerer: $tid was $now_st before its worker launched, so nothing was started." >&2
+    return 1
+  fi
 
   local -a args=()
   [ -n "$provider" ] && args+=(--provider "$provider")
@@ -535,11 +717,30 @@ _task_dispatch() {
   [ -d "$OSRC_JOBS/$jid" ] && printf '%s/%s\n' "$plan" "$tid" > "$OSRC_JOBS/$jid/task_ref" 2>/dev/null
   local wtp="" br=""
   if [ "$wt" = 1 ]; then wtp="$repo/.outsourcerer/worktrees/$jid"; br="outsourcerer/$jid"; fi
-  FACTORY_EVENT_NOTE="job $jid" _task_update "$plan" "$tid" \
-    '.job = $j | .jobs = ((.jobs // []) + [$j]) | .worktree = $w | .branch = $b | .base_sha = $s' \
-    --arg j "$jid" --arg w "$wtp" --arg b "$br" --arg s "$base_sha" || return 1
+  # Guarded: only attach the job to the claim we made. If the task was canceled, reset by a scheduler,
+  # or already got a job while we launched, this worker is an orphan: stop it instead of letting it
+  # keep committing for a task nobody is tracking.
+  if ! FACTORY_EVENT_NOTE="job $jid" _task_update "$plan" "$tid" \
+    'if .state != "running" or (.job // "") != "" then error("claim lost")
+     else .job = $j | .jobs = ((.jobs // []) + [$j]) | .worktree = $w | .branch = $b | .base_sha = $s | .claimed_by = "" end' \
+    --arg j "$jid" --arg w "$wtp" --arg b "$br" --arg s "$base_sha" 2>/dev/null; then
+    now_st="$(_task_get "$plan" "$tid" 2>/dev/null | jq -r '.state // "?"')"
+    _task_stop_launched_job "$jid"
+    _task_event_full "$plan" "$tid" orphan-stopped "" "" "job $jid launched after the task became $now_st; stopped it" || true
+    echo "outsourcerer: $tid became $now_st while its worker launched, so job $jid was stopped and not attached.${wtp:+ Its worktree, if any, can be removed with: outsourcerer cleanup $jid}" >&2
+    return 1
+  fi
   _task_event_full "$plan" "$tid" dispatched "" "" "job $jid" || true
   printf '%s\n' "$jid"
+}
+
+# _task_stop_launched_job <job> -> stop a job we just launched whatever its status says (it may not
+# have written "running" yet). Best-effort, quiet.
+_task_stop_launched_job() {
+  local job="${1:-}"
+  [ -n "$job" ] && [ -d "$OSRC_JOBS/$job" ] || return 0
+  if type cmd_cancel >/dev/null 2>&1; then ( cmd_cancel "$job" ) >/dev/null 2>&1 || true
+  else echo canceled > "$OSRC_JOBS/$job/status" 2>/dev/null || true; fi
 }
 
 # ---------------------------------------------------------------- done fallback (when track C is absent)
@@ -601,14 +802,20 @@ outsourcerer plan run [name] ...        (needs factory-flow.sh)
 EOF
 }
 
+# _plan_new_abort <plan-dir> <why> -> remove the plan folder this `plan new` just created, then die.
+_plan_new_abort() {
+  case "$1" in "$(_plans_root)"/?*) rm -rf "$1" 2>/dev/null ;; esac
+  die "plan new: $2. Nothing was kept; fix that and run plan new again."
+}
+
 _plan_cli_new() {
   local name="" goal="" repo="" repo_set=0 base="" use=1 pd now top
   while [ $# -gt 0 ]; do
     case "$1" in
-      --goal) goal="${2:-}"; shift 2 ;;
-      --repo) repo="${2:-}"; repo_set=1; shift 2 ;;
+      --goal) _factory_optval "$1" $#; goal="$2"; shift 2 ;;
+      --repo) _factory_optval "$1" $#; repo="$2"; repo_set=1; shift 2 ;;
       --no-repo) repo=""; repo_set=2; shift ;;
-      --base) base="${2:-}"; shift 2 ;;
+      --base) _factory_optval "$1" $#; base="$2"; shift 2 ;;
       --no-use) use=0; shift ;;
       -*) die "plan new: unknown option '$1'" ;;
       *) [ -z "$name" ] && name="$1" || goal="${goal:-$1}"; shift ;;
@@ -632,13 +839,18 @@ _plan_cli_new() {
   _mkdir_private "$(_plans_root)" || die "cannot create $(_plans_root)"
   pd="$(_plan_dir "$name")"
   mkdir "$pd" 2>/dev/null || die "a plan named '$name' already exists. Pick another name, or see it with: outsourcerer plan show $name"
-  mkdir -p "$pd/tasks"
+  # From here on this call owns $pd (mkdir just made it): any failure removes it again, so a half-made
+  # plan (no plan.json) never blocks the name or confuses plan ls.
+  mkdir "$pd/tasks" 2>/dev/null || _plan_new_abort "$pd" "could not create $pd/tasks"
   now="$(_factory_now)"
   _factory_write_json "$pd/plan.json" "$(jq -cn --arg n "$name" --arg g "$goal" --arg r "$repo" --arg b "$base" --arg now "$now" \
-    '{schema:1,name:$n,goal:$g,repo:$r,base_branch:$b,created:$now,updated:$now}')" || die "could not save $pd/plan.json"
-  : > "$pd/events.jsonl"
+    '{schema:1,name:$n,goal:$g,repo:$r,base_branch:$b,created:$now,updated:$now}')" || _plan_new_abort "$pd" "could not save $pd/plan.json"
+  ( : > "$pd/events.jsonl" ) 2>/dev/null || _plan_new_abort "$pd" "could not create $pd/events.jsonl"
   _task_event_full "$name" "" plan-created "" "" "$goal" || true
-  [ "$use" = 1 ] && printf '%s\n' "$name" | _factory_write_file "$(_plans_root)/current"
+  if [ "$use" = 1 ]; then
+    printf '%s\n' "$name" | _factory_write_file "$(_plans_root)/current" \
+      || _plan_new_abort "$pd" "could not make '$name' the current plan ($(_plans_root)/current)"
+  fi
   echo "plan '$name' created${repo:+ for $repo}${base:+ (base branch $base)}$( [ "$use" = 1 ] && echo '; it is now the current plan')."
   [ -z "$repo" ] && echo "No repo is set, so this plan can hold scout tasks only. To build code, make it inside a git repo or pass --repo <path>."
   echo "Next: outsourcerer task add \"<what to do>\" [--shape ship|scout] [--deps t1,t2]"
@@ -688,7 +900,7 @@ _plan_cli_rm() {
 _plan_cli_show() {
   local plan="" json=0
   while [ $# -gt 0 ]; do
-    case "$1" in --json) json=1; shift ;; --plan) plan="${2:-}"; shift 2 ;; -*) die "plan show: unknown option '$1'" ;; *) plan="$1"; shift ;; esac
+    case "$1" in --json) json=1; shift ;; --plan) _factory_optval "$1" $#; plan="$2"; shift 2 ;; -*) die "plan show: unknown option '$1'" ;; *) plan="$1"; shift ;; esac
   done
   plan="$(_plan_resolve "$plan")" || exit 1
   local pj view
@@ -781,7 +993,7 @@ _task_cli_args() {
   _TASK_ARGV=(); _TASK_PLAN=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --plan) [ -n "${2:-}" ] || die "--plan needs a plan name"; _TASK_PLAN="$2"; shift 2 ;;
+      --plan) _factory_optval "$1" $#; [ -n "$2" ] || die "--plan needs a plan name"; _TASK_PLAN="$2"; shift 2 ;;
       --plan=*) _TASK_PLAN="${1#--plan=}"; shift ;;
       *) _TASK_ARGV+=("$1"); shift ;;
     esac
@@ -795,23 +1007,23 @@ _task_cli_add() {
   local deliver="local" retries=1 hold="" flow="" stage="" fields tid
   while [ $# -gt 0 ]; do
     case "$1" in
-      --prompt) prompt="${2:-}"; shift 2 ;;
-      --prompt-file) [ -f "${2:-}" ] || die "task add: no such prompt file '${2:-}'"; prompt="$(cat "$2")"; shift 2 ;;
-      --shape) shape="${2:-}"; shift 2 ;;
-      --deps|--after) deps="${2:-}"; shift 2 ;;
-      --spec) spec="${2:-}"; shift 2 ;;
-      --check) check="${2:-}"; shift 2 ;;
-      --verb) verb="${2:-}"; shift 2 ;;
-      -m|--model) model="${2:-}"
+      --prompt) _factory_optval "$1" $#; prompt="$2"; shift 2 ;;
+      --prompt-file) _factory_optval "$1" $#; [ -f "$2" ] || die "task add: no such prompt file '${2:-}'"; prompt="$(cat "$2")"; shift 2 ;;
+      --shape) _factory_optval "$1" $#; shape="$2"; shift 2 ;;
+      --deps|--after) _factory_optval "$1" $#; deps="$2"; shift 2 ;;
+      --spec) _factory_optval "$1" $#; spec="$2"; shift 2 ;;
+      --check) _factory_optval "$1" $#; check="$2"; shift 2 ;;
+      --verb) _factory_optval "$1" $#; verb="$2"; shift 2 ;;
+      -m|--model) _factory_optval "$1" $#; model="$2"
         # Exclude list (#45): refuse at add time, not when the task later fails to launch.
         if [ -n "$model" ] && declare -F _exclude_refuse >/dev/null 2>&1; then _exclude_refuse "$model" "task add"; fi
         shift 2 ;;
-      --provider) provider="${2:-}"; shift 2 ;;
-      --deliver) deliver="${2:-}"; shift 2 ;;
-      --retries) retries="${2:-}"; shift 2 ;;
-      --hold) hold="${2:-}"; shift 2 ;;
-      --flow) flow="${2:-}"; shift 2 ;;
-      --stage) stage="${2:-}"; shift 2 ;;
+      --provider) _factory_optval "$1" $#; provider="$2"; shift 2 ;;
+      --deliver) _factory_optval "$1" $#; deliver="$2"; shift 2 ;;
+      --retries) _factory_optval "$1" $#; retries="$2"; shift 2 ;;
+      --hold) _factory_optval "$1" $#; hold="$2"; shift 2 ;;
+      --flow) _factory_optval "$1" $#; flow="$2"; shift 2 ;;
+      --stage) _factory_optval "$1" $#; stage="$2"; shift 2 ;;
       -*) die "task add: unknown option '$1'" ;;
       *) [ -z "$title" ] && title="$1" || die "task add: give one title (quote it). Extra text: '$1'"; shift ;;
     esac
@@ -822,16 +1034,21 @@ _task_cli_add() {
   case "$shape" in ship|scout) ;; *) die "task add: --shape must be ship (changes code) or scout (investigates)." ;; esac
   case "$deliver" in local|branch|pr) ;; *) die "task add: --deliver must be local, branch or pr." ;; esac
   case "$retries" in ''|*[!0-9]*) die "task add: --retries must be a whole number." ;; esac
+  # Normalize: "007" -> 7 (a leading zero is not valid JSON), and keep it sane.
+  retries="$(printf '%s' "$retries" | sed 's/^0*//')"; retries="${retries:-0}"
+  [ "${#retries}" -le 3 ] || die "task add: --retries must be 999 or less."
   if [ -n "$spec" ]; then
     [ -f "$spec" ] || die "task add: the spec file '$spec' does not exist."
     spec="$(cd "$(dirname "$spec")" && pwd -P)/$(basename "$spec")"
   fi
   local d; deps="$(printf '%s' "$deps" | tr ', ' '\n\n' | sed '/^$/d')"
   for d in $deps; do _task_id_ok "$d" || die "task add: '$d' is not a task id (they look like t1, t2)."; done
-  fields="$(jq -cn --arg title "$title" --arg prompt "$prompt" --arg shape "$shape" --arg deps "$deps" --arg spec "$spec" \
+  # The prompt (possibly a large --prompt-file) goes through stdin, not jq's argv.
+  fields="$(printf '%s' "$prompt" | jq -Rsc --arg title "$title" --arg shape "$shape" --arg deps "$deps" --arg spec "$spec" \
     --arg check "$check" --arg verb "$verb" --arg model "$model" --arg provider "$provider" --arg deliver "$deliver" \
     --argjson retries "$retries" --arg hold "$hold" --arg flow "$flow" --arg stage "$stage" '
-    {title:$title,prompt:$prompt,shape:$shape,deps:($deps | split("\n") | map(select(. != "")) | unique),
+    . as $prompt | {title:$title,prompt:$prompt,shape:$shape,
+     deps:($deps | split("\n") | map(select(. != "")) | reduce .[] as $d ([]; if any(.[]; . == $d) then . else . + [$d] end)),
      spec:$spec,check:$check,verb:$verb,model:$model,provider:$provider,deliver:$deliver,retries:$retries,
      flow:{name:$flow,stage:$stage}}
     + (if $hold != "" then {state:"held",hold:{reason:$hold,until:"",answer:""}} else {} end)')"
@@ -844,7 +1061,7 @@ _task_cli_ls() {
   _task_cli_args "$@"; set -- ${_TASK_ARGV[@]+"${_TASK_ARGV[@]}"}
   local st="" json=0
   while [ $# -gt 0 ]; do
-    case "$1" in --state) st="${2:-}"; shift 2 ;; --json) json=1; shift ;; *) die "task ls: unknown option '$1'" ;; esac
+    case "$1" in --state) _factory_optval "$1" $#; st="$2"; shift 2 ;; --json) json=1; shift ;; *) die "task ls: unknown option '$1'" ;; esac
   done
   local view; view="$(_task_view "$_TASK_PLAN")"
   [ "$json" = 1 ] && { printf '%s\n' "$view" | jq --arg s "$st" 'map(select($s == "" or .state == $s or .derived == $s))'; return 0; }
@@ -924,7 +1141,7 @@ _task_cli_hold() {
   _task_cli_args "$@"; set -- ${_TASK_ARGV[@]+"${_TASK_ARGV[@]}"}
   local tid="" reason="" until=""
   while [ $# -gt 0 ]; do
-    case "$1" in --reason) reason="${2:-}"; shift 2 ;; --until) until="${2:-}"; shift 2 ;; -*) die "task hold: unknown option '$1'" ;; *) tid="$1"; shift ;; esac
+    case "$1" in --reason) _factory_optval "$1" $#; reason="$2"; shift 2 ;; --until) _factory_optval "$1" $#; until="$2"; shift 2 ;; -*) die "task hold: unknown option '$1'" ;; *) tid="$1"; shift ;; esac
   done
   _task_id_ok "$tid" || die "task hold needs a task id, e.g. outsourcerer task hold t3 --reason \"pick A or B\""
   [ -n "$reason" ] || die "task hold needs --reason \"<the question for the captain>\"."
@@ -940,7 +1157,7 @@ _task_cli_release() {
   _task_cli_args "$@"; set -- ${_TASK_ARGV[@]+"${_TASK_ARGV[@]}"}
   local tid="" answer="" mkdone=0
   while [ $# -gt 0 ]; do
-    case "$1" in --answer) answer="${2:-}"; shift 2 ;; --done) mkdone=1; shift ;; -*) die "task release: unknown option '$1'" ;; *) tid="$1"; shift ;; esac
+    case "$1" in --answer) _factory_optval "$1" $#; answer="$2"; shift 2 ;; --done) mkdone=1; shift ;; -*) die "task release: unknown option '$1'" ;; *) tid="$1"; shift ;; esac
   done
   _task_id_ok "$tid" || die "task release needs a task id, e.g. outsourcerer task release t3 --answer \"go with B\""
   [ -n "$answer" ] || die "task release needs --answer \"<your decision>\". It is handed to this task and the ones after it."
@@ -975,11 +1192,24 @@ _task_finish_from_output() {
   fi
 }
 
+# Interrupt handling for `task done`: the check can run for minutes. Ctrl-C (or a kill) during it must
+# not leave the task stuck in verifying, where start says "underway" and retry refuses.
+_TASK_DONE_PLAN=""; _TASK_DONE_TID=""; _TASK_DONE_PREV=""
+_task_done_interrupted() {
+  if [ -n "$_TASK_DONE_TID" ]; then
+    FACTORY_EVENT_NOTE="done check interrupted" _task_update "$_TASK_DONE_PLAN" "$_TASK_DONE_TID" \
+      'if .state == "verifying" then .state = $p else error("moved on") end' --arg p "$_TASK_DONE_PREV" >/dev/null 2>&1 || true
+    echo "outsourcerer: the done check for $_TASK_DONE_TID was interrupted; it is back to $_TASK_DONE_PREV." >&2
+  fi
+  trap - INT TERM HUP
+  exit 130
+}
+
 _task_cli_done() {
   _task_cli_args "$@"; set -- ${_TASK_ARGV[@]+"${_TASK_ARGV[@]}"}
   local tid="" result="" force=0 why rc=0 prev
   while [ $# -gt 0 ]; do
-    case "$1" in --result) result="${2:-}"; shift 2 ;; --force) force=1; shift ;; -*) die "task done: unknown option '$1'" ;; *) tid="$1"; shift ;; esac
+    case "$1" in --result) _factory_optval "$1" $#; result="$2"; shift 2 ;; --force) force=1; shift ;; -*) die "task done: unknown option '$1'" ;; *) tid="$1"; shift ;; esac
   done
   _task_id_ok "$tid" || die "task done needs a task id, e.g. outsourcerer task done t2"
   local t; t="$(_task_get "$_TASK_PLAN" "$tid")" || exit 1
@@ -990,12 +1220,26 @@ _task_cli_done() {
   esac
   if [ "$force" = 1 ]; then
     FACTORY_EVENT_NOTE="marked done by hand${result:+: $result}" _task_update "$_TASK_PLAN" "$tid" \
-      '.state = "done" | (if $r != "" then .result = $r else . end)' --arg r "$result" || exit 1
+      'if .state == "canceled" then error("canceled") else .state = "done" | (if $r != "" then .result = $r else . end) end' --arg r "$result" \
+      || die "$tid could not be marked done (it was canceled meanwhile?). See: outsourcerer task show $tid"
     echo "$tid marked done by hand (no check was run)."
     return 0
   fi
-  case "$prev" in running|verifying|failed) ;; *) die "$tid has not run yet ($prev). Start it with: outsourcerer task start $tid  (or mark it done by hand with --force)" ;; esac
-  _task_update "$_TASK_PLAN" "$tid" '.state = "verifying"' >/dev/null || exit 1
+  case "$prev" in
+    running|failed) ;;
+    verifying) die "$tid is already being checked (by plan run or another task done). Wait for it, then see: outsourcerer task show $tid" ;;
+    *) die "$tid has not run yet ($prev). Start it with: outsourcerer task start $tid  (or mark it done by hand with --force)" ;;
+  esac
+  # The interrupt handler goes in first (it only ever undoes OUR verifying, so arming it early is safe).
+  _TASK_DONE_PLAN="$_TASK_PLAN"; _TASK_DONE_TID="$tid"; _TASK_DONE_PREV="$prev"
+  trap _task_done_interrupted INT TERM HUP
+  # Claim the check: only from the exact state we saw, so a concurrent cancel is never resurrected and
+  # a concurrent `plan run` verify (which also moves the task to verifying) never runs it twice.
+  if ! FACTORY_EVENT_NOTE="done check" _task_update "$_TASK_PLAN" "$tid" \
+    'if .state != $p then error("moved on") else .state = "verifying" end' --arg p "$prev" >/dev/null 2>&1; then
+    trap - INT TERM HUP; _TASK_DONE_TID=""
+    die "$tid changed while starting its check (it is now $(_task_get "$_TASK_PLAN" "$tid" 2>/dev/null | jq -r '.state // "?"')). See: outsourcerer task show $tid"
+  fi
   if type _factory_done_check >/dev/null 2>&1; then
     why="$(_factory_done_check "$_TASK_PLAN" "$tid")" || rc=$?
   else
@@ -1004,11 +1248,18 @@ _task_cli_done() {
   if [ "$rc" -eq 0 ]; then
     [ -n "$result" ] && _task_update "$_TASK_PLAN" "$tid" '.result = $r' --arg r "$result" >/dev/null
     _task_finish_from_output "$_TASK_PLAN" "$tid"
-    FACTORY_EVENT_NOTE="$why" _task_update "$_TASK_PLAN" "$tid" '.state = "done"' || exit 1
+    if ! FACTORY_EVENT_NOTE="$why" _task_update "$_TASK_PLAN" "$tid" \
+         'if .state != "verifying" then error("moved on") else .state = "done" end' 2>/dev/null; then
+      trap - INT TERM HUP; _TASK_DONE_TID=""
+      die "$tid passed its check, but it was changed meanwhile (now $(_task_get "$_TASK_PLAN" "$tid" 2>/dev/null | jq -r '.state // "?"')), so it was left as is."
+    fi
+    trap - INT TERM HUP; _TASK_DONE_TID=""
     echo "$tid is done: $why"
     return 0
   fi
-  FACTORY_EVENT_NOTE="not done: $why" _task_update "$_TASK_PLAN" "$tid" '.state = $p' --arg p "$prev" >/dev/null 2>&1 || true
+  FACTORY_EVENT_NOTE="not done: $why" _task_update "$_TASK_PLAN" "$tid" \
+    'if .state == "verifying" then .state = $p else error("moved on") end' --arg p "$prev" >/dev/null 2>&1 || true
+  trap - INT TERM HUP; _TASK_DONE_TID=""
   echo "$tid is not done: $why" >&2
   echo "If the work is good anyway: outsourcerer task done $tid --force. If it is bad: outsourcerer task fail $tid --reason \"...\"" >&2
   return 1
@@ -1028,7 +1279,7 @@ _task_cli_fail() {
   _task_cli_args "$@"; set -- ${_TASK_ARGV[@]+"${_TASK_ARGV[@]}"}
   local tid="" reason=""
   while [ $# -gt 0 ]; do
-    case "$1" in --reason) reason="${2:-}"; shift 2 ;; -*) die "task fail: unknown option '$1'" ;; *) tid="$1"; shift ;; esac
+    case "$1" in --reason) _factory_optval "$1" $#; reason="$2"; shift 2 ;; -*) die "task fail: unknown option '$1'" ;; *) tid="$1"; shift ;; esac
   done
   _task_id_ok "$tid" || die "task fail needs a task id, e.g. outsourcerer task fail t2 --reason \"tests still red\""
   local t; t="$(_task_get "$_TASK_PLAN" "$tid")" || exit 1
@@ -1036,7 +1287,9 @@ _task_cli_fail() {
   FACTORY_EVENT_NOTE="$reason" _task_update "$_TASK_PLAN" "$tid" \
     'if (.state == "done" or .state == "canceled") then error("final") else .state = "failed" | .result = $r end' --arg r "$reason" \
     || die "$tid is already finished ($(printf '%s' "$t" | jq -r .state)); nothing to fail."
-  _task_stop_job "$(printf '%s' "$t" | jq -r '.job // ""')"
+  # Read the job AFTER the state change: a dispatch that attaches a job does so only while the task is
+  # still running, so this sees every job that can exist for it.
+  _task_stop_job "$(_task_get "$_TASK_PLAN" "$tid" 2>/dev/null | jq -r '.job // ""')"
   echo "$tid failed: $reason. Tasks after it stay blocked until you retry or cancel it."
 }
 
@@ -1048,17 +1301,58 @@ _task_cli_cancel() {
   FACTORY_EVENT_NOTE="canceled by hand" _task_update "$_TASK_PLAN" "$tid" \
     'if .state == "done" then error("done") else .state = "canceled" end' \
     || die "$tid is already done; there is nothing to cancel."
-  _task_stop_job "$(printf '%s' "$t" | jq -r '.job // ""')"
+  _task_stop_job "$(_task_get "$_TASK_PLAN" "$tid" 2>/dev/null | jq -r '.job // ""')"
   echo "$tid canceled. Tasks after it stay blocked until you retry it or cancel them too."
+}
+
+# _task_release_worktree <plan> <task-json> -> before a retry forgets a ship task's worktree, remove it
+# when that is safe: it lives under the plan repo's .outsourcerer/worktrees/, its job is not running,
+# and it has no uncommitted changes. The branch (and so any commits) is always kept. Prints one plain
+# line saying what happened; never fails the caller.
+_task_release_worktree() {
+  local plan="$1" t="$2" wt br job repo st
+  wt="$(printf '%s' "$t" | jq -r '.worktree // ""')"; br="$(printf '%s' "$t" | jq -r '.branch // ""')"
+  job="$(printf '%s' "$t" | jq -r '.job // ""')"
+  [ -n "$wt" ] && [ -d "$wt" ] || return 0
+  repo="$(jq -r '.repo // ""' "$(_plan_dir "$plan")/plan.json" 2>/dev/null)"
+  case "$wt" in "$repo"/.outsourcerer/worktrees/?*) ;; *) return 0 ;; esac
+  case "$wt" in */../*|*/..) return 0 ;; esac
+  st="$(_task_job_status "$job")"
+  case "$st" in running|launching)
+    echo "kept the old worktree $wt: its job $job is still running."; return 0 ;;
+  esac
+  if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null | head -1)" ]; then
+    echo "kept the old worktree $wt: it has uncommitted changes. Look, then remove it with: outsourcerer cleanup $job --force"
+    return 0
+  fi
+  if git -C "$repo" worktree remove "$wt" >/dev/null 2>&1; then
+    echo "removed the old worktree $wt${br:+ (branch $br is kept, with its commits)}."
+  else
+    echo "could not remove the old worktree $wt; remove it with: outsourcerer cleanup $job"
+  fi
 }
 
 _task_cli_retry() {
   _task_cli_args "$@"; set -- ${_TASK_ARGV[@]+"${_TASK_ARGV[@]}"}
-  local tid="${1:-}"
+  local tid="${1:-}" t note
   _task_id_ok "$tid" || die "task retry needs a task id, e.g. outsourcerer task retry t2"
+  t="$(_task_get "$_TASK_PLAN" "$tid")" || exit 1
+  # A task stuck "running" with no job is a launch that died between claim and recording its job.
+  # Retry may recover it, but only when that claim is provably dead or old (never a live launch).
+  if _task_claim_stale "$t"; then
+    FACTORY_EVENT_NOTE="recovered a launch that never finished" _task_update "$_TASK_PLAN" "$tid" \
+      'if .state != "running" or (.job // "") != "" or (.claimed_at // 0) != $at then error("moved on")
+       else .state = "todo" | .worktree = "" | .branch = "" | .base_sha = "" | .head_sha = "" | .evidence = "" | .claimed_by = "" end' \
+      --argjson at "$(printf '%s' "$t" | jq -c '.claimed_at // 0')" \
+      || die "$tid changed while recovering it. See: outsourcerer task show $tid"
+    echo "$tid was stuck starting (its launcher stopped before the worker began); it is back in line."
+    return 0
+  fi
   FACTORY_EVENT_NOTE="retry by hand" _task_update "$_TASK_PLAN" "$tid" \
     'if (.state == "failed" or .state == "canceled") | not then error("not retryable")
-     else .state = "todo" | .job = "" | .worktree = "" | .branch = "" | .base_sha = "" | .head_sha = "" | .evidence = "" end' \
+     else .state = "todo" | .job = "" | .worktree = "" | .branch = "" | .base_sha = "" | .head_sha = "" | .evidence = "" | .launch_failed = false end' \
     || die "only a failed or canceled task can be retried; $tid is $(_task_get "$_TASK_PLAN" "$tid" 2>/dev/null | jq -r '.state // "unknown"')."
+  note="$(_task_release_worktree "$_TASK_PLAN" "$t")"
+  [ -n "$note" ] && echo "$note"
   echo "$tid is back in line. It runs when its dependencies are done (start it now with: outsourcerer task start $tid)."
 }
