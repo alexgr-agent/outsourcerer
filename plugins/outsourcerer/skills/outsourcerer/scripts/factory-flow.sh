@@ -24,7 +24,8 @@
 #   land_target (tid)       -- a flow stage with "land":"<stage>". No worker runs: when ready, the
 #                              scheduler lands the target task through `land` and records the outcome.
 #                              land_attempts / land_started_at count and time those tries.
-#   require_verdict (bool)  -- a flow stage with "verdict":true (a reviewer). The LAST non-empty line
+#   require_verdict (bool)  -- a flow stage with "verdict":true (a reviewer). The last content line
+#                              before trailing OSRC completion metadata
 #                              of its job's last.txt must be exactly `VERDICT: PASS` or
 #                              `VERDICT: FAIL - <reason>`. FAIL sends the build it reviewed back for a
 #                              redo (within that build's retries), then reviews again. No clear verdict
@@ -35,7 +36,9 @@
 #   prompt_orig (string)    -- the prompt before a review note was appended (so redos never pile up).
 #   attempt_base (number)   -- attempts already used before a re-review started (its own budget restarts).
 #   land_error (string)     -- an --auto-land that failed; the task stays done and the captain is told.
-#   verifying_at/_pid       -- who is running the done check, so two checkers never run it twice.
+#   verifying_at/_pid/_start -- checker ownership; age or proven death permits takeover.
+#   reviewed_head           -- the build commit this reviewer was dispatched to inspect.
+#   auto_land_pending       -- durable intent recorded together with completion, replayed on restart.
 #   claimed_at              -- (task store, when present) when the task was claimed for dispatch.
 # bash 3.2 compatible: no associative arrays, no mapfile, no ${x,,}.
 
@@ -47,9 +50,25 @@ _FF_RC_BUSY=4
 # ---------------------------------------------------------------- small helpers
 
 _ff_need_jq() { have jq || die "the factory needs jq; install it (brew install jq, or apt install jq) and try again"; }
+# Native Windows jq emits CRLF; preserve its exit status while normalizing output.
+_ff_jq() ( set -o pipefail; jq "$@" | tr -d '\r' )
+_ff_owner_dead() {
+  local cur rc=0
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  cur="$(_pid_start_identity "$1" 2>/dev/null)" || rc=$?
+  [ "$rc" = 2 ] && return 0
+  [ "$rc" = 0 ] && [ -n "$2" ] && [ "$cur" != "$2" ] && return 0
+  # Permission errors and unavailable process inspection cannot prove death.
+  return 1
+}
 _ff_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _ff_name_ok() { case "${1:-}" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
-_ff_num() { case "${1:-}" in ''|*[!0-9]*) printf '%s' "${2:-0}" ;; *) printf '%s' "$1" ;; esac; }
+_ff_num() {
+  local n="${1:-}"
+  case "$n" in ''|*[!0-9]*) n="${2:-0}" ;; esac
+  while [ "${#n}" -gt 1 ] && [ "${n#0}" != "$n" ]; do n="${n#0}"; done
+  printf '%s' "$n"
+}
 _ff_need_fns() {   # <fn>... -> die naming the first missing piece of the factory
   local f
   for f in "$@"; do
@@ -59,7 +78,7 @@ _ff_need_fns() {   # <fn>... -> die naming the first missing piece of the factor
 
 # _ff_epoch <task-json> <jq-expr> -> seconds since epoch of a timestamp field (ISO-8601 Z or a number); 0 if unknown.
 _ff_epoch() {
-  printf '%s' "$1" | jq -r "($2) as \$x
+  printf '%s' "$1" | _ff_jq -r "($2) as \$x
     | if (\$x | type) == \"number\" then \$x
       elif (\$x | type) == \"string\" and (\$x | test(\"^[0-9]+\$\")) then (\$x | tonumber)
       elif (\$x | type) == \"string\" and \$x != \"\" then (\$x | try fromdateiso8601 catch 0)
@@ -72,7 +91,7 @@ _ff_wake() {
   local plan="$1" tid="$2" kind="$3" summary="$4" id
   declare -F _wake_append >/dev/null 2>&1 || return 0
   id="factory.$(printf '%s' "$plan" | tr -c 'A-Za-z0-9._-' '_').$(printf '%s' "$tid" | tr -c 'A-Za-z0-9._-' '_').$kind.$(date +%s).$$"
-  _wake_append "$(jq -cn --arg event_id "$id" --arg kind "factory-$kind" --arg plan "$plan" --arg task "$tid" \
+  _wake_append "$(_ff_jq -cn --arg event_id "$id" --arg kind "factory-$kind" --arg plan "$plan" --arg task "$tid" \
       --arg s "$summary" '{event_id:$event_id,kind:$kind,state:"blocked",plan:$plan,task:$task,task_summary:$s}')" \
     >/dev/null 2>&1 || true
 }
@@ -93,16 +112,17 @@ _ff_out_of_time() { [ "$_FF_DEADLINE" -gt 0 ] && [ "$(date +%s)" -ge "$_FF_DEADL
 # removing the lock can never delete a fresh lock another driver just took.
 _FF_LOCK=""
 _FF_LOCK_HOLDER=""
+_FF_LOCK_OWNER=""
 _ff_lock_acquire() {   # <lockdir> -> 0 claimed | 1 held by a live driver (_FF_LOCK_HOLDER) | 2 cannot write
-  local dir="$1" own="$1/owner" me ident opid oident cur tries=0 seen seen2 stale
-  me="${BASHPID:-$$}"
+  local dir="$1" own="$1/owner" me ident opid oident tries=0 seen seen2 stale
+  _factory_self_pid "${dir%/*}"; me="$_FACTORY_SELF_PID"
   while [ "$tries" -lt 5 ]; do
     tries=$((tries + 1))
     if _mkdir_claim "$dir"; then
       ident="$(_pid_start_identity "$me" 2>/dev/null)"
       if printf '%s %s\n' "$me" "$ident" > "$dir/.own.$me" 2>/dev/null && [ -s "$dir/.own.$me" ] \
          && mv -f "$dir/.own.$me" "$own" 2>/dev/null; then
-        _FF_LOCK="$dir"; return 0
+        _FF_LOCK="$dir"; _FF_LOCK_OWNER="$me $ident"; return 0
       fi
       # Never hold a lock nobody can identify: a live driver with no owner record would look dead
       # to the next run, which would take the plan over while this one still drives it.
@@ -117,13 +137,10 @@ $seen
 EOF
     stale=0
     if [ -n "$opid" ]; then
-      if kill -0 "$opid" 2>/dev/null; then
-        cur="$(_pid_start_identity "$opid" 2>/dev/null)"
-        if [ -z "$oident" ] || [ -z "$cur" ] || [ "$cur" = "$oident" ]; then
-          _FF_LOCK_HOLDER="$opid"; return 1
-        fi
+      if ! _ff_owner_dead "$opid" "$oident"; then
+        _FF_LOCK_HOLDER="$opid"; return 1
       fi
-      stale=1   # owner is dead or its pid was reused
+      stale=1
     elif [ -n "$(find "$dir" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
       stale=1   # ownerless for over a minute: the claimer died between mkdir and writing its owner
     else
@@ -135,7 +152,13 @@ EOF
     if _mkdir_claim "$dir.steal"; then
       seen2="$(cat "$own" 2>/dev/null)"
       if [ -d "$dir" ] && [ "$seen2" = "$seen" ]; then
-        mv "$dir" "$dir.dead.$me" 2>/dev/null && rm -rf "$dir.dead.$me" 2>/dev/null
+        if mv "$dir" "$dir.dead.$me" 2>/dev/null; then
+          if [ "$(cat "$dir.dead.$me/owner" 2>/dev/null)" = "$seen" ]; then
+            rm -rf "$dir.dead.$me" 2>/dev/null
+          else
+            [ -e "$dir" ] || mv "$dir.dead.$me" "$dir" 2>/dev/null
+          fi
+        fi
       fi
       rmdir "$dir.steal" 2>/dev/null
     else
@@ -145,10 +168,10 @@ EOF
   _FF_LOCK_HOLDER="unknown"; return 1
 }
 _ff_lock_release() {
-  local opid=""
+  local owner=""
   [ -n "$_FF_LOCK" ] || return 0
-  [ -f "$_FF_LOCK/owner" ] && read -r opid _ < "$_FF_LOCK/owner" 2>/dev/null
-  [ "$opid" = "${BASHPID:-$$}" ] && rm -rf "$_FF_LOCK" 2>/dev/null
+  owner="$(cat "$_FF_LOCK/owner" 2>/dev/null)"
+  [ "$owner" = "$_FF_LOCK_OWNER" ] && rm -rf "$_FF_LOCK" 2>/dev/null
   _FF_LOCK=""
   return 0
 }
@@ -192,16 +215,75 @@ _ff_job_outcome() {
   esac
 }
 
-# _ff_find_job_by_ref <plan> <tid> <task-json> -> newest job whose task_ref names this task and that
-# the task does not already list (a launch whose launcher died before recording it).
+# _ff_find_job_by_ref <plan> <tid> <task-json> -> the unique unrecorded job for this attempt.
+# Returns 2 for ambiguous receipts; a nested or older job must never win by filename order.
 _ff_find_job_by_ref() {
-  local plan="$1" tid="$2" t="$3" f j best=""
-  for f in $(grep -lxF "$plan/$tid" "$OSRC_JOBS"/*/task_ref 2>/dev/null | sort); do
+  local plan="$1" tid="$2" t="$3" f j best="" tok linked count=0
+  tok="$(printf '%s' "$t" | _ff_jq -r '.attempt_token // ""')"
+  for f in "$OSRC_JOBS"/*/task_ref; do
+    [ -f "$f" ] || continue
+    linked="$(tr -d '\r\n' < "$f")"
+    [ "$linked" = "$plan/$tid" ] || [ "$linked" = "$plan/$tid/$tok" ] || continue
     j="${f%/task_ref}"; j="${j##*/}"
-    printf '%s' "$t" | jq -e --arg j "$j" '(.jobs // []) | index($j) != null' >/dev/null 2>&1 && continue
-    best="$j"
+    if [ -n "$tok" ] && [ "$linked" != "$plan/$tid/$tok" ]; then
+      linked="$(cat "$OSRC_JOBS/$j/task_attempt_token" 2>/dev/null | tr -d '\r\n')"
+      [ -n "$linked" ] || linked="$(cat "$OSRC_JOBS/$j/attempt_token" 2>/dev/null | tr -d '\r\n')"
+      [ "$linked" = "$tok" ] || continue
+    fi
+    printf '%s' "$t" | _ff_jq -e --arg j "$j" '(.jobs // []) | index($j) != null' >/dev/null 2>&1 && continue
+    best="$j"; count=$((count + 1))
   done
-  printf '%s' "$best"
+  # Never guess between a parent and a nested job (including legacy tokenless receipts).
+  [ "$count" -gt 1 ] && return 2
+  [ "$count" = 1 ] && printf '%s' "$best"
+  return 0
+}
+
+# A guard identifies the exact attempt and checker, even when a task returns to the same state.
+_ff_guard() {
+  printf '%s' "$1" | _ff_jq -r '
+    [.state, (.job // ""), (.attempt_token // ""), (.verifying_token // ""),
+     (.verifying_pid // ""), (.verifying_start // ""), (.verifying_at // "")]
+    | "([.state, (.job // \"\"), (.attempt_token // \"\"), (.verifying_token // \"\"), (.verifying_pid // \"\"), (.verifying_start // \"\"), (.verifying_at // \"\")] == " + tojson + ")"'
+}
+
+_ff_review_target() {
+  printf '%s' "$2" | _ff_jq -r --argjson deps "$(printf '%s' "$1" | _ff_jq -c '.deps // []')" '
+    [.[] | select(.shape == "ship" and (.id as $id | $deps | index($id)) != null) | .id]
+    | if length == 1 then .[0] else "" end'
+}
+
+# Recovery is idempotent and does not overwrite a cancellation or another external change.
+# The plan lock makes both writes one transition to concurrent task commands. The journal
+# makes an interrupted transition finish before the scheduler can launch either task.
+_ff_pair_recover() {
+  local plan="$1" pd data id old new cur
+  pd="$(_plan_dir "$plan")"
+  [ -f "$pd/review-transaction.json" ] || return 0
+  data="$(cat "$pd/review-transaction.json")"
+  printf '%s' "$data" | _ff_jq -e 'type == "array" and length == 2 and
+    all(.[]; (.before.id == .after.id) and (.after.id | test("^t[1-9][0-9]*$")))' >/dev/null || return 1
+  for id in $(printf '%s' "$data" | _ff_jq -r '.[].after.id'); do
+    old="$(printf '%s' "$data" | _ff_jq -c --arg id "$id" '.[] | select(.after.id == $id) | .before')"
+    new="$(printf '%s' "$data" | _ff_jq -c --arg id "$id" '.[] | select(.after.id == $id) | .after')"
+    cur="$(_task_get "$plan" "$id")" || return 1
+    if [ "$cur" = "$old" ]; then
+      _factory_write_json "$pd/tasks/$id.json" "$new" || return 1
+    elif [ "$cur" != "$new" ]; then
+      # A captain acted after a crash. Never resurrect that task.
+      _ff_event "$plan" "$id" review-recovery-skipped "task changed after interrupted review transition"
+    fi
+  done
+  rm -f "$pd/review-transaction.json"
+}
+
+_ff_pair_commit() {
+  local plan="$1" pd data
+  shift
+  pd="$(_plan_dir "$plan")"
+  data="$(printf '%s\n' "$@" | _ff_jq -cs '[{before:.[0],after:.[1]},{before:.[2],after:.[3]}]')" || return 1
+  _factory_write_json "$pd/review-transaction.json" "$data" || return 1
+  _ff_pair_recover "$plan"
 }
 
 # ---------------------------------------------------------------- models (fallback re-pick)
@@ -213,8 +295,8 @@ _ff_excluded() { declare -F _model_excluded >/dev/null 2>&1 && _model_excluded "
 # (a failing model is not tried twice in a row while another is allowed). Empty = let the router pick.
 _ff_next_model() {
   local t="$1" mode="$2" cur cands m n i idx=-1 k
-  cur="$(printf '%s' "$t" | jq -r '.model // ""')"
-  cands="$(printf '%s' "$t" | jq -r '(.fallback // []) | map(select(type == "string" and . != "")) | .[]')"
+  cur="$(printf '%s' "$t" | _ff_jq -r '.model // ""')"
+  cands="$(printf '%s' "$t" | _ff_jq -r '(.fallback // []) | map(select(type == "string" and . != "")) | .[]')"
   if [ -z "$cands" ]; then
     # No stored fallbacks: an excluded model goes to the router (which honours the exclude list).
     if [ -n "$cur" ] && _ff_excluded "$cur"; then printf ''; else printf '%s' "$cur"; fi
@@ -247,7 +329,7 @@ _ff_next_model() {
 
 # _ff_attempts <task-json> -> attempts used in the current budget window.
 _ff_attempts() {
-  printf '%s' "$1" | jq -r '([(.attempts // 0), ((.jobs // []) | length)] | max) - (.attempt_base // 0) | if . < 0 then 0 else . end'
+  printf '%s' "$1" | _ff_jq -r '([(.attempts // 0), ((.jobs // []) | length)] | max) - (.attempt_base // 0) | if . < 0 then 0 else . end'
 }
 
 # _ff_fail_or_retry <plan> <tid> <reason> [guard-jq]: retry while attempts remain, putting the reason
@@ -257,7 +339,7 @@ _ff_fail_or_retry() {
   local plan="$1" tid="$2" reason="$3" guard="${4:-true}" t n retries m
   t="$(_task_get "$plan" "$tid")" || return 1
   n="$(_ff_num "$(_ff_attempts "$t")" 0)"
-  retries="$(_ff_num "$(printf '%s' "$t" | jq -r '.retries // 0')" 0)"
+  retries="$(_ff_num "$(printf '%s' "$t" | _ff_jq -r '.retries // 0')" 0)"
   if [ "$n" -le "$retries" ]; then
     m="$(_ff_next_model "$t" retry)"
     # Same reset as `task retry`; .result carries the reason, which the next brief prints under
@@ -265,18 +347,18 @@ _ff_fail_or_retry() {
     FACTORY_EVENT_NOTE="retry: $reason" _task_update "$plan" "$tid" \
       "if ($guard) | not then error(\"moved\") else . end
        | .state = \"todo\" | .job = \"\" | .worktree = \"\" | .branch = \"\" | .base_sha = \"\" | .head_sha = \"\" | .evidence = \"\"
-       | del(.launch_failed) | del(.verifying_at) | del(.verifying_pid)
+       | del(.launch_failed, .auto_land_pending, .auto_land_complete) | del(.verifying_at) | del(.verifying_pid, .verifying_start, .verifying_token)
        | (if ((.fallback // []) | length) > 0 then .model = \$m else . end)
        | .result = (\"previous attempt failed because \" + \$r)" \
       --arg r "$reason" --arg m "$m" >/dev/null 2>&1 || return 1
     _ff_event "$plan" "$tid" retry "attempt $n failed: $reason"
     printf '  %s: retrying%s (attempt %s failed: %s)\n' "$tid" \
-      "$( [ -n "$m" ] && [ "$m" != "$(printf '%s' "$t" | jq -r '.model // ""')" ] && printf ' on %s' "$m")" "$n" "$reason"
+      "$( [ -n "$m" ] && [ "$m" != "$(printf '%s' "$t" | _ff_jq -r '.model // ""')" ] && printf ' on %s' "$m")" "$n" "$reason"
   else
     FACTORY_EVENT_NOTE="failed: $reason" _task_update "$plan" "$tid" \
       "if ($guard) | not then error(\"moved\") else . end
        | .state = \"failed\" | .result = (\"failed after \" + \$n + \" attempt(s): \" + \$r)
-       | del(.verifying_at) | del(.verifying_pid)
+       | del(.verifying_at) | del(.verifying_pid, .verifying_start, .verifying_token)
        | .hold = ((.hold // {}) + {reason: (\"failed after \" + \$n + \" attempt(s): \" + \$r + \". Run it again: \" + \$retry + \" (or cancel it: \" + \$cancel + \")\")})" \
       --arg r "$reason" --arg n "$n" --arg retry "$(_ff_cmd "$plan" task retry "$tid")" --arg cancel "$(_ff_cmd "$plan" task cancel "$tid")" \
       >/dev/null 2>&1 || return 1
@@ -288,20 +370,20 @@ _ff_hold() {   # <plan> <tid> <reason> [guard-jq]   (the task store sends the wa
   local plan="$1" tid="$2" reason="$3" guard="${4:-true}"
   FACTORY_EVENT_NOTE="$reason" _task_update "$plan" "$tid" \
     "if ($guard) | not then error(\"moved\") else . end
-     | .state = \"held\" | .hold_after_deps = false | del(.verifying_at) | del(.verifying_pid)
+     | .state = \"held\" | .hold_after_deps = false | del(.verifying_at) | del(.verifying_pid, .verifying_start, .verifying_token)
      | .hold = ((.hold // {}) + {reason: \$r, answer: \"\"})" \
     --arg r "$reason" >/dev/null 2>&1 || return 1
   printf '  %s: held for the captain: %s\n' "$tid" "$reason"
 }
 
 _ff_is_land_target() {   # <tasks-json> <tid> -> 0 when some flow land stage owns landing this task
-  printf '%s' "$1" | jq -e --arg t "$2" 'any(.[]; (.land_target // "") == $t)' >/dev/null 2>&1
+  printf '%s' "$1" | _ff_jq -e --arg t "$2" 'any(.[]; (.land_target // "") == $t)' >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------- reviewer verdicts
 
 # _ff_verdict <job> -> sets _FF_VERDICT (pass|fail|none|ambiguous) and _FF_VERDICT_LINE. Strict on
-# purpose: only the job's last.txt (never out.log, which can echo the brief), only its last non-empty
+# purpose: only the job's last.txt (never out.log, which can echo the brief), only its last content
 # line, and only the exact form `VERDICT: PASS` or `VERDICT: FAIL - <reason>`. Markup, quotes, a
 # template echo ("VERDICT: PASS or VERDICT: FAIL"), or an earlier verdict that says the opposite
 # all fail closed (held for the captain), so a worker cannot talk a reviewer into a PASS.
@@ -311,7 +393,25 @@ _ff_verdict() {
   _FF_VERDICT=none; _FF_VERDICT_LINE=""
   f="$OSRC_JOBS/$job/last.txt"
   [ -n "$job" ] && [ -s "$f" ] || return 0
-  line="$(tr -d '\r' < "$f" | awk 'NF { l = $0 } END { print l }' | sed 's/[[:space:]]*$//')"
+  # Strip only trailing protocol metadata. Track Markdown fences before selecting a verdict.
+  line="$(tr -d '\r' < "$f" | awk '
+    { lines[NR] = $0 }
+    END {
+      n = NR
+      while (n > 0 && (lines[n] ~ /^[[:space:]]*$/ || lines[n] ~ /^OSRC::(DONE|BLOCKED|PROGRESS)([#:[:space:]]|$)/)) n--
+      fence = ""; width = 0
+      for (i = 1; i <= n; i++) {
+        s = lines[i]; sub(/^   ? ?/, "", s)
+        if (s ~ /^```/ || s ~ /^~~~/) {
+          ch = substr(s, 1, 1); run = 0
+          while (substr(s, run + 1, 1) == ch) run++
+          if (fence == "") { fence = ch; width = run }
+          else if (ch == fence && run >= width && substr(s, run + 1) ~ /^[[:space:]]*$/) fence = ""
+          if (i == n) exit
+        }
+      }
+      if (fence == "") print lines[n]
+    }')"
   _FF_VERDICT_LINE="$(printf '%s' "$line" | cut -c1-200)"
   [[ "$line" =~ $re ]] || return 0
   word="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"
@@ -323,27 +423,55 @@ _ff_verdict() {
     fi
     _FF_VERDICT=pass
   else
+    case "$rest" in *PASS*) _FF_VERDICT=ambiguous; return 0 ;; esac
+    if tr -d '\r' < "$f" | grep -E '^[[:space:]>*#`_-]*VERDICT[[:space:]]*:' | grep -q 'PASS'; then
+      _FF_VERDICT=ambiguous; return 0
+    fi
     _FF_VERDICT=fail
   fi
+}
+
+# Shared with `task done`; the engine completion marker is not review content.
+_factory_review_verdict() {
+  local t job
+  t="$(_task_get "$1" "$2")" || { echo AMBIGUOUS; return 2; }
+  job="$(printf '%s' "$t" | _ff_jq -r '.job // ""')"
+  _ff_verdict "$job"
+  case "$_FF_VERDICT" in
+    pass) echo PASS; return 0 ;;
+    fail) echo FAIL; return 1 ;;
+    *) echo AMBIGUOUS; return 2 ;;
+  esac
 }
 
 # _ff_review_failed <plan> <reviewer-tid> <tasks-json>: the reviewer said FAIL. Send the build it
 # reviewed back for a redo (with the reviewer's reason in its brief) and re-run the review after it,
 # while the build still has retries left. Otherwise hold the reviewer with the exact commands.
 # $1..$3 plus optional 4th arg "captain" = the captain asked for one more round (ignores the budget).
-_ff_review_failed() {
+_ff_review_failed() (
   local plan="$1" vt="$2" tasks="$3" who="${4:-}" v r target n retries rstate landed br head out note vnote answer cmds pd
+  _plan_lock "$plan" || return 1
+  trap '_plan_unlock "$plan"' EXIT
+  _ff_pair_recover "$plan" || return 1
   v="$(_task_get "$plan" "$vt")" || return 1
+  local expected="${5:-$v}" guard nv nt
+  guard="$(_ff_guard "$expected")"
+  printf '%s' "$v" | _ff_jq -e "$guard" >/dev/null || return 1
+  if [ "$who" = captain ]; then
+    [ "$(printf '%s' "$v" | _ff_jq -r .state)" = todo ] || return 1
+  else
+    [ "$(printf '%s' "$v" | _ff_jq -r .state)" = verifying ] || return 1
+  fi
   pd="$(_plan_dir "$plan")"
   # This pass's verdict line; the reason stored at the last hold only when the captain asks for a redo.
-  if [ "$who" = captain ]; then r="$(printf '%s' "$v" | jq -r '.verdict_failed.reason // ""')"
+  if [ "$who" = captain ]; then r="$(printf '%s' "$v" | _ff_jq -r '.verdict_failed.reason // ""')"
   else r="${_FF_VERDICT_LINE#VERDICT: FAIL}"; r="${r# - }"; fi
   [ -n "$r" ] || r="no reason given"
-  answer="$(printf '%s' "$v" | jq -r '.hold.answer // ""')"
+  answer="$(printf '%s' "$v" | _ff_jq -r '.hold.answer // ""')"
   # The build under review: the reviewer's direct dependencies that are build (ship) tasks.
-  target="$(printf '%s' "$tasks" | jq -r --argjson d "$(printf '%s' "$v" | jq -c '.deps // []')" \
+  target="$(printf '%s' "$tasks" | _ff_jq -r --argjson d "$(printf '%s' "$v" | _ff_jq -c '.deps // []')" \
     '[.[] | select((.id as $i | $d | index($i)) != null) | select((.shape // "") == "ship") | .id] | if length == 1 then .[0] else "" end')"
-  out="$OSRC_JOBS/$(printf '%s' "$v" | jq -r '.job // ""')/last.txt"
+  out="$OSRC_JOBS/$(printf '%s' "$v" | _ff_jq -r '.job // ""')/last.txt"
   [ -f "$out" ] || out="$pd/tasks/$vt/report.md"
   cmds="Accept the build anyway: $(_ff_cmd "$plan" task done "$vt" --force). One more redo: $(_ff_cmd "$plan" task release "$vt" --answer '"<what to fix>"'). Stop here: $(_ff_cmd "$plan" task cancel "$vt")"
   if [ -z "$target" ]; then
@@ -352,8 +480,8 @@ _ff_review_failed() {
     return 0
   fi
   local t; t="$(_task_get "$plan" "$target")" || return 1
-  rstate="$(printf '%s' "$t" | jq -r '.state')"; landed="$(printf '%s' "$t" | jq -r '.landed // false')"
-  n="$(_ff_num "$(_ff_attempts "$t")" 0)"; retries="$(_ff_num "$(printf '%s' "$t" | jq -r '.retries // 0')" 0)"
+  rstate="$(printf '%s' "$t" | _ff_jq -r '.state')"; landed="$(printf '%s' "$t" | _ff_jq -r '.landed // false')"
+  n="$(_ff_num "$(_ff_attempts "$t")" 0)"; retries="$(_ff_num "$(printf '%s' "$t" | _ff_jq -r '.retries // 0')" 0)"
   if [ "$rstate" != done ] || [ "$landed" = true ] || { [ "$who" != captain ] && [ "$n" -gt "$retries" ]; }; then
     local why="its redo budget is used up ($n attempt(s))"
     [ "$rstate" != done ] && why="$target is $rstate, not done"
@@ -363,7 +491,7 @@ _ff_review_failed() {
     _ff_hold "$plan" "$vt" "the reviewer said FAIL on $target ($r); $why. Read the review: $out. $cmds" || return 1
     return 0
   fi
-  br="$(printf '%s' "$t" | jq -r '.branch // ""')"; head="$(printf '%s' "$t" | jq -r '.head_sha // ""')"
+  br="$(printf '%s' "$t" | _ff_jq -r '.branch // ""')"; head="$(printf '%s' "$t" | _ff_jq -r '.head_sha // ""')"
   note="A reviewer ($vt) did not pass your previous attempt: $r"
   [ -n "$answer" ] && note="$note
 The captain adds: $answer"
@@ -373,34 +501,37 @@ Full review: $out"
 Your previous attempt is on branch $br${head:+ at commit $head}; you may start from it (for example: git merge $br) and fix what the reviewer found."
   # The build goes back in line with the review in its prompt (replaced, never piled up); its retries
   # budget counts this redo. The captain's extra round raises the budget by one so the count stays honest.
-  FACTORY_EVENT_NOTE="redo after review $vt: $r" _task_update "$plan" "$target" \
+  nt="$(printf '%s' "$t" | _ff_jq -c \
     'if .state != "done" or (.landed // false) then error("moved") else . end
      | .prompt_orig = (.prompt_orig // .prompt)
      | .prompt = (.prompt_orig + "\n\n## Review of your previous attempt\n\n" + $note)
      | .state = "todo" | .job = "" | .worktree = "" | .branch = "" | .base_sha = "" | .head_sha = "" | .evidence = ""
      | .result = "" | del(.land_error) | (if $cap == "1" then .retries = ((.retries // 0) + 1) else . end)' \
-    --arg note "$note" --arg cap "$( [ "$who" = captain ] && echo 1 || echo 0)" >/dev/null 2>&1 || {
-      _ff_hold "$plan" "$vt" "the reviewer said FAIL on $target ($r) but $target changed while this ran. $cmds"; return 0; }
+    --arg note "$note" --arg cap "$( [ "$who" = captain ] && echo 1 || echo 0)")" || return 1
   vnote="You reviewed an earlier attempt of $target and failed it: $r
 That build was redone. Review the new attempt from scratch, and check that this problem is fixed."
-  FACTORY_EVENT_NOTE="re-review after redo of $target" _task_update "$plan" "$vt" \
+  nv="$(printf '%s' "$v" | _ff_jq -c \
     '.prompt_orig = (.prompt_orig // .prompt)
      | .prompt = (.prompt_orig + "\n\n## Earlier review\n\n" + $note)
      | .state = "todo" | .job = "" | .evidence = "" | .result = "" | del(.verdict_failed)
-     | .hold = ((.hold // {}) + {answer: ""}) | del(.verifying_at) | del(.verifying_pid)
+     | .hold = ((.hold // {}) + {answer: ""}) | del(.verifying_at) | del(.verifying_pid, .verifying_start, .verifying_token)
      | .attempt_base = ([(.attempts // 0), ((.jobs // []) | length)] | max)' \
-    --arg note "$vnote" >/dev/null 2>&1 || return 1
+    --arg note "$vnote")" || return 1
+  _ff_pair_commit "$plan" "$t" "$nt" "$v" "$nv" || return 1
   _ff_event "$plan" "$vt" review-failed "redo $target: $r"
   printf '  %s: reviewer said FAIL (%s); %s goes back for a redo, then %s reviews again\n' "$vt" "$r" "$target" "$vt"
   _FF_MOVED=1
-}
+)
 
 # ---------------------------------------------------------------- scheduler: verify + land
 
 # _ff_verify <plan> <tid> <tasks-json>: the caller holds the verifying claim; the done contract decides.
 _ff_verify() {
   local plan="$1" tid="$2" tasks="$3" out rc t shape ev pd job guard
-  guard='.state == "verifying"'
+  t="$(_task_get "$plan" "$tid")" || return 1
+  guard="$(_ff_guard "$t")"
+  local expected="$t"
+  [ "$(printf '%s' "$t" | _ff_jq -r .state)" = verifying ] || return 1
   out="$( _factory_done_check "$plan" "$tid" 2>&1 )"; rc=$?
   out="$(printf '%s' "$out" | tr '\n' ' ' | sed 's/  */ /g; s/ $//' | cut -c1-200)"
   if [ "$rc" -ne 0 ]; then
@@ -408,34 +539,55 @@ _ff_verify() {
     return 0
   fi
   t="$(_task_get "$plan" "$tid")" || return 1
-  shape="$(printf '%s' "$t" | jq -r '.shape // "scout"')"
+  printf '%s' "$t" | _ff_jq -e "$guard" >/dev/null || return 0
+  shape="$(printf '%s' "$t" | _ff_jq -r '.shape // "scout"')"
   pd="$(_plan_dir "$plan")"; ev=""; [ -f "$pd/tasks/$tid/evidence.json" ] && ev="$pd/tasks/$tid/evidence.json"
-  if [ "$(printf '%s' "$t" | jq -r '.require_verdict // false')" = "true" ]; then
-    job="$(printf '%s' "$t" | jq -r '.job // ""')"
+  if [ "$(printf '%s' "$t" | _ff_jq -r '.require_verdict // false')" = "true" ]; then
+    job="$(printf '%s' "$t" | _ff_jq -r '.job // ""')"
     _ff_verdict "$job"
     case "$_FF_VERDICT" in
-      pass) ;;
+      pass)
+        local target current reviewed
+        target="$(_ff_review_target "$t" "$(_task_list "$plan")")"
+        if [ -n "$target" ] && printf '%s' "$t" | _ff_jq -e 'has("reviewed_head")' >/dev/null; then
+          current="$(_task_get "$plan" "$target" | _ff_jq -r '.head_sha // ""')"
+          reviewed="$(printf '%s' "$t" | _ff_jq -r '.reviewed_head // ""')"
+          if [ "$current" != "$reviewed" ]; then
+            _task_update "$plan" "$tid" "if ($guard) then .state = \"todo\" | .job = \"\"
+              | .result = \"build changed during review; review again\"
+              | del(.verifying_at, .verifying_pid, .verifying_start, .verifying_token)
+              | .attempt_base = ([(.attempts // 0), ((.jobs // []) | length)] | max) else error(\"moved\") end" >/dev/null 2>&1
+            return 0
+          fi
+        fi ;;
       fail)
-        _task_update "$plan" "$tid" '.evidence = $e' --arg e "$ev" >/dev/null 2>&1
-        _ff_review_failed "$plan" "$tid" "$tasks"
+        _task_update "$plan" "$tid" "if ($guard) then .evidence = \$e else error(\"moved\") end" --arg e "$ev" >/dev/null 2>&1
+        _ff_review_failed "$plan" "$tid" "$tasks" "" "$expected"
         return 0 ;;
       *)
-        _task_update "$plan" "$tid" '.evidence = $e | .result = ("no clear verdict: " + $v)' \
+        _task_update "$plan" "$tid" "if ($guard) then .evidence = \$e | .result = (\"no clear verdict: \" + \$v) else error(\"moved\") end" \
           --arg e "$ev" --arg v "${_FF_VERDICT_LINE:-(empty)}" >/dev/null 2>&1
         _ff_hold "$plan" "$tid" "the reviewer gave no clear verdict (its last line must be exactly 'VERDICT: PASS' or 'VERDICT: FAIL - <reason>'; it was: ${_FF_VERDICT_LINE:-empty}$( [ "$_FF_VERDICT" = ambiguous ] && echo ', and its answer says both')). Read it: $OSRC_JOBS/$job/last.txt. Accept: $(_ff_cmd "$plan" task done "$tid" --force). Review again: $(_ff_cmd "$plan" task release "$tid" --answer '"review again"')" "$guard"
         return 0 ;;
     esac
   fi
+  _plan_lock "$plan" || return 1
+  if ! _task_get "$plan" "$tid" | _ff_jq -e "$guard" >/dev/null; then _plan_unlock "$plan"; return 0; fi
   declare -F _task_finish_from_output >/dev/null 2>&1 && _task_finish_from_output "$plan" "$tid"
-  FACTORY_EVENT_NOTE="$out" _task_update "$plan" "$tid" 'if .state != "verifying" then error("moved") else . end
-      | .state = "done" | del(.verifying_at) | del(.verifying_pid) | (if $e != "" then .evidence = $e else . end)
-      | .result = (if (.result // "") == "" or (.result | startswith("previous attempt failed")) then $o else .result end)' \
-    --arg e "$ev" --arg o "$out" >/dev/null 2>&1 || { printf '  %s: someone else finished checking it\n' "$tid"; return 0; }
+  FACTORY_EVENT_NOTE="$out" _task_update "$plan" "$tid" "if ($guard) | not then error(\"moved\") else . end
+      | .state = \"done\" | del(.verifying_at, .verifying_pid, .verifying_start, .verifying_token)
+      | (if \$e != \"\" then .evidence = \$e else . end)
+      | .result = (if (.result // \"\") == \"\" or (.result | startswith(\"previous attempt failed\")) then \$o else .result end)
+      | if \$pending then .auto_land_pending = true else . end" \
+    --arg e "$ev" --arg o "$out" --argjson pending "$(
+      if [ "$_FF_AUTO_LAND" = 1 ] && [ "$shape" = ship ] && [ -z "$(printf '%s' "$t" | _ff_jq -r '.flow.name // ""')" ] && ! _ff_is_land_target "$tasks" "$tid"; then echo true; else echo false; fi)" >/dev/null 2>&1
+  rc=$?; _plan_unlock "$plan"
+  [ "$rc" = 0 ] || return 0
   printf '  %s: done\n' "$tid"
   # --auto-land: only plain build tasks. A flow's build tasks are reviewed, compared or picked after
   # they finish, and the flow lands them itself through its own land stage (or the captain does).
   if [ "$_FF_AUTO_LAND" = 1 ] && [ "$shape" = ship ] \
-     && [ -z "$(printf '%s' "$t" | jq -r '.flow.name // ""')" ] && ! _ff_is_land_target "$tasks" "$tid"; then
+     && [ -z "$(printf '%s' "$t" | _ff_jq -r '.flow.name // ""')" ] && ! _ff_is_land_target "$tasks" "$tid"; then
     if _ff_out_of_time; then
       printf '  %s: not landed: time cap reached; land it with: %s\n' "$tid" "$(_ff_cmd "$plan" land "$tid")"
       _task_update "$plan" "$tid" '.land_error = "not landed before the time cap"' >/dev/null 2>&1
@@ -450,8 +602,8 @@ _ff_verify() {
 _FF_SETUP=""
 _ff_land_setup() {
   local s1 s2
-  s1="$(_task_get "$1" "$2" 2>/dev/null | jq -r '.setup // ""' 2>/dev/null)"
-  s2="$(_task_get "$1" "$3" 2>/dev/null | jq -r '.setup // ""' 2>/dev/null)"
+  s1="$(_task_get "$1" "$2" 2>/dev/null | _ff_jq -r '.setup // ""' 2>/dev/null)"
+  s2="$(_task_get "$1" "$3" 2>/dev/null | _ff_jq -r '.setup // ""' 2>/dev/null)"
   printf '%s' "${s1:-${s2:-$_FF_SETUP}}"
 }
 # _ff_run_land <plan> <target-tid> <setup>: cmd_land, passing --setup only when given and supported.
@@ -467,15 +619,15 @@ _ff_run_land() {
 # done, the failure is recorded in .land_error, and the captain gets a wake with the exact command.
 _ff_auto_land() {
   local plan="$1" tid="$2" out rc st
-  declare -F cmd_land >/dev/null 2>&1 || { printf '  %s: landing is not available in this build; land it by hand\n' "$tid"; return 0; }
+  declare -F cmd_land >/dev/null 2>&1 || { printf '  %s: landing is not available in this build; update, then: %s\n' "$tid" "$(_ff_cmd "$plan" land "$tid")"; return 1; }
   out="$( _ff_run_land "$plan" "$tid" "$(_ff_land_setup "$plan" "$tid" "$tid")" 2>&1 )"; rc=$?
   out="$(printf '%s' "$out" | tail -3 | tr '\n' ' ' | sed 's/^ERROR: //' | cut -c1-200)"
   if [ "$rc" -eq 0 ]; then
-    _task_update "$plan" "$tid" 'del(.land_error)' >/dev/null 2>&1
+    _task_update "$plan" "$tid" 'del(.land_error, .land_error_at, .auto_land_pending) | .auto_land_complete = true' >/dev/null 2>&1
     printf '  %s: landed\n' "$tid"; return 0
   fi
-  st="$(_task_get "$plan" "$tid" | jq -r '.state')"
-  _task_update "$plan" "$tid" '.land_error = $o' --arg o "$out" >/dev/null 2>&1
+  st="$(_task_get "$plan" "$tid" | _ff_jq -r '.state')"
+  _task_update "$plan" "$tid" '.land_error = $o | .land_error_at = $now | .auto_land_pending = false' --arg o "$out" --argjson now "$(date +%s)" >/dev/null 2>&1
   [ "$st" = done ] && _ff_wake "$plan" "$tid" land-failed "plan $plan: landing $tid failed: $out. Fix it, then: $(_ff_cmd "$plan" land "$tid")"
   printf '  %s: landing failed (the build stays %s): %s. Next: %s\n' "$tid" "$st" "$out" "$(_ff_cmd "$plan" land "$tid")"
 }
@@ -489,7 +641,7 @@ _ff_land_stage() {
      | .state = "running" | .land_attempts = ((.land_attempts // 0) + 1) | .land_started_at = $now' \
     --arg now "$(_ff_now)" >/dev/null 2>&1 || return 0
   if ! declare -F cmd_land >/dev/null 2>&1; then
-    _ff_hold "$plan" "$lt" "landing is not available in this build; land $target by hand, then: $(_ff_cmd "$plan" task done "$lt" --force)"
+    _ff_hold "$plan" "$lt" "landing is not available in this build; update, run $(_ff_cmd "$plan" land "$target"), then: $(_ff_cmd "$plan" task done "$lt" --force)"
     return 0
   fi
   out="$( _ff_run_land "$plan" "$target" "$(_ff_land_setup "$plan" "$lt" "$target")" 2>&1 )"; rc=$?
@@ -501,8 +653,12 @@ _ff_land_stage() {
     _FF_MOVED=1
     return 0
   fi
-  tst="$(_task_get "$plan" "$target" | jq -r '.state')"
-  _ff_hold "$plan" "$lt" "landing $target failed: $out ($target is $tst). Fix it, then land again: $(_ff_cmd "$plan" task release "$lt" --answer '"land again"'). Or land it by hand ($(_ff_cmd "$plan" land "$target")) and close this step: $(_ff_cmd "$plan" task done "$lt" --force)" \
+  tst="$(_task_get "$plan" "$target" | _ff_jq -r '.state')"
+  local recovery=""
+  if [ "$tst" = held ]; then
+    recovery="Resolve the build first: $(_ff_cmd "$plan" task release "$target" --answer '"<resolve conflict>"'), then run outsourcerer plan run $plan to rebuild and re-review. "
+  fi
+  _ff_hold "$plan" "$lt" "${recovery}landing $target failed: $out ($target is $tst). Fix it, then land again: $(_ff_cmd "$plan" task release "$lt" --answer '"land again"'). Or land it by hand ($(_ff_cmd "$plan" land "$target")) and close this step: $(_ff_cmd "$plan" task done "$lt" --force)" \
     '.state == "running"'
 }
 
@@ -511,16 +667,16 @@ _ff_land_stage() {
 # attempts, else hold.
 _ff_land_stage_recover() {
   local plan="$1" lt="$2" t="$3" target tt n max
-  target="$(printf '%s' "$t" | jq -r '.land_target')"
+  target="$(printf '%s' "$t" | _ff_jq -r '.land_target')"
   tt="$(_task_get "$plan" "$target" 2>/dev/null)"
-  if [ "$(printf '%s' "$tt" | jq -r '.landed // false' 2>/dev/null)" = true ]; then
+  if [ "$(printf '%s' "$tt" | _ff_jq -r '.landed // false' 2>/dev/null)" = true ]; then
     _task_update "$plan" "$lt" 'if .state != "running" then error("moved") else . end | .state = "done" | .result = ("landed " + $t)' \
       --arg t "$target" >/dev/null 2>&1 && printf '  %s: %s had already landed\n' "$lt" "$target"
     _FF_MOVED=1
     return 0
   fi
-  n="$(_ff_num "$(printf '%s' "$t" | jq -r '.land_attempts // 0')" 0)"
-  max=$(( $(_ff_num "$(printf '%s' "$t" | jq -r '.retries // 1')" 1) + 1 ))
+  n="$(_ff_num "$(printf '%s' "$t" | _ff_jq -r '.land_attempts // 0')" 0)"
+  max=$(( $(_ff_num "$(printf '%s' "$t" | _ff_jq -r '.retries // 1')" 1) + 1 ))
   if [ "$n" -lt "$max" ]; then
     FACTORY_EVENT_NOTE="land interrupted; trying again" _task_update "$plan" "$lt" \
       'if .state != "running" then error("moved") else . end | .state = "todo"' >/dev/null 2>&1 \
@@ -534,26 +690,63 @@ _ff_land_stage_recover() {
 # ---------------------------------------------------------------- scheduler: reconcile
 
 _ff_reconcile() {   # <plan>
-  local plan="$1" tasks tid t st job grace age now vstale vpid j
+  local plan="$1" tasks tid t st job grace age now vstale vpid j tok guard me ident vtoken old target head reviewed receipt w br base rc
+  _plan_lock "$plan" || return 1
+  if [ -f "$(_plan_dir "$plan")/flow-expansion.json" ]; then
+    echo "plan $plan has an incomplete flow expansion; rerun outsourcerer flow run $(_ff_jq -r .flow "$(_plan_dir "$plan")/flow-expansion.json") --plan $plan with the original variables to replace it" >&2
+    _plan_unlock "$plan"; return 1
+  fi
+  _ff_pair_recover "$plan" || { _plan_unlock "$plan"; return 1; }
+  _plan_unlock "$plan"
   tasks="$(_task_list "$plan")" || return 1
+  # Invalidate an approval before any dependent land step is dispatched.
+  for tid in $(printf '%s' "$tasks" | _ff_jq -r '.[] | select(.state == "done" and .require_verdict == true and has("reviewed_head")) | .id'); do
+    t="$(_task_get "$plan" "$tid")" || continue
+    target="$(_ff_review_target "$t" "$tasks")"; [ -n "$target" ] || continue
+    head="$(_task_get "$plan" "$target" | _ff_jq -r '.head_sha // ""')"
+    reviewed="$(printf '%s' "$t" | _ff_jq -r '.reviewed_head // ""')"
+    if [ "$reviewed" != "$head" ]; then
+      guard="$(_ff_guard "$t")"
+      _task_update "$plan" "$tid" "if ($guard) then .state = \"todo\" | .job = \"\" | .evidence = \"\" | .result = \"build revision changed; review again\"
+        | .attempt_base = ([(.attempts // 0), ((.jobs // []) | length)] | max) else error(\"moved\") end" >/dev/null 2>&1
+    fi
+  done
+  tasks="$(_task_list "$plan")" || return 1
+  _factory_self_pid "$(_plan_dir "$plan")"; me="$_FACTORY_SELF_PID"
+  ident="$(_pid_start_identity "$me" 2>/dev/null)"
   grace="$(_ff_num "${OSRC_FACTORY_LAUNCH_GRACE:-300}" 300)"
   vstale="$(_ff_num "${OSRC_FACTORY_VERIFY_STALE_SECS:-900}" 900)"
-  for tid in $(printf '%s' "$tasks" | jq -r '.[] | select(.state == "running" or .state == "verifying") | .id'); do
+  for tid in $(printf '%s' "$tasks" | _ff_jq -r '.[] | select(.state == "running" or .state == "verifying" or .state == "failed" or .state == "done") | .id'); do
     _ff_out_of_time && return 0
     t="$(_task_get "$plan" "$tid")" || continue
-    st="$(printf '%s' "$t" | jq -r '.state')"
-    job="$(printf '%s' "$t" | jq -r '.job // ""')"
+    st="$(printf '%s' "$t" | _ff_jq -r '.state')"
+    job="$(printf '%s' "$t" | _ff_jq -r '.job // ""')"
+    tok="$(printf '%s' "$t" | _ff_jq -r '.attempt_token // ""')"
+    guard="$(_ff_guard "$t")"
     # A captain's decision or a land step is moved only by the scheduler, never by a worker's output.
-    if [ -n "$job" ] && printf '%s' "$t" | jq -e '(.gate // false) or ((.land_target // "") != "") or (.hold_after_deps // false)' >/dev/null 2>&1; then
+    if [ -n "$job" ] && printf '%s' "$t" | _ff_jq -e '(.gate // false) or ((.land_target // "") != "") or (.hold_after_deps // false)' >/dev/null 2>&1; then
       declare -F _task_stop_job >/dev/null 2>&1 && _task_stop_job "$job" >/dev/null 2>&1
-      _ff_hold "$plan" "$tid" "a worker was started by hand on this $(printf '%s' "$t" | jq -r 'if (.land_target // "") != "" then "land step" else "decision step" end'); its output does not count. Decide: $(_ff_cmd "$plan" task release "$tid" --answer '"<your decision>"')" \
+      _ff_hold "$plan" "$tid" "a worker was started by hand on this $(printf '%s' "$t" | _ff_jq -r 'if (.land_target // "") != "" then "land step" else "decision step" end'); its output does not count. Decide: $(_ff_cmd "$plan" task release "$tid" --answer '"<your decision>"')" \
         "(.state == \"running\" or .state == \"verifying\") and (.job // \"\") == \"$job\""
       continue
     fi
     case "$st" in
+      done)
+        if printf '%s' "$t" | _ff_jq -e '.auto_land_pending == true and ((.landed // false) | not)' >/dev/null; then
+          _ff_auto_land "$plan" "$tid"
+        elif [ "$_FF_AUTO_LAND" = 1 ] && ! _ff_is_land_target "$tasks" "$tid" && printf '%s' "$t" | _ff_jq -e '
+          .shape == "ship" and (.flow.name // "") == "" and ((.landed // false) | not)
+          and (.land_error // "") == "" and (.pr // "") == "" and ((.auto_land_pending // false) | not)
+          and (.deliver // "local") == "local" and ((.auto_land_complete // false) | not)' >/dev/null; then
+          _task_update "$plan" "$tid" "if ($guard) then .auto_land_pending = true else error(\"moved\") end" >/dev/null 2>&1 && _ff_auto_land "$plan" "$tid"
+        fi ;;
+      failed)
+        if printf '%s' "$t" | _ff_jq -e '.launch_failed == true' >/dev/null && [ "$(_ff_attempts "$t")" -le "$(printf '%s' "$t" | _ff_jq -r '.retries // 0')" ]; then
+          _ff_fail_or_retry "$plan" "$tid" "persisted launch failure: $(printf '%s' "$t" | _ff_jq -r '.result // ""')" "$guard"
+        fi ;;
       running)
         if [ -z "$job" ]; then
-          if [ -n "$(printf '%s' "$t" | jq -r '.land_target // ""')" ]; then
+          if [ -n "$(printf '%s' "$t" | _ff_jq -r '.land_target // ""')" ]; then
             _ff_land_stage_recover "$plan" "$tid" "$t"; continue
           fi
           # Claimed but no job yet: a launch is in flight (it takes seconds) unless the claim is old.
@@ -562,16 +755,30 @@ _ff_reconcile() {   # <plan>
           if [ "$age" -lt "$grace" ]; then
             printf '  %s: still launching (claimed %ss ago)\n' "$tid" "$age"; continue
           fi
-          j="$(_ff_find_job_by_ref "$plan" "$tid" "$t")"
+          j="$(_ff_find_job_by_ref "$plan" "$tid" "$t")"; rc=$?
+          if [ "$rc" = 2 ]; then
+            _ff_hold "$plan" "$tid" "multiple jobs match this attempt; inspect them before retrying: $(_ff_cmd "$plan" task show "$tid")" "$guard"
+            continue
+          fi
           if [ -n "$j" ]; then
+            receipt="{}"
+            [ ! -f "$OSRC_JOBS/$j/meta.json" ] || receipt="$(_ff_jq -c . "$OSRC_JOBS/$j/meta.json" 2>/dev/null)"
+            if [ -f "$OSRC_JOBS/$j/worktree.json" ]; then
+              receipt="$(_ff_jq -c . "$OSRC_JOBS/$j/worktree.json" 2>/dev/null)"
+            fi
+            [ -n "$receipt" ] || receipt="{}"
+            w="$(printf '%s' "$receipt" | _ff_jq -r '.path // .worktree // ""')"
+            br="$(printf '%s' "$receipt" | _ff_jq -r '.branch // ""')"
+            base="$(printf '%s' "$receipt" | _ff_jq -r '.base_sha // ""')"
             FACTORY_EVENT_NOTE="recovered job $j" _task_update "$plan" "$tid" \
-              'if .state != "running" or (.job // "") != "" then error("moved") else . end | .job = $j | .jobs = ((.jobs // []) + [$j])' \
-              --arg j "$j" >/dev/null 2>&1 || continue
+              "if ($guard) | not then error(\"moved\") else . end | .job = \$j | .jobs = ((.jobs // []) + [\$j])
+               | .worktree = \$w | .branch = \$b | .base_sha = \$s | .claimed_by = \"\"" \
+              --arg j "$j" --arg w "$w" --arg b "$br" --arg s "$base" >/dev/null 2>&1 || continue
             printf '  %s: found its job %s (its launcher stopped before recording it)\n' "$tid" "$j"
-            job="$j"
+            job="$j"; t="$(_task_get "$plan" "$tid")"; guard="$(_ff_guard "$t")"
           else
             _ff_fail_or_retry "$plan" "$tid" "its worker never launched (no job ${age}s after it was claimed)" \
-              '.state == "running" and (.job // "") == ""'
+              "$guard"
             continue
           fi
         fi
@@ -581,26 +788,26 @@ _ff_reconcile() {   # <plan>
           ok)
             # Verifying claim: only the pass that moves running -> verifying runs the done check, so a
             # concurrent `task done` (or a second driver) never checks or lands the same work twice.
-            _task_update "$plan" "$tid" 'if .state != "running" or (.job // "") != $j then error("moved") else . end
-                | .state = "verifying" | .verifying_at = $now | .verifying_pid = $pid' \
-              --arg j "$job" --arg now "$(_ff_now)" --arg pid "$$" >/dev/null 2>&1 || continue
+            vtoken="$(date +%s)-$me-$RANDOM"
+            _task_update "$plan" "$tid" "if ($guard) | not then error(\"moved\") else . end
+                | .state = \"verifying\" | .verifying_at = \$now | .verifying_pid = \$pid | .verifying_start = \$start | .verifying_token = \$token" \
+              --argjson now "$(date +%s)" --arg pid "$me" --arg start "$ident" --arg token "$vtoken" >/dev/null 2>&1 || continue
             _ff_verify "$plan" "$tid" "$tasks" ;;
           blocked) _ff_hold "$plan" "$tid" "$_FF_REASON. Answer it: $(_ff_cmd "$plan" task release "$tid" --answer '"<your answer>"') (a new worker starts with your answer)" \
-                     "(.state == \"running\") and (.job // \"\") == \"$job\"" ;;
-          *)       _ff_fail_or_retry "$plan" "$tid" "$_FF_REASON" "(.state == \"running\") and (.job // \"\") == \"$job\"" ;;
+                     "$guard" ;;
+          *)       _ff_fail_or_retry "$plan" "$tid" "$_FF_REASON" "$guard" ;;
         esac ;;
       verifying)
         # Someone is checking it (a `task done`, or this driver's previous run that stopped mid-check).
         # Take it over only when that checker is gone or the claim is stale.
-        vpid="$(printf '%s' "$t" | jq -r '.verifying_pid // ""')"
-        if [ -n "$vpid" ] && [ "$vpid" != "$$" ] && kill -0 "$vpid" 2>/dev/null; then continue; fi
-        if [ -z "$vpid" ]; then
-          age=$(( $(date +%s) - $(_ff_num "$(_ff_epoch "$t" '.verifying_at // .updated')" 0) ))
-          [ "$age" -ge "$vstale" ] || continue
-        fi
-        _task_update "$plan" "$tid" 'if .state != "verifying" or ((.verifying_pid // "") != $old) then error("moved") else . end
-            | .verifying_at = $now | .verifying_pid = $pid' \
-          --arg old "$vpid" --arg now "$(_ff_now)" --arg pid "$$" >/dev/null 2>&1 || continue
+        vpid="$(printf '%s' "$t" | _ff_jq -r '.verifying_pid // ""')"
+        old="$(printf '%s' "$t" | _ff_jq -r '.verifying_start // ""')"
+        age=$(( $(date +%s) - $(_ff_num "$(_ff_epoch "$t" '.verifying_at // .updated')" 0) ))
+        if [ "$age" -lt "$vstale" ] && ! _ff_owner_dead "$vpid" "$old"; then continue; fi
+        vtoken="$(date +%s)-$me-$RANDOM"
+        _task_update "$plan" "$tid" "if ($guard) | not then error(\"moved\") else . end
+            | .verifying_at = \$now | .verifying_pid = \$pid | .verifying_start = \$start | .verifying_token = \$token" \
+          --argjson now "$(date +%s)" --arg pid "$me" --arg start "$ident" --arg token "$vtoken" >/dev/null 2>&1 || continue
         _ff_verify "$plan" "$tid" "$tasks" ;;
     esac
   done
@@ -610,29 +817,34 @@ _ff_reconcile() {   # <plan>
 
 _FF_MOVED=0
 _ff_dispatch() {   # <plan> <max-parallel>
-  local plan="$1" max="$2" tasks active tid t out rc st answer target m lf
+  local plan="$1" max="$2" tasks active tid t out rc st answer target m lf ready
   _FF_MOVED=0
+  _plan_lock "$plan" || return 1
+  if [ -f "$(_plan_dir "$plan")/flow-expansion.json" ]; then _plan_unlock "$plan"; return 1; fi
+  _ff_pair_recover "$plan" || { _plan_unlock "$plan"; return 1; }
+  ready="$(_task_ready "$plan")"
+  _plan_unlock "$plan"
   tasks="$(_task_list "$plan")" || return 1
-  active="$(printf '%s' "$tasks" | jq '[.[] | select(.state == "running" or .state == "verifying")] | length')"
-  for tid in $(_task_ready "$plan"); do
+  active="$(printf '%s' "$tasks" | _ff_jq '[.[] | select(.state == "running" or .state == "verifying")] | length')"
+  for tid in $ready; do
     _ff_out_of_time && return 0
     t="$(_task_get "$plan" "$tid")" || continue
-    [ "$(printf '%s' "$t" | jq -r '.state')" = todo ] || continue
-    if [ "$(printf '%s' "$t" | jq -r '.hold_after_deps // false')" = "true" ]; then
-      _ff_hold "$plan" "$tid" "captain's decision: $(printf '%s' "$t" | jq -r '.title // ""')$(_ff_pick_hint "$plan" "$t" "$tasks"). Decide: $(_ff_cmd "$plan" task release "$tid" --answer '"<your decision>"')" '.state == "todo"'
+    [ "$(printf '%s' "$t" | _ff_jq -r '.state')" = todo ] || continue
+    if [ "$(printf '%s' "$t" | _ff_jq -r '.hold_after_deps // false')" = "true" ]; then
+      _ff_hold "$plan" "$tid" "captain's decision: $(printf '%s' "$t" | _ff_jq -r '.title // ""')$(_ff_pick_hint "$plan" "$t" "$tasks"). Decide: $(_ff_cmd "$plan" task release "$tid" --answer '"<your decision>"')" '.state == "todo"'
       _FF_MOVED=1
       continue
     fi
-    target="$(printf '%s' "$t" | jq -r '.land_target // ""')"
+    target="$(printf '%s' "$t" | _ff_jq -r '.land_target // ""')"
     if [ -n "$target" ]; then
       _ff_land_stage "$plan" "$tid" "$target"
       continue
     fi
-    answer="$(printf '%s' "$t" | jq -r '.hold.answer // ""')"
-    if [ "$(printf '%s' "$t" | jq -r '.gate // false')" = "true" ]; then
+    answer="$(printf '%s' "$t" | _ff_jq -r '.hold.answer // ""')"
+    if [ "$(printf '%s' "$t" | _ff_jq -r '.gate // false')" = "true" ]; then
       # A decision gate is done only with the captain's answer (`task release --answer`).
       if [ -z "$answer" ]; then
-        _ff_hold "$plan" "$tid" "captain's decision: $(printf '%s' "$t" | jq -r '.title // ""'). Decide: $(_ff_cmd "$plan" task release "$tid" --answer '"<your decision>"')" '.state == "todo"'
+        _ff_hold "$plan" "$tid" "captain's decision: $(printf '%s' "$t" | _ff_jq -r '.title // ""'). Decide: $(_ff_cmd "$plan" task release "$tid" --answer '"<your decision>"')" '.state == "todo"'
       else
         _task_update "$plan" "$tid" 'if .state != "todo" then error("moved") else . end | .state = "done" | .result = $a' --arg a "$answer" >/dev/null 2>&1 \
           && printf '  %s: decided by the captain: %s\n' "$tid" "$answer"
@@ -641,16 +853,24 @@ _ff_dispatch() {   # <plan> <max-parallel>
       continue
     fi
     # A reviewer the captain released after a FAIL: the answer asks for one more redo of the build.
-    if [ -n "$answer" ] && [ -n "$(printf '%s' "$t" | jq -r '.verdict_failed.target // ""')" ]; then
-      _ff_review_failed "$plan" "$tid" "$tasks" captain
+    if [ -n "$answer" ] && [ -n "$(printf '%s' "$t" | _ff_jq -r '.verdict_failed.target // ""')" ]; then
+      _ff_review_failed "$plan" "$tid" "$tasks" captain && _FF_MOVED=1
       continue
     fi
     [ "$active" -lt "$max" ] || continue
     # Model: skip one the exclude list now names; the stored fallbacks keep the stage's intent.
     m="$(_ff_next_model "$t" dispatch)"
-    if [ "$m" != "$(printf '%s' "$t" | jq -r '.model // ""')" ]; then
+    if [ "$m" != "$(printf '%s' "$t" | _ff_jq -r '.model // ""')" ]; then
       _task_update "$plan" "$tid" 'if .state != "todo" then error("moved") else . end | .model = $m' --arg m "$m" >/dev/null 2>&1 \
-        && printf '  %s: model %s is excluded now; using %s\n' "$tid" "$(printf '%s' "$t" | jq -r '.model // "(none)"')" "${m:-whatever the router picks}"
+        && printf '  %s: model %s is excluded now; using %s\n' "$tid" "$(printf '%s' "$t" | _ff_jq -r '.model // "(none)"')" "${m:-whatever the router picks}"
+    fi
+    if [ "$(printf '%s' "$t" | _ff_jq -r '.require_verdict // false')" = true ]; then
+      target="$(_ff_review_target "$t" "$(_task_list "$plan")")"
+      if [ -n "$target" ]; then
+        _task_update "$plan" "$tid" 'if .state != "todo" then error("moved") else . end
+          | .reviewed_head = $h | .review_target = $t' \
+          --arg h "$(_task_get "$plan" "$target" | _ff_jq -r '.head_sha // ""')" --arg t "$target" >/dev/null 2>&1 || continue
+      fi
     fi
     out="$( _task_dispatch "$plan" "$tid" 2>&1 )"; rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -659,13 +879,13 @@ _ff_dispatch() {   # <plan> <max-parallel>
     else
       out="$(printf '%s' "$out" | tail -2 | tr '\n' ' ' | sed 's/^ERROR: //' | cut -c1-200)"
       t="$(_task_get "$plan" "$tid")"
-      st="$(printf '%s' "$t" | jq -r '.state')"
+      st="$(printf '%s' "$t" | _ff_jq -r '.state')"
       if [ "$st" = failed ]; then
         # A launch failure counts as a failed attempt: retried within the task's budget. The task
         # store marks it with launch_failed:true when it can; older stores leave the reason text.
-        lf="$(printf '%s' "$t" | jq -r 'if has("launch_failed") then (.launch_failed | tostring) else ((.result // "") | test("did not launch") | tostring) end')"
+        lf="$(printf '%s' "$t" | _ff_jq -r 'if has("launch_failed") then (.launch_failed | tostring) else ((.result // "") | test("did not launch") | tostring) end')"
         if [ "$lf" = true ]; then
-          _ff_fail_or_retry "$plan" "$tid" "the worker did not launch: $out" '.state == "failed"'
+          _ff_fail_or_retry "$plan" "$tid" "the worker did not launch: $out" "$(_ff_guard "$t")"
         else
           printf '  %s: could not start: %s\n' "$tid" "$out"
         fi
@@ -678,7 +898,7 @@ _ff_dispatch() {   # <plan> <max-parallel>
 # say how to land the winner once picked, since a flow never lands a candidate on its own.
 _ff_pick_hint() {
   local plan="$1" t="$2" tasks="$3" ships
-  ships="$(printf '%s' "$tasks" | jq -r --arg f "$(printf '%s' "$t" | jq -r '.flow.name // ""')" \
+  ships="$(printf '%s' "$tasks" | _ff_jq -r --arg f "$(printf '%s' "$t" | _ff_jq -r '.flow.name // ""')" \
     '[.[] | select($f != "" and (.flow.name // "") == $f and (.shape // "") == "ship" and .state == "done") | .id] | join(", ")')"
   case "$ships" in *,*) printf ' (candidates: %s; after you pick, land the winner: %s)' "$ships" "$(_ff_cmd "$plan" land '<tid>')" ;; esac
 }
@@ -693,7 +913,7 @@ _FF_JQ_LANDFAIL='(.state == "done" and ((.land_error // "") != "") and ((.landed
 
 # _ff_counts <plan> -> "total done canceled failed held running ready blocked todo landfail" (one line)
 _ff_counts() {
-  _task_view "$1" | jq -r '
+  _task_view "$1" | _ff_jq -r '
     def n(f): [.[] | select(f)] | length;
     [length, n(.state == "done"), n(.state == "canceled"), n(.state == "failed"), n(.state == "held"),
      n(.state == "running" or .state == "verifying"), n(.derived == "ready"), n(.derived == "blocked"),
@@ -702,7 +922,7 @@ _ff_counts() {
 
 # _ff_summary <plan> [tick]: the four buckets on one compact line.
 _ff_summary() {
-  _task_view "$1" | jq -r --arg plan "$1" --arg tick "${2:-}" '
+  _task_view "$1" | _ff_jq -r --arg plan "$1" --arg tick "${2:-}" '
     def ids(f): [.[] | select(f) | .id] | (if length > 6 then (.[0:6] + ["+\(length - 6)"]) else . end) | join(",");
     def paren(s): if s == "" then "" else " (" + s + ")" end;
     def cc: (.state == "held" or .state == "failed" or '"$_FF_JQ_LANDFAIL"');
@@ -716,7 +936,7 @@ _ff_summary() {
 
 # _ff_why_stuck <plan>: one plain line naming what is held, failed, or blocked, with the next command.
 _ff_why_stuck() {
-  _task_view "$1" | jq -r --arg plan "$1" '
+  _task_view "$1" | _ff_jq -r --arg plan "$1" '
     def cmd(s): "outsourcerer " + s + " --plan " + $plan;
     ([.[] | select(.state == "held") | .id + " (" + cmd("task release " + .id + " --answer \"...\"") + ")"]) as $held
     | ([.[] | select(.state == "failed") | .id + " (" + cmd("task retry " + .id) + ")"]) as $failed
@@ -756,17 +976,17 @@ cmd_plan_run() {
   while [ "$#" -gt 0 ]; do
     a="$1"
     case "$a" in
-      --max-parallel) max="${2:-}"; shift 2 || true ;;
+      --max-parallel) _factory_optval "$1" "$#" || return 1; max="$2"; shift 2 ;;
       --max-parallel=*) max="${a#*=}"; shift ;;
-      --interval) interval="${2:-}"; shift 2 || true ;;
+      --interval) _factory_optval "$1" "$#" || return 1; interval="$2"; shift 2 ;;
       --interval=*) interval="${a#*=}"; shift ;;
-      --max-minutes) maxmin="${2:-}"; shift 2 || true ;;
+      --max-minutes) _factory_optval "$1" "$#" || return 1; maxmin="$2"; shift 2 ;;
       --max-minutes=*) maxmin="${a#*=}"; shift ;;
       --once) once=1; shift ;;
       --auto-land) _FF_AUTO_LAND=1; shift ;;
       --setup) [ -n "${2:-}" ] || die "plan run --setup needs a command, e.g. --setup \"npm ci\""; _FF_SETUP="$2"; shift 2 ;;
       --setup=*) _FF_SETUP="${a#*=}"; shift ;;
-      --plan) plan="${2:-}"; shift 2 || true ;;
+      --plan) _factory_optval "$1" "$#" || return 1; plan="$2"; shift 2 ;;
       -h|--help) _ff_plan_run_usage; return 0 ;;
       -*) die "plan run: unknown option '$a' ($(_ff_plan_run_usage | head -1))" ;;
       *) [ -z "$plan" ] || die "plan run takes one plan name (got '$plan' and '$a')"; plan="$a"; shift ;;
@@ -775,6 +995,8 @@ cmd_plan_run() {
   case "$max" in ''|*[!0-9]*|0) die "plan run --max-parallel needs a whole number of 1 or more" ;; esac
   case "$interval" in ''|*[!0-9]*|0) die "plan run --interval needs a whole number of seconds (1 or more)" ;; esac
   case "$maxmin" in ''|*[!0-9]*|0) die "plan run --max-minutes needs a whole number of minutes (1 or more)" ;; esac
+  max="$(_ff_num "$max")"; interval="$(_ff_num "$interval")"; maxmin="$(_ff_num "$maxmin")"
+  [ "$max" -gt 0 ] && [ "$interval" -gt 0 ] && [ "$maxmin" -gt 0 ] || die "plan run limits must be greater than zero"
   _ff_need_jq
   _ff_need_fns _plan_dir _plan_resolve _task_get _task_update _task_list _task_view _task_ready _task_dispatch _factory_done_check
   plan="$(_plan_resolve ${plan:+"$plan"})" || return 1
@@ -800,7 +1022,7 @@ cmd_plan_run() {
   t0=$(date +%s); _FF_DEADLINE=$(( t0 + maxmin * 60 ))
   while :; do
     tick=$((tick + 1))
-    _ff_reconcile "$plan"
+    _ff_reconcile "$plan" || { _ff_lock_release; _ff_restore_traps; return 3; }
     _ff_dispatch "$plan" "$max"
     # A decision or land that finished this pass frees its dependents now, not one interval later.
     pass=1
@@ -844,7 +1066,7 @@ cmd_plan_run() {
 _ff_wake_finished() {   # <plan> <done-count>: one wake per distinct finished state, not one per tick
   local plan="$1" n="$2" pd sig
   pd="$(_plan_dir "$plan")"
-  sig="$(_task_list "$plan" | jq -r '[.[] | .id + ":" + .state] | sort | join(",")' | cksum | cut -d' ' -f1)"
+  sig="$(_task_list "$plan" | _ff_jq -r '[.[] | .id + ":" + .state] | sort | join(",")' | cksum | cut -d' ' -f1)"
   [ "$(cat "$pd/.finished-woken" 2>/dev/null)" = "$sig" ] && return 0
   _ff_wake "$plan" "-" finished "plan $plan finished: $n task(s) done"
   printf '%s\n' "$sig" > "$pd/.finished-woken.$$" 2>/dev/null && mv -f "$pd/.finished-woken.$$" "$pd/.finished-woken" 2>/dev/null
@@ -883,7 +1105,7 @@ _factory_plans_digest() {
   done
   [ -n "$files" ] || return 0
   out="$(printf '%s' "$files" | while IFS= read -r d; do [ -n "$d" ] && cat "$d"tasks/t*.json 2>/dev/null; echo; done \
-    | jq -rs '
+    | _ff_jq -rs '
       group_by(.plan)[]
       | (map({key: .id, value: .state}) | from_entries) as $s
       | map(. + {derived: (if .state == "todo" then (if all((.deps // [])[]; $s[.] == "done") then "ready" else "blocked" end) else .state end)}) as $v
@@ -979,19 +1201,19 @@ _ff_flow_load() {
   local name="$1" path err tgt
   _ff_name_ok "$name" || die "flow names use letters, digits, dot, dash and underscore only (got '$name')"
   path="$(_ff_flow_path "$name")" || die "no flow named '$name' (see: flow ls)"
-  jq -e . "$path" >/dev/null 2>&1 || die "flow file $path is not valid JSON"
-  err="$(jq -r "$_FF_FLOW_CHECK_JQ" "$path" 2>/dev/null)" || die "flow '$name' ($path) could not be checked (its layout is not what a flow file looks like); fix it against references/factory-flow-cli.md"
+  _ff_jq -e . "$path" >/dev/null 2>&1 || die "flow file $path is not valid JSON"
+  err="$(_ff_jq -r "$_FF_FLOW_CHECK_JQ" "$path" 2>/dev/null)" || die "flow '$name' ($path) could not be checked (its layout is not what a flow file looks like); fix it against references/factory-flow-cli.md"
   [ -z "$err" ] || die "flow '$name' ($path) is broken: $err"
   # Land targets must be build (ship) stages.
-  tgt="$(jq -r '. as $f | [.stages[] | select((.land // "") != "") | .land as $l | select(([$f.stages[] | select(.id == $l) | (.shape // "scout")][0]) != "ship") | .id + " lands " + $l] | first // ""' "$path" 2>/dev/null)" \
+  tgt="$(_ff_jq -r '. as $f | [.stages[] | select((.land // "") != "") | .land as $l | select(([$f.stages[] | select(.id == $l) | (.shape // "scout")][0]) != "ship") | .id + " lands " + $l] | first // ""' "$path" 2>/dev/null)" \
     || die "flow '$name' ($path) could not be checked"
   [ -z "$tgt" ] || die "flow '$name' ($path) is broken: stage $tgt, which is not a build (ship) stage"
-  jq -c --arg src "$path" '. + {_source: $src}' "$path"
+  _ff_jq -c --arg src "$path" '. + {_source: $src}' "$path"
 }
 
 # _ff_flow_vars_used <flow-json> -> newline list of {{var}} names used in the stages
 _ff_flow_vars_used() {
-  printf '%s' "$1" | jq -r '[.stages[] | (.title, .prompt, .check, .setup, .repeat, .model, (.fallback // [])[], (.models // [])[])
+  printf '%s' "$1" | _ff_jq -r '[.stages[] | (.title, .prompt, .check, .setup, .repeat, .model, (.fallback // [])[], (.models // [])[])
      | select(type == "string") | [match("\\{\\{([A-Za-z_][A-Za-z0-9_]*)\\}\\}"; "g") | .captures[0].string][]] | unique[]'
 }
 
@@ -1012,12 +1234,12 @@ _ff_pick_model() {
   return 0
 }
 
-# _ff_jq_with <json-a> <json-b> <jq args...>: run jq -n with the two JSON documents on stdin, so big
+# _ff_jq_with <json-a> <json-b> <jq args...>: run _ff_jq -n with the two JSON documents on stdin, so big
 # values (a huge --var) never hit the per-argument size limit. The filter reads them with
 # `input as $a | input as $b | ...`.
 _ff_jq_with() {
   local a="$1" b="$2"; shift 2
-  { printf '%s\n' "$a"; printf '%s\n' "$b"; } | jq -c -n "$@"
+  { printf '%s\n' "$a"; printf '%s\n' "$b"; } | _ff_jq -c -n "$@"
 }
 
 # _ff_subst <json-string-value> <vars-json>: single-pass {{var}} substitution done inside jq. Values
@@ -1030,13 +1252,13 @@ _FF_SUBST_JQ='def sub($v): if type == "string" then gsub("\\{\\{(?<k>[A-Za-z_][A
 # (base stage id for repeated stages), the original deps (stage ids) and "cands" (model candidates).
 _ff_flow_expand() {
   local flow="$1" vars="$2" n i k cnt base stage out="[]" model models
-  n="$(printf '%s' "$flow" | jq '.stages | length')"
+  n="$(printf '%s' "$flow" | _ff_jq '.stages | length')"
   i=0
   while [ "$i" -lt "$n" ]; do
-    stage="$(printf '%s' "$flow" | jq -c --argjson i "$i" '.stages[$i]')"
+    stage="$(printf '%s' "$flow" | _ff_jq -c --argjson i "$i" '.stages[$i]')"
     cnt="$(_ff_jq_with "$vars" "$stage" -r "$_FF_SUBST_JQ"' input as $v | input | (.repeat // "1") | tostring | sub($v)')"
-    case "$cnt" in ''|*[!0-9]*) die "stage $(printf '%s' "$stage" | jq -r .id) repeats '$cnt' times; that must be a whole number (for example --var n=3)" ;; esac
-    { [ "$cnt" -ge 1 ] && [ "$cnt" -le 10 ]; } || die "stage $(printf '%s' "$stage" | jq -r .id) repeats $cnt times; pick 1 to 10"
+    case "$cnt" in ''|*[!0-9]*) die "stage $(printf '%s' "$stage" | _ff_jq -r .id) repeats '$cnt' times; that must be a whole number (for example --var n=3)" ;; esac
+    { [ "$cnt" -ge 1 ] && [ "$cnt" -le 10 ]; } || die "stage $(printf '%s' "$stage" | _ff_jq -r .id) repeats $cnt times; pick 1 to 10"
     k=1; _FF_AVOID=""
     while [ "$k" -le "$cnt" ]; do
       # Per-copy vars add {{i}} (copy number) and {{n}} (copy count); flow vars win if they define them.
@@ -1053,16 +1275,16 @@ _ff_flow_expand() {
            cands: ((if ($s.models // []) | length > 0
                     then ($s.models | length) as $L | [range(0; $L)] | map($s.models[(. + ($i | tonumber) - 1) % $L])
                     else [($s.model // "")] + ($s.fallback // []) end) | map(sub($vv)) | map(select(. != "")))}')" \
-        || die "could not expand stage $(printf '%s' "$stage" | jq -r .id)"
-      models="$(printf '%s' "$base" | jq -r '.cands[]')"
+        || die "could not expand stage $(printf '%s' "$stage" | _ff_jq -r .id)"
+      models="$(printf '%s' "$base" | _ff_jq -r '.cands[]')"
       # shellcheck disable=SC2086
       model="$(set -f; _ff_pick_model $models)"
       [ -n "$model" ] && _FF_AVOID="$_FF_AVOID $model"
-      if [ -n "$models" ] && [ -z "$model" ] && [ "$(printf '%s' "$base" | jq -r '.land')" = "" ]; then
-        echo "note: every model named for stage $(printf '%s' "$base" | jq -r .sid) is on your exclude list; the router will pick one." >&2
+      if [ -n "$models" ] && [ -z "$model" ] && [ "$(printf '%s' "$base" | _ff_jq -r '.land')" = "" ]; then
+        echo "note: every model named for stage $(printf '%s' "$base" | _ff_jq -r .sid) is on your exclude list; the router will pick one." >&2
       fi
       out="$(_ff_jq_with "$out" "$base" --arg m "$model" 'input as $o | input as $b | $o + [($b + {model: $m})]')" \
-        || die "could not expand stage $(printf '%s' "$stage" | jq -r .id)"
+        || die "could not expand stage $(printf '%s' "$stage" | _ff_jq -r .id)"
       k=$((k + 1))
     done
     i=$((i + 1))
@@ -1072,23 +1294,23 @@ _ff_flow_expand() {
 }
 
 # _ff_parse_vars <flow-json> <JSON array of "k=v" strings> -> merged vars JSON (defaults applied);
-# dies on a missing required var or an unknown one. Values stay data end to end (jq --arg / stdin),
+# dies on a missing required var or an unknown one. Values stay data end to end (_ff_jq --arg / stdin),
 # never eval'd, and never passed as one giant argument.
 _ff_parse_vars() {
   local flow="$1" kvs="$2" vars="{}" kv k v missing unknown used cnt i
-  cnt="$(printf '%s' "$kvs" | jq 'length')"; i=0
+  cnt="$(printf '%s' "$kvs" | _ff_jq 'length')"; i=0
   while [ "$i" -lt "$cnt" ]; do
-    kv="$(printf '%s' "$kvs" | jq -r --argjson i "$i" '.[$i]')"; i=$((i + 1))
+    kv="$(printf '%s' "$kvs" | _ff_jq -r --argjson i "$i" '.[$i]')"; i=$((i + 1))
     case "$kv" in *=*) ;; *) die "--var needs name=value (got '$(printf '%s' "$kv" | cut -c1-60)')" ;; esac
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in ''|[0-9]*|*[!A-Za-z0-9_]*) die "--var name '$(printf '%s' "$k" | cut -c1-60)' must be letters, digits and underscore" ;; esac
-    vars="$(_ff_jq_with "$vars" "$(printf '%s' "$v" | jq -Rs .)" --arg k "$k" 'input as $c | input as $v | $c + {($k): $v}')" \
+    vars="$(_ff_jq_with "$vars" "$(printf '%s' "$v" | _ff_jq -Rs .)" --arg k "$k" 'input as $c | input as $v | $c + {($k): $v}')" \
       || die "could not read --var $k"
   done
   unknown="$(_ff_jq_with "$flow" "$vars" -r 'input as $f | input as $v | ($f.vars // {}) as $d | [$v | keys[] | . as $k | select(($d | has($k)) | not)] | join(", ")')"
-  [ -z "$unknown" ] || die "flow $(printf '%s' "$flow" | jq -r .name) has no variable $unknown (it takes: $(printf '%s' "$flow" | jq -r '(.vars // {}) | keys | join(", ")'))"
+  [ -z "$unknown" ] || die "flow $(printf '%s' "$flow" | _ff_jq -r .name) has no variable $unknown (it takes: $(printf '%s' "$flow" | _ff_jq -r '(.vars // {}) | keys | join(", ")'))"
   missing="$(_ff_jq_with "$flow" "$vars" -r 'input as $f | input as $v | [($f.vars // {}) | to_entries[] | select(.value == "required" and (($v[.key] // "") == "")) | .key] | join(", ")')"
-  [ -z "$missing" ] || die "flow $(printf '%s' "$flow" | jq -r .name) needs $(printf '%s' "$missing" | sed 's/\([A-Za-z0-9_]*\)/--var \1=.../g')"
+  [ -z "$missing" ] || die "flow $(printf '%s' "$flow" | _ff_jq -r .name) needs $(printf '%s' "$missing" | sed 's/\([A-Za-z0-9_]*\)/--var \1=.../g')"
   vars="$(_ff_jq_with "$flow" "$vars" 'input as $f | input as $v | $f
     | reduce ((.vars // {}) | to_entries[]) as $e ({};
       . + {($e.key): (if ($e.value | type) == "object" then ($e.value.default // "" | tostring)
@@ -1097,7 +1319,7 @@ _ff_parse_vars() {
   used="$(_ff_flow_vars_used "$flow")"
   for k in $used; do
     case "$k" in i|n) continue ;; esac
-    printf '%s' "$vars" | jq -e --arg k "$k" 'has($k)' >/dev/null || die "flow $(printf '%s' "$flow" | jq -r .name) uses {{$k}} but does not declare it under vars"
+    printf '%s' "$vars" | _ff_jq -e --arg k "$k" 'has($k)' >/dev/null || die "flow $(printf '%s' "$flow" | _ff_jq -r .name) uses {{$k}} but does not declare it under vars"
   done
   printf '%s\n' "$vars"
 }
@@ -1114,7 +1336,7 @@ _ff_plan_ensure() {
   if [ -e "$pd" ]; then
     [ "$new" = 1 ] && return 2
     [ -f "$pd/plan.json" ] || die "$pd exists but is not a plan; pick another name with --plan"
-    repo="$(jq -r '.repo // ""' "$pd/plan.json")"
+    repo="$(_ff_jq -r '.repo // ""' "$pd/plan.json")"
     if [ -n "$repoarg" ]; then
       want="$(git -C "$repoarg" rev-parse --show-toplevel 2>/dev/null)" || die "--repo $repoarg is not inside a git repository"
       want="$(cd "$want" && pwd -P)"
@@ -1152,7 +1374,7 @@ _ff_plan_ensure() {
   mkdir -p "$pd/tasks" || die "could not create the plan folder $pd"
   _FF_PLAN_CREATED=1
   tmp="$pd/.plan.json.$$"
-  jq -n --arg name "$plan" --arg goal "$goal" --arg repo "$repo" --arg base "$base" --arg now "$now" \
+  _ff_jq -n --arg name "$plan" --arg goal "$goal" --arg repo "$repo" --arg base "$base" --arg now "$now" \
     '{schema:1,name:$name,goal:$goal,repo:$repo,base_branch:$base,created:$now,updated:$now}' > "$tmp" \
     && mv -f "$tmp" "$pd/plan.json" || die "could not write $pd/plan.json"
   [ -s "$OSRC_HOME/plans/current" ] || { printf '%s\n' "$plan" > "$OSRC_HOME/plans/current.$$" && mv -f "$OSRC_HOME/plans/current.$$" "$OSRC_HOME/plans/current"; }
@@ -1189,7 +1411,7 @@ _ff_flow_ls() {
       case " $seen " in *" $name "*) continue ;; esac
       seen="$seen $name"
       src="built-in"; [ "$d" = "$OSRC_HOME/flows" ] && src="yours"
-      printf '%-16s %-8s %s\n' "$name" "$src" "$(jq -r '.description // "" | tostring | gsub("[[:cntrl:]]"; " ") | .[0:110]' "$f" 2>/dev/null || echo '(unreadable)')"
+      printf '%-16s %-8s %s\n' "$name" "$src" "$(_ff_jq -r '.description // "" | tostring | gsub("[[:cntrl:]]"; " ") | .[0:110]' "$f" 2>/dev/null || echo '(unreadable)')"
     done
   done <<EOF
 $(_ff_flow_dirs)
@@ -1200,7 +1422,7 @@ EOF
 _ff_flow_show() {
   local flow
   flow="$(_ff_flow_load "$1")" || return 1
-  printf '%s' "$flow" | jq -r '
+  printf '%s' "$flow" | _ff_jq -r '
     "\(.name): \(.description // "")",
     "from: \(._source)",
     "vars: " + ((.vars // {}) | to_entries | map(.key + (if .value == "required" then " (required)" elif .value == "optional" then " (optional)" elif (.value | type) == "object" then " (default " + (.value.default // "" | tostring) + ")" else " (default " + (.value | tostring) + ")" end)) | join(", ")),
@@ -1218,34 +1440,34 @@ _ff_flow_show() {
        + "  - " + (.title // ""))'
 }
 
-# _ff_flow_rollback <plan> <tids...>: undo a half-made flow run. Removes the tasks this run added (and
-# the plan itself when this run created it), so a failed `flow run` never leaves a partial plan.
+# _ff_flow_rollback <plan>: remove only the expansion named by its durable marker, under the plan
+# lock. Keep the plan and unrelated tasks, including work added before this expansion acquired it.
 _ff_flow_rollback() {
-  local plan="$1" pd t; shift
+  local plan="$1" pd t token
   pd="$(_plan_dir "$plan")"
-  if [ "$_FF_PLAN_CREATED" = 1 ]; then
-    [ "$(cat "$OSRC_HOME/plans/current" 2>/dev/null)" = "$plan" ] && rm -f "$OSRC_HOME/plans/current"
-    rm -rf "$pd"
-    return 0
-  fi
-  for t in "$@"; do
-    case "$t" in t[0-9]*) rm -f "$pd/tasks/$t.json"; rm -rf "$pd/tasks/$t" ;; esac
+  [ -f "$pd/flow-expansion.json" ] || return 0
+  token="$(_ff_jq -r '.token' "$pd/flow-expansion.json")" || return 1
+  # The caller holds the plan lock. Remove only this expansion, never the whole plan.
+  for t in $(_task_list "$plan" | _ff_jq -r --arg token "$token" '.[] | select(.flow_expansion == $token) | .id'); do
+    rm -f "$pd/tasks/$t.json"
+    rm -rf "$pd/tasks/$t"
   done
-  _ff_event "$plan" "" flow-rolled-back "removed $*"
+  rm -f "$pd/flow-expansion.json"
+  _ff_event "$plan" "" flow-rolled-back "interrupted expansion $token"
 }
 
-_ff_flow_run() {
+_ff_flow_run() (
   local name="" plan="" repo="" dry=0 a flow vars stages goal needrepo n i st sid tid map="" deps_json json model title rows="" copy land
-  local kvs="[]" auto=0 base k rc made="" ltid bad
+  local kvs="[]" auto=0 base k rc made="" ltid bad pd token committed=0
   while [ "$#" -gt 0 ]; do
     a="$1"
     case "$a" in
-      --plan) plan="${2:-}"; shift 2 || true ;;
+      --plan) _factory_optval "$1" "$#" || return 1; plan="$2"; shift 2 ;;
       --plan=*) plan="${a#*=}"; shift ;;
-      --repo) repo="${2:-}"; shift 2 || true ;;
+      --repo) _factory_optval "$1" "$#" || return 1; repo="$2"; shift 2 ;;
       --repo=*) repo="${a#*=}"; shift ;;
-      --var) [ "$#" -ge 2 ] || die "--var needs name=value"; kvs="$(_ff_jq_with "$kvs" "$(printf '%s' "$2" | jq -Rs .)" 'input as $c | input as $v | $c + [$v]')"; shift 2 ;;
-      --var=*) kvs="$(_ff_jq_with "$kvs" "$(printf '%s' "${a#--var=}" | jq -Rs .)" 'input as $c | input as $v | $c + [$v]')"; shift ;;
+      --var) [ "$#" -ge 2 ] || die "--var needs name=value"; kvs="$(_ff_jq_with "$kvs" "$(printf '%s' "$2" | _ff_jq -Rs .)" 'input as $c | input as $v | $c + [$v]')"; shift 2 ;;
+      --var=*) kvs="$(_ff_jq_with "$kvs" "$(printf '%s' "${a#--var=}" | _ff_jq -Rs .)" 'input as $c | input as $v | $c + [$v]')"; shift ;;
       --dry-run) dry=1; shift ;;
       -*) die "flow run: unknown option '$a'" ;;
       *) [ -z "$name" ] || die "flow run takes one flow name (got '$name' and '$a')"; name="$a"; shift ;;
@@ -1259,17 +1481,17 @@ _ff_flow_run() {
   [ -n "$vars" ] || return 1
   stages="$(_ff_flow_expand "$flow" "$vars")" || return 1
   [ -n "$stages" ] || return 1
-  bad="$(printf '%s' "$stages" | jq -r '. as $all | [.[] | select(.land != "") | .land as $l | select(([$all[] | select(.sid == $l or .copy_of == $l)] | length) != 1) | .sid] | first // ""')"
+  bad="$(printf '%s' "$stages" | _ff_jq -r '. as $all | [.[] | select(.land != "") | .land as $l | select(([$all[] | select(.sid == $l or .copy_of == $l)] | length) != 1) | .sid] | first // ""')"
   [ -z "$bad" ] || die "stage $bad must land exactly one task"
-  goal="$(printf '%s' "$vars" | jq -r '.goal // ""')"
-  [ -n "$goal" ] || goal="$(printf '%s' "$flow" | jq -r '.description // .name')"
-  needrepo="$(printf '%s' "$stages" | jq -r 'if any(.[]; .shape == "ship" and .land == "") then 1 else 0 end')"
+  goal="$(printf '%s' "$vars" | _ff_jq -r '.goal // ""')"
+  [ -n "$goal" ] || goal="$(printf '%s' "$flow" | _ff_jq -r '.description // .name')"
+  needrepo="$(printf '%s' "$stages" | _ff_jq -r 'if any(.[]; .shape == "ship" and .land == "") then 1 else 0 end')"
   if [ -z "$plan" ]; then auto=1; plan="$name-$(date +%Y%m%d-%H%M%S)"; fi
   _ff_name_ok "$plan" || die "plan names use letters, digits, dot, dash and underscore only (got '$plan')"
 
   if [ "$dry" = 1 ]; then
     echo "flow $name would add to plan $plan:"
-    printf '%s' "$stages" | jq -r '.[] | "  " + .sid + "  " + (if .land != "" then "lands " + .land else .shape + "/" + .verb + (if .model != "" then " on " + .model else "" end) end) + (if (.deps | length) > 0 then "  after " + (.deps | join(",")) else "" end) + (if .hold then "  [captain decides]" else "" end) + "  - " + .title'
+    printf '%s' "$stages" | _ff_jq -r '.[] | "  " + .sid + "  " + (if .land != "" then "lands " + .land else .shape + "/" + .verb + (if .model != "" then " on " + .model else "" end) end) + (if (.deps | length) > 0 then "  after " + (.deps | join(",")) else "" end) + (if .hold then "  [captain decides]" else "" end) + "  - " + .title'
     return 0
   fi
   if [ "$auto" = 1 ]; then
@@ -1286,15 +1508,26 @@ _ff_flow_run() {
     _ff_plan_ensure "$plan" "$goal" "$repo" "$needrepo" 0 || return 1
   fi
 
-  n="$(printf '%s' "$stages" | jq 'length')"; i=0
+  pd="$(_plan_dir "$plan")"
+  _plan_lock "$plan" || return 1
+  # Ordinary errors/signals roll back our tasks. SIGKILL leaves the marker and held tasks;
+  # scheduling refuses them, and the next flow run rolls back under this same lock.
+  trap '[ "$committed" = 1 ] || _ff_flow_rollback "$plan"; _plan_unlock "$plan"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  _ff_flow_rollback "$plan" || return 1
+  _factory_self_pid "$pd"; token="$(date +%s)-$_FACTORY_SELF_PID-$RANDOM"
+  _factory_write_json "$pd/flow-expansion.json" "$(_ff_jq -cn --arg token "$token" --arg name "$name" '{token:$token,flow:$name}')" || return 1
+
+  n="$(printf '%s' "$stages" | _ff_jq 'length')"; i=0
   while [ "$i" -lt "$n" ]; do
-    st="$(printf '%s' "$stages" | jq -c --argjson i "$i" '.[$i]')"
-    sid="$(printf '%s' "$st" | jq -r .sid)"
+    st="$(printf '%s' "$stages" | _ff_jq -c --argjson i "$i" '.[$i]')"
+    sid="$(printf '%s' "$st" | _ff_jq -r .sid)"
     # Translate stage-id deps into tids. A dep on a repeated stage means every copy.
-    deps_json="$(printf '%s' "$st" | jq -c --arg map "$map" '
+    deps_json="$(printf '%s' "$st" | _ff_jq -c --arg map "$map" '
       ($map | split("\n") | map(select(. != "") | split("=") | {stage: .[0], copy: .[1], tid: .[2]})) as $m
       | [.deps[] as $d | $m[] | select(.stage == $d or .copy == $d) | .tid] | unique')"
-    land="$(printf '%s' "$st" | jq -r .land)"
+    land="$(printf '%s' "$st" | _ff_jq -r .land)"
     ltid=""
     if [ -n "$land" ]; then
       ltid="$(printf '%s' "$map" | awk -F= -v s="$land" '$2 == s || $1 == s { print $3 }' | head -2)"
@@ -1303,10 +1536,10 @@ _ff_flow_run() {
         _ff_flow_rollback "$plan" $made
         die "stage $sid lands '$land', which must be exactly one task; nothing was added"
       fi
-      deps_json="$(printf '%s' "$deps_json" | jq -c --arg t "$ltid" '(. + [$t]) | unique')"
+      deps_json="$(printf '%s' "$deps_json" | _ff_jq -c --arg t "$ltid" '(. + [$t]) | unique')"
     fi
-    json="$(printf '%s' "$st" | jq -c --argjson deps "$deps_json" --arg flow "$name" --arg ltid "$ltid" --arg now "$(_ff_now)" '
-      {schema:1, title:.title, shape:(if .land != "" then "scout" else .shape end), state:"todo", deps:$deps,
+    json="$(printf '%s' "$st" | _ff_jq -c --argjson deps "$deps_json" --arg flow "$name" --arg ltid "$ltid" --arg now "$(_ff_now)" --arg token "$token" '
+      {flow_expansion:$token,schema:1, title:.title, shape:(if .land != "" then "scout" else .shape end), state:"held", deps:$deps,
        prompt:(if .land != "" then "" else .prompt end), spec:"", check:.check,
        verb:(if .land != "" then "run" else .verb end), model:.model, provider:.provider,
        deliver:(if .land != "" then "local" else .deliver end), retries:.retries, attempts:0,
@@ -1321,15 +1554,22 @@ _ff_flow_run() {
       _ff_flow_rollback "$plan" $made
       die "could not add stage $sid to plan $plan; nothing was added"; }
     made="$made $tid"
-    copy="$(printf '%s' "$st" | jq -r .copy_of)"
+    copy="$(printf '%s' "$st" | _ff_jq -r .copy_of)"
     map="$map$sid=$copy=$tid
 "
-    model="$(printf '%s' "$st" | jq -r .model)"; title="$(printf '%s' "$st" | jq -r .title | cut -c1-120)"
+    model="$(printf '%s' "$st" | _ff_jq -r .model)"; title="$(printf '%s' "$st" | _ff_jq -r .title | cut -c1-120)"
     rows="$rows$(printf '  %-14s -> %-4s %s%s' "$sid" "$tid" "${model:+[$model] }" "$title")
 "
     i=$((i + 1))
   done
+  for tid in $made; do
+    _task_update "$plan" "$tid" 'if .flow_expansion != $token or .state != "held" then error("expansion changed") else .state = "todo" end' --arg token "$token" >/dev/null || return 1
+  done
+  rm -f "$pd/flow-expansion.json" || return 1
+  committed=1
+  _plan_unlock "$plan"
+  trap - EXIT INT TERM
   echo "flow $name added $n task(s) to plan $plan:"
   printf '%s' "$rows"
   echo "next: outsourcerer plan run $plan"
-}
+)
