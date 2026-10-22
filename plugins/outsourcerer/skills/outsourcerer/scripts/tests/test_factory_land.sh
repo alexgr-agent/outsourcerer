@@ -9,9 +9,12 @@ LAND="$HERE/../factory-land.sh"
 [ -f "$SRC" ] && [ -f "$LAND" ] || { echo "FAIL: cannot find $SRC or $LAND"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq missing"; exit 0; }
 
-TMP="$(mktemp -d "$HERE/.test-factory-land.XXXXXX")"
+# Outside this checkout (mktemp -d), and git may not climb out of it, so no worktree, branch or
+# hook of the real repo can ever be touched by these temp repos.
+TMP="$(mktemp -d 2>/dev/null || mktemp -d -t osrc-factory-land)"
 TMP="$(cd "$TMP" && pwd -P)"
 HOME="$TMP/home"; export HOME; mkdir -p "$HOME"
+export GIT_CEILING_DIRECTORIES="$TMP"
 trap 'rm -rf "$TMP"' EXIT
 export GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com
 pass=0; fail=0
@@ -157,6 +160,9 @@ out="$(drv cmd_land t10 2>&1)"; rc=$?
 [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'conflicts with main in: a.txt' && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
   && [ -z "$(git -C "$REPO" status --porcelain -uno)" ] && [ "$(efield t10 .land.verdict)" = conflict ] \
   && ok "land: merge conflict aborts cleanly, target untouched" || bad "conflict (rc=$rc out=$out)"
+[ "$(tfield t10 .state)" = held ] && [ "$(tfield t10 .hold.reason)" = "merge conflict with main: a.txt; rebase the task branch or retry" ] \
+  && printf '%s' "$out" | grep -q 'task release t10' \
+  && ok "land (#16): a conflict holds the task with a plain reason and says how to release it" || bad "conflict hold (state=$(tfield t10 .state) reason=$(tfield t10 .hold.reason))"
 no_land_wt && ok "land: no integration worktree left after a conflict" || bad "worktree left after conflict"
 grep -q '"land_conflict"' "$PD/events.jsonl" 2>/dev/null && ok "land: conflict recorded as a task event" || bad "conflict event missing"
 
@@ -172,7 +178,9 @@ out="$(drv cmd_land t11 2>&1)"; rc=$?
   && [ "$(efield t11 .land.verdict)" = check_failed ] \
   && ok "land: merged result breaks check -> target untouched, task failed" || bad "merge breaks check (rc=$rc out=$out)"
 no_land_wt && ok "land: no integration worktree left after a red check" || bad "worktree left after red check"
-grep -q '"kind":"land"' "$ST/wake-queue.jsonl" 2>/dev/null && ok "land: red check queued a wake event" || bad "wake event missing"
+grep '"task":"t11"' "$ST/wake-queue.jsonl" 2>/dev/null | grep -q 'merge breaks check' && ok "land: red check queued a wake event" || bad "wake event missing"
+printf '%s' "$out" | grep -q 'clean checkout' && printf '%s' "$out" | grep -q -- '--setup' \
+  && ok "land (#9): a red merged check says it ran in a clean checkout and points at --setup" || bad "clean-checkout hint missing: $out"
 
 # ---------------- target checked out dirty ----------------
 mk_task t12 ship "" "dirty target"
@@ -187,17 +195,28 @@ git -C "$REPO" checkout -q -- a.txt
 
 # ---------------- dry run ----------------
 m="$(git -C "$REPO" rev-parse main)"
+tsum="$(cksum < "$PD/tasks/t12.json")"; esum="$(cksum < "$PD/tasks/t12/evidence.json" 2>/dev/null)"
 out="$(drv cmd_land t12 --dry-run 2>&1)"; rc=$?
 [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'dry run' && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
-  && [ "$(tfield t12 .landed)" != true ] && [ "$(efield t12 .land.mode)" = dry-run ] && no_land_wt \
+  && [ "$(tfield t12 .landed)" != true ] && no_land_wt \
+  && [ "$(jq -r .land.mode "$ST/land/dry-run/p_t12/evidence.json")" = dry-run ] \
   && ok "land --dry-run: merges + checks in scratch, moves nothing" || bad "dry run (rc=$rc out=$out)"
+[ "$(cksum < "$PD/tasks/t12.json")" = "$tsum" ] && [ "$(cksum < "$PD/tasks/t12/evidence.json" 2>/dev/null)" = "$esum" ] \
+  && ok "land --dry-run (#16): the task file and its evidence are byte-for-byte untouched" || bad "dry run mutated the task or its evidence"
 
 # ---------------- serialized (two concurrent lands) ----------------
+# Deterministic, not timing-based: the first land to reach its merged check HOLDS the queue until
+# the other lander has printed its "waiting in the merge queue" line (bounded at 60s so a bug fails
+# the assertions instead of hanging). The second land's check then finds the line already there.
 cat > "$TMP/slowcheck.sh" <<EOF
-case "\$PWD" in */land-*) echo S >> "$TMP/seq"; sleep 2; echo E >> "$TMP/seq" ;; esac
+case "\$PWD" in */land-*)
+  echo S >> "$TMP/seq"
+  n=0; until cat "$TMP/o13" "$TMP/o14" 2>/dev/null | grep -q 'waiting in the merge queue'; do n=\$((n+1)); [ \$n -ge 600 ] && break; sleep 0.1; done
+  echo E >> "$TMP/seq" ;;
+esac
 exit 0
 EOF
-: > "$TMP/seq"
+: > "$TMP/seq"; : > "$TMP/o13"; : > "$TMP/o14"
 mk_task t13 ship "bash $TMP/slowcheck.sh" "c13"; commit_in t13 f13.txt a
 mk_task t14 ship "bash $TMP/slowcheck.sh" "c14"; commit_in t14 f14.txt b
 ( drv cmd_land t13 > "$TMP/o13" 2>&1; echo $? > "$TMP/r13" ) &
@@ -246,6 +265,185 @@ out="$(drv cmd_land j-t17 --check 'test -f k.txt' 2>&1)"; rc=$?
   && ok "land <job-id> --check: lands an ad-hoc worktree job, evidence in the job dir" || bad "bare job land (rc=$rc out=$out)"
 out="$(drv cmd_land nope-123 2>&1)"; rc=$?
 [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'no task or job' && ok "land: unknown id says what to do" || bad "unknown id (rc=$rc)"
+
+# ================= review-1 fixes =================
+setst() { jq "$2" "$PD/tasks/$1.json" > "$PD/tasks/$1.json.x" && mv "$PD/tasks/$1.json.x" "$PD/tasks/$1.json"; }
+
+# ---- #2: land only from running|verifying|done; failed needs --force; held/canceled/todo never ----
+mk_task t20 ship "" "held work"; commit_in t20 h20.txt a
+setst t20 '.state="held" | .hold.reason="pick A or B"'
+m="$(git -C "$REPO" rev-parse main)"
+out="$(drv cmd_land t20 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'on hold (pick A or B)' && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] && [ "$(tfield t20 .state)" = held ] \
+  && ok "land (#2): a held task is refused and stays held" || bad "held land (rc=$rc out=$out)"
+out="$(drv cmd_land t20 --force 2>&1)"; rc=$?
+[ "$rc" != 0 ] && [ "$(tfield t20 .state)" = held ] && ok "land (#2): --force never lands a held task" || bad "held --force landed (rc=$rc)"
+mk_task t21 ship "" "failed work"; commit_in t21 h21.txt a
+setst t21 '.state="failed" | .result="boom"'
+out="$(drv cmd_land t21 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'failed (boom)' && printf '%s' "$out" | grep -q -- '--force' && [ "$(tfield t21 .state)" = failed ] \
+  && ok "land (#2): a failed task is refused and the line names --force" || bad "failed land (rc=$rc out=$out)"
+out="$(drv cmd_land t21 --force 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ "$(tfield t21 .landed)" = true ] && [ "$(tfield t21 .state)" = done ] \
+  && ok "land (#2): --force lands a failed task after the full gate" || bad "failed --force (rc=$rc out=$out)"
+mk_task t23 ship "" "todo work"; commit_in t23 h23.txt a; setst t23 '.state="todo"'
+out="$(drv cmd_land t23 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'has not run yet' && ok "land (#2): a todo task is refused" || bad "todo land (rc=$rc out=$out)"
+# A cancel that arrives WHILE landing (here: during the merged-result check) must win.
+cat > "$TMP/cancel_mid.sh" <<EOT
+case "\$PWD" in */land-*) jq '.state="canceled"' "$PD/tasks/t22.json" > "$PD/tasks/t22.json.x" && mv "$PD/tasks/t22.json.x" "$PD/tasks/t22.json" ;; esac
+exit 0
+EOT
+mk_task t22 ship "bash $TMP/cancel_mid.sh" "cancel mid land"; commit_in t22 h22.txt a
+m="$(git -C "$REPO" rev-parse main)"
+out="$(drv cmd_land t22 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'canceled' && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && [ "$(tfield t22 .state)" = canceled ] && [ "$(tfield t22 .landed)" != true ] && no_land_wt \
+  && ok "land (#2): a cancel during the land stops it before the target moves; state stays canceled" || bad "cancel mid-land (rc=$rc state=$(tfield t22 .state) out=$out)"
+
+# ---- #3: never overwrite ignored/untracked files in the checked-out target ----
+printf 'local.cfg\n' > "$REPO/.gitignore"; git -C "$REPO" add .gitignore; git -C "$REPO" commit -qm "ignore local.cfg"
+printf 'MY LOCAL SETTINGS\n' > "$REPO/local.cfg"
+mk_task t24 ship "" "force-add ignored"
+printf 'worker version\n' > "$(wt_of t24)/local.cfg"; git -C "$(wt_of t24)" add -f local.cfg; git -C "$(wt_of t24)" commit -qm "add local.cfg"
+m="$(git -C "$REPO" rev-parse main)"
+out="$(drv cmd_land t24 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'local.cfg' && printf '%s' "$out" | grep -q 'would overwrite' \
+  && [ "$(cat "$REPO/local.cfg")" = "MY LOCAL SETTINGS" ] && [ "$(git -C "$REPO" rev-parse main)" = "$m" ] \
+  && ok "land (#3): a git-ignored local file in the target checkout is never overwritten (refused, path listed)" || bad "ignored overwrite (rc=$rc file=$(cat "$REPO/local.cfg") out=$out)"
+mkdir -p "$REPO/notes"; printf 'my notes\n' > "$REPO/notes/todo.md"
+mk_task t25 ship "" "adds notes"; mkdir -p "$(wt_of t25)/notes"; commit_in t25 notes/todo.md "worker notes"
+out="$(drv cmd_land t25 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'notes/todo.md' && [ "$(cat "$REPO/notes/todo.md")" = "my notes" ] \
+  && ok "land (#3): an untracked file in the way is listed, not clobbered" || bad "untracked collision (rc=$rc out=$out)"
+rm -rf "$REPO/local.cfg" "$REPO/notes"
+setst t24 '.state="canceled"'; setst t25 '.state="canceled"'
+
+# ---- #4: the verified head is private; a concurrent evidence rewrite can't change what lands ----
+cat > "$TMP/driver_race.sh" <<EOT
+OSRC_SOURCED=1 . "$SRC" >/dev/null 2>&1
+. "$HERE/../factory-tasks.sh"
+. "$LAND"
+eval "_orig_record() \$(declare -f _factory_done_record | tail -n +2)"
+_factory_done_record() { _orig_record "\$@"; local r=\$?
+  jq --arg h "\$BOGUS" '.head_sha=\$h' "\$_FDC_TDIR/evidence.json" > "\$_FDC_TDIR/evidence.json.x" && mv "\$_FDC_TDIR/evidence.json.x" "\$_FDC_TDIR/evidence.json"
+  return \$r; }
+"\$@"
+EOT
+mk_task t26 ship "" "race"; commit_in t26 r26.txt a
+h26="$(git -C "$(wt_of t26)" rev-parse HEAD)"; bogus="$(git -C "$REPO" rev-parse main~1)"
+out="$(BOGUS="$bogus" OSRC_HOME="$ST" bash "$TMP/driver_race.sh" cmd_land t26 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ "$(git -C "$REPO" rev-parse main^2)" = "$h26" ] && [ "$(tfield t26 .landed)" = true ] \
+  && ok "land (#4): lands the head it verified even if evidence.json is rewritten underneath" || bad "evidence race (rc=$rc out=$out)"
+
+# ---- #9: --setup prepares the clean checkout; recorded in evidence ----
+mk_task t27 ship "test -f deps/ok" "needs deps"; commit_in t27 r27.txt a
+mkdir -p "$(wt_of t27)/deps"; : > "$(wt_of t27)/deps/ok"
+out="$(drv cmd_land t27 --dry-run 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'clean checkout' && [ "$(tfield t27 .state)" = running ] \
+  && ok "land (#9): a check needing untracked deps fails on the merged result with the clean-checkout hint" || bad "deps dry run (rc=$rc out=$out)"
+out="$(drv cmd_land t27 --dry-run --setup 'exit 3' 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'setup command failed (exit 3)' && ok "land (#9): a failing --setup refuses with its exit code" || bad "setup fail (rc=$rc out=$out)"
+out="$(drv cmd_land t27 --setup 'mkdir -p deps && touch deps/ok' 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ "$(tfield t27 .landed)" = true ] && [ "$(efield t27 .land.setup.cmd)" = "mkdir -p deps && touch deps/ok" ] \
+  && [ "$(efield t27 .land.setup.rc)" = 0 ] && ok "land (#9): --setup runs before the merged check and is recorded in evidence" || bad "setup land (rc=$rc out=$out)"
+
+# ---- #10: secret scan = added lines, key values only ----
+mk_task t28 ship "" "names only"
+commit_in t28 cfg.py 'key = os.environ["OPENROUTER_API_KEY"]; aws = os.environ["AWS_SECRET_ACCESS_KEY"]; risk-assessment-framework-document-v2'
+out="$(drv _factory_done_check p t28)"; rc=$?
+[ "$rc" = 0 ] && [ "$(efield t28 .secret_scan)" = clean ] && ok "secret scan (#10): variable NAMES alone do not block" || bad "names blocked (rc=$rc out=$out)"
+GHK="gh""p_$(printf 'B%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24)"
+printf 'old=%s\n' "$GHK" > "$REPO/leak.txt"; git -C "$REPO" add leak.txt; git -C "$REPO" commit -qm "old leak on main"
+mk_task t29 ship "" "remove leak"; git -C "$(wt_of t29)" rm -q leak.txt; git -C "$(wt_of t29)" commit -qm "remove leaked key"
+out="$(drv _factory_done_check p t29)"; rc=$?
+[ "$rc" = 0 ] && ok "secret scan (#10): REMOVING a leaked key does not block" || bad "removal blocked (rc=$rc out=$out)"
+SR="$TMP/secrets"; mkdir -p "$SR"; git -C "$SR" init -q; printf 'x\n' > "$SR/f"; git -C "$SR" add f; git -C "$SR" commit -qm b
+sb="$(git -C "$SR" rev-parse HEAD)"
+A20="$(printf 'a%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24)"
+for v in "sk_""live_$A20" "rk_""live_$A20" "AI""za$A20$A20" "xa""pp-1-A0$A20" "-----BEGIN ""RSA PRIVATE KEY-----" "sk-""proj-$A20" "AK""IAABCDEFGHIJKLMNOP" "xox""b-1234-$A20"; do
+  printf 'v = "%s"\n' "$v" > "$SR/f"; git -C "$SR" commit -qam "add"
+  if drv _factory_scan_range "$SR" "$sb" HEAD; then ok "secret scan (#10): blocks ${v:0:8}..."; else bad "secret scan missed ${v:0:8}..."; fi
+  git -C "$SR" reset -q --hard "$sb"
+done
+# crew shares the patterns: planted keys still block, removals and names don't.
+CR="$TMP/crewscan"; mkdir -p "$CR"; git -C "$CR" init -q; printf 'base\n' > "$CR/f"; git -C "$CR" add f; git -C "$CR" commit -qm b
+printf 'token=%s\n' "$GHK" > "$CR/f"; git -C "$CR" add f
+drv _crew_scan_staged "$CR" && ok "crew (#10): a staged planted key still blocks" || bad "crew missed a planted key"
+git -C "$CR" commit -qm leak; git -C "$CR" rm -q f
+drv _crew_scan_staged "$CR" && bad "crew blocked a staged key REMOVAL" || ok "crew (#10): staging a key removal does not block"
+git -C "$CR" commit -qm rm; printf 'k = env("OPENROUTER_API_KEY")\n' > "$CR/g"; git -C "$CR" add g
+drv _crew_scan_staged "$CR" && bad "crew blocked a variable name" || ok "crew (#10): a variable name alone does not block"
+
+# ---- #11: bare job needs --check or explicit --no-check ----
+mk_task t30 ship "" "adhoc2"; commit_in t30 r30.txt a; setst t30 '.state="canceled"'
+out="$(drv cmd_land j-t30 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q -- '--no-check' && ok "land (#11): a bare job without --check is refused" || bad "bare job no check (rc=$rc out=$out)"
+out="$(drv cmd_land j-t30 --no-check 2>&1)"; rc=$?
+[ "$rc" = 0 ] && git -C "$REPO" merge-base --is-ancestor "$(git -C "$(wt_of t30)" rev-parse HEAD)" main \
+  && ok "land (#11): --no-check lands a bare job on purpose" || bad "bare job --no-check (rc=$rc out=$out)"
+
+# ---- #12: "already contained" only counts when an earlier land put it there ----
+mk_task t31 ship "" "merged by hand"; commit_in t31 r31.txt a
+git -C "$REPO" merge -q --no-edit outsourcerer/j-t31 >/dev/null 2>&1
+out="$(drv cmd_land t31 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'did not get there through land' && [ "$(tfield t31 .landed)" != true ] \
+  && ok "land (#12): head already in the target WITHOUT a land is refused" || bad "contained w/o land (rc=$rc out=$out)"
+setst t8 '.landed=false'
+out="$(drv cmd_land t8 2>&1)"; rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'by an earlier land' && [ "$(tfield t8 .landed)" = true ] \
+  && ok "land (#12): head put there by an earlier land is accepted (bookkeeping repaired)" || bad "contained via land (rc=$rc out=$out)"
+
+# ---- #13: target mid-rebase / mid-bisect in another worktree ----
+git -C "$REPO" branch reb main; git -C "$REPO" branch onto main
+RW="$TMP/rebwt"; git -C "$REPO" worktree add -q "$RW" reb >/dev/null 2>&1
+printf 'reb side\n' > "$RW/conf.txt"; git -C "$RW" add conf.txt; git -C "$RW" commit -qm reb
+OW="$TMP/ontowt"; git -C "$REPO" worktree add -q "$OW" onto >/dev/null 2>&1
+printf 'onto side\n' > "$OW/conf.txt"; git -C "$OW" add conf.txt; git -C "$OW" commit -qm onto
+git -C "$RW" rebase onto >/dev/null 2>&1
+mk_task t32 ship "" "into reb"; commit_in t32 r32.txt a
+rb="$(git -C "$REPO" rev-parse refs/heads/reb)"
+out="$(drv cmd_land t32 --into reb 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'middle of a rebase' && [ "$(git -C "$REPO" rev-parse refs/heads/reb)" = "$rb" ] \
+  && ok "land (#13): refuses a target that is mid-rebase in another worktree" || bad "mid-rebase (rc=$rc out=$out)"
+git -C "$RW" rebase --abort >/dev/null 2>&1
+git -C "$RW" bisect start >/dev/null 2>&1
+out="$(drv cmd_land t32 --into reb 2>&1)"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'middle of a bisect' && ok "land (#13): refuses a target that is mid-bisect" || bad "mid-bisect (rc=$rc out=$out)"
+git -C "$RW" bisect reset >/dev/null 2>&1
+
+# ---- #14: land never replaces the task store's private, validating JSON writer ----
+fwj="$(drv declare -f _factory_write_json)"; grep -q 'jq -e' <<<"$fwj" && grep -q 'umask 077' <<<"$fwj" && ok "land (#14): factory-tasks' _factory_write_json survives sourcing factory-land.sh" || bad "_factory_write_json clobbered"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) echo "SKIP: file modes on Windows" ;;
+  *) pm="$(stat -c %a "$PD/tasks/t8.json" 2>/dev/null || stat -f %Lp "$PD/tasks/t8.json")"
+     [ "$pm" = 600 ] && ok "land (#14): task files written by land stay private (0600)" || bad "task file mode $pm after land" ;;
+esac
+
+# ---- #15 + #17: no repo hooks in the scratch worktree; stale land-* worktrees pruned ----
+HK="$(git -C "$REPO" rev-parse --git-common-dir)"; case "$HK" in /*) ;; *) HK="$REPO/$HK" ;; esac; HK="$HK/hooks"; mkdir -p "$HK"
+printf '#!/bin/sh\necho "$PWD" >> "%s/hook.log"\n' "$TMP" > "$HK/post-checkout"; chmod +x "$HK/post-checkout"
+WD="$REPO/.outsourcerer/worktrees"
+git -C "$REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$WD/land-stale1" main >/dev/null 2>&1
+git -C "$REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$WD/land-stale2" main >/dev/null 2>&1
+git -C "$REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$WD/land-live" main >/dev/null 2>&1
+mkdir -p "$ST/land/active"
+sh -c 'exit 0' & deadpid=$!; wait "$deadpid" 2>/dev/null
+echo "$deadpid Thu Jan  1 00:00:00 1970" > "$ST/land/active/land-stale1"
+sleep 60 & livepid=$!
+printf '%s %s\n' "$livepid" "$(drv _pid_start_identity "$livepid")" > "$ST/land/active/land-live"
+mk_task t33 ship "" "prune"; commit_in t33 r33.txt a
+out="$(drv cmd_land t33 2>&1)"; rc=$?
+[ "$rc" = 0 ] && [ ! -d "$WD/land-stale1" ] && [ ! -d "$WD/land-stale2" ] && [ -d "$WD/land-live" ] \
+  && ! git -C "$REPO" worktree list | grep -q 'land-stale' \
+  && ok "land (#17): leftover land-* worktrees of dead lands are pruned; a live one is kept" || bad "prune (rc=$rc out=$out)"
+grep -q 'j-t33' "$TMP/hook.log" 2>/dev/null && ! grep -q '/land-' "$TMP/hook.log" && ok "land (#15): repo hooks never run for the scratch worktree" || bad "post-checkout hook ran in a land worktree"
+kill "$livepid" 2>/dev/null; wait "$livepid" 2>/dev/null
+git -C "$REPO" worktree remove --force "$WD/land-live" >/dev/null 2>&1; rm -f "$ST/land/active/land-live" "$HK/post-checkout"
+
+# ---- #24: the unknown-subcommand hint lists the factory commands ----
+out="$(OSRC_HOME="$ST" bash "$SRC" no-such-subcommand 2>&1)"
+printf '%s' "$out" | grep -q 'plan|task|land|flow' && printf '%s' "$out" | grep -q 'exclude' \
+  && ok "main (#24): unknown subcommand hint lists plan, task, land, flow, exclude" || bad "hint missing factory commands: $(printf '%s' "$out" | tail -1 | cut -c1-200)"
 
 echo
 echo "factory land: $pass passed, $fail failed"
