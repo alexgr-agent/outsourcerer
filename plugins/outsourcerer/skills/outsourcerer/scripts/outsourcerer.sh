@@ -8226,11 +8226,15 @@ _heartbeat_arm_verify() {
     _heartbeat_arm_optout="OSRC_HEARTBEAT_DISABLED=1"
     return 2
   fi
-  _heartbeat_start >/dev/null 2>&1
+  # Keep the start attempts quiet on success, but remember why they failed: "kill -0 failed" alone
+  # sent people hunting for a dead process when the real reason was e.g. a non-executable script.
+  local _hb_why
+  _hb_why="$(_heartbeat_start 2>&1 >/dev/null)"
   _heartbeat_leader_alive && return 0
-  _heartbeat_start >/dev/null 2>&1   # re-arm once; single-instance makes this double-spawn-safe
+  _hb_why="$(_heartbeat_start 2>&1 >/dev/null)"   # re-arm once; single-instance makes this double-spawn-safe
   _heartbeat_leader_alive && return 0
-  printf '%s\n' "[outsourcerer] NOT-ARMED: supervision watcher is NOT live (kill -0 failed after re-arm). This run is UNSUPERVISED; check '$0 fleet ls' / '$0 bearings' on your next turn." >&2
+  _hb_why="$(printf '%s' "$_hb_why" | tr '\n' ' ' | sed 's/  */ /g; s/ $//' | cut -c1-300)"
+  printf '%s\n' "[outsourcerer] NOT-ARMED: supervision watcher is NOT live after re-arm${_hb_why:+ (start said: $_hb_why)}. This run is UNSUPERVISED; check '$0 fleet ls' / '$0 bearings' on your next turn." >&2
   return 1
 }
 
