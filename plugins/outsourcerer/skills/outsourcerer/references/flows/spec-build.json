@@ -14,6 +14,6 @@
      "prompt": "Implement the spec by following the plan (both under 'Inputs from finished work'). Goal: {{goal}}\nAdd the tests the plan names. Commit your work on the current branch with a clear message."},
     {"id": "verify", "title": "Verify the build against the spec", "shape": "scout", "verb": "research", "deps": ["spec", "build"], "verdict": true,
      "model": "sol", "fallback": ["opus", "gemini-pro"],
-     "prompt": "Check the build (branch and commit under 'Inputs from finished work') against every acceptance test in the spec. Read the diff and run the tests if you can; do not edit.\nEnd your answer with exactly one line: VERDICT: PASS or VERDICT: FAIL - <the main reason>."}
+     "prompt": "Check the build (branch and commit under 'Inputs from finished work') against every acceptance test in the spec. Read the diff and run the tests if you can; do not edit.\nYour very last line must be the verdict, exactly in one of these two forms, with no formatting and nothing after it:\nVERDICT: PASS\nVERDICT: FAIL - <the main reason>"}
   ]
 }

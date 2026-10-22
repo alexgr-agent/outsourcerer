@@ -52,6 +52,17 @@ git -C "$R" log --format=%s main | grep -q '^land(demo/t2): build it$' && ok "ma
 [ "$(jq -r .verdict "$T/t2/evidence.json")" = done ] && [ "$(jq -r .secret_scan "$T/t2/evidence.json")" = clean ] \
   && ok "evidence records the verdict and a clean secret scan" || bad "evidence incomplete"
 
+if [ "$fail" -gt 0 ]; then
+  # A rare first-run failure was seen once and never reproduced; print enough to explain the next one.
+  echo "--- diagnostics (plan run rc=$rc) ---"
+  printf '%s\n' "$out" | tail -25
+  for f in "$T"/t*.json; do jq -c '{id,state,attempts,job,jobs,landed,land_error,result:(.result|.[0:160])}' "$f" 2>/dev/null; done
+  tail -20 "$OSRC_HOME/plans/demo/events.jsonl" 2>/dev/null
+  for j in $(jq -r '.jobs[]?' "$T"/t*.json 2>/dev/null); do
+    echo "job $j: status=$(cat "$OSRC_HOME/jobs/$j/status" 2>/dev/null) reason=$(cat "$OSRC_HOME/jobs/$j/reason" 2>/dev/null) error=$(head -c 300 "$OSRC_HOME/jobs/$j/error" 2>/dev/null)"
+  done
+  git -C "$R" status --porcelain | head
+fi
 echo
 echo "factory e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

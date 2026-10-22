@@ -49,7 +49,8 @@ then starts t3. When everything is done it stops and prints a summary. `land t2`
    - optionally a verb, a model, a provider, and how many retries it gets.
 3. **`plan run`** is the scheduler. Each tick it reconciles running tasks against their jobs, then starts
    ready tasks up to `--max-parallel` (default 3). `--once` runs a single tick, which is the shape to use
-   from a heartbeat or an orchestrator that takes turns. `--auto-land` lands ship tasks as they pass.
+   from a heartbeat or an orchestrator that takes turns. `--auto-land` lands plain ship tasks as they pass
+   (a flow's builds land through its own land stage, after review). Exit 4 = another `plan run` already drives it.
 4. **Held decisions** stop the line on purpose (see below). Release them with an answer and the plan
    moves on.
 5. **`land <task>`** takes a finished ship task through the merge gate onto the target branch.

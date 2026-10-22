@@ -1,7 +1,7 @@
 {
   "name": "council-build",
   "description": "Two frontier advisors plan independently, one synthesizes, a cheap capable model builds, a reviewer from another family checks fidelity, then the build lands.",
-  "vars": {"goal": "required", "check": "optional"},
+  "vars": {"goal": "required", "check": "optional", "setup": "optional"},
   "stages": [
     {"id": "advise-a", "title": "Advisor A: plan for {{goal}}", "shape": "scout", "verb": "research",
      "model": "sol", "fallback": ["terra", "gpt-5.5"],
@@ -17,7 +17,7 @@
      "prompt": "Implement this goal by following the synthesized plan under 'Inputs from finished work': {{goal}}\n\nCommit your work on the current branch with a clear message. Keep the change focused; run the project's tests if they exist."},
     {"id": "review", "title": "Fidelity review of the build", "shape": "scout", "verb": "research", "deps": ["build"], "verdict": true,
      "model": "sol", "fallback": ["opus", "gemini-pro"],
-     "prompt": "Review the build (its branch and commit are under 'Inputs from finished work') against the goal and the synthesized plan. Goal: {{goal}}\nCheck: does it do what was asked, did it skip steps, did it break anything, are there bugs or secrets? Read the diff, do not edit.\nEnd your answer with exactly one line: VERDICT: PASS or VERDICT: FAIL - <the main reason>."},
-    {"id": "land", "title": "Land the build", "land": "build", "deps": ["review"]}
+     "prompt": "Review the build (its branch and commit are under 'Inputs from finished work') against the goal and the synthesized plan. Goal: {{goal}}\nCheck: does it do what was asked, did it skip steps, did it break anything, are there bugs or secrets? Read the diff, do not edit.\nYour very last line must be the verdict, exactly in one of these two forms, with no formatting and nothing after it:\nVERDICT: PASS\nVERDICT: FAIL - <the main reason>"},
+    {"id": "land", "title": "Land the build", "land": "build", "deps": ["review"], "setup": "{{setup}}"}
   ]
 }
