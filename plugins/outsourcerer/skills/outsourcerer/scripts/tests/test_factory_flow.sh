@@ -100,7 +100,9 @@ _task_bg_launch() {
   local ref="${OSRC_TASK_REF:-}" plan tid n out job
   plan="${ref%%/*}"; tid="${ref#*/}"
   [ -f "$TMP/dispatch-refuse-$tid" ] && { echo "ERROR: lane is down for $tid" >&2; return 1; }
+  [ -f "$TMP/slow-$plan-$tid" ] && sleep "$(cat "$TMP/slow-$plan-$tid")"
   n=$(( $(cat "$TMP/count-$plan-$tid" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMP/count-$plan-$tid"
+  echo "$plan/$tid" >> "$TMP/launches"
   out="$(sed -n "${n}p" "$TMP/outcomes/$tid" 2>/dev/null)"; [ -n "$out" ] || out=done
   job="$(date +%Y%m%d-%H%M%S)-$plan$tid$n$RANDOM"; job="$(printf '%s' "$job" | tr -cd '0-9A-Za-z-')"
   mkdir -p "$OSRC_JOBS/$job"
@@ -108,13 +110,20 @@ _task_bg_launch() {
   date +%s > "$OSRC_JOBS/$job/started_at"
   [ "$out" = running ] && printf '%s\n' "$$" > "$OSRC_JOBS/$job/pid"
   [ "$out" = failed ] && printf 'exit-nonzero:rc=1\n' > "$OSRC_JOBS/$job/reason"
-  printf 'result of %s attempt %s\n%s\n' "$tid" "$n" "$(cat "$TMP/lasttxt-$tid" 2>/dev/null)" > "$OSRC_JOBS/$job/last.txt"
+  # Worker output: per-attempt file first (lasttxt-<plan>-<tid>-<n>), then the per-task one. A
+  # nolast-<tid> marker leaves last.txt empty and puts the text in out.log only.
+  local lt="$TMP/lasttxt-$plan-$tid-$n"; [ -f "$lt" ] || lt="$TMP/lasttxt-$tid"
+  if [ -f "$TMP/nolast-$tid" ]; then : > "$OSRC_JOBS/$job/last.txt"; cat "$lt" > "$OSRC_JOBS/$job/out.log" 2>/dev/null
+  else printf 'result of %s attempt %s\n%s\n' "$tid" "$n" "$(cat "$lt" 2>/dev/null)" > "$OSRC_JOBS/$job/last.txt"; fi
+  local a prevm="" usedm=""; for a in "$@"; do [ "$prevm" = "-m" ] && usedm="$a"; prevm="$a"; done
+  echo "$plan/$tid ${usedm:-none}" >> "$TMP/models"
   cp "$OSRC_HOME/plans/$plan/tasks/$tid/brief.md" "$TMP/brief-$plan-$tid-$n" 2>/dev/null
   echo "$job"
 }
 # ------------------------------------------------------------------ Track C shims (test only, both modes:
 # the real done contract needs real worktrees + commits; track C tests it on its own)
 _factory_done_check() {
+  echo "$1/$2" >> "$TMP/donechecks"
   if [ -f "$TMP/donefail-$2" ]; then echo "no commits beyond base"; return 1; fi
   echo "done: job finished"; return 0
 }
@@ -199,7 +208,7 @@ for j in $(_task_list p5 | jq -r '.[] | .job | select(. != "")'); do echo done >
 sleep 60 & SLP=$!; SLEEPERS="$SLEEPERS $SLP"
 mkdir -p "$OSRC_HOME/plans/p5/run.lock"; printf '%s %s\n' "$SLP" "$(_pid_start_identity "$SLP")" > "$OSRC_HOME/plans/p5/run.lock/owner"
 out="$( cmd_plan_run p5 --once 2>&1 )"; rc=$?
-[ "$rc" = 1 ] && printf '%s' "$out" | grep -q "already driving p5 (pid $SLP)" && ok "run lock refuses a second driver" || bad "lock rc=$rc: $out"
+[ "$rc" = 4 ] && printf '%s' "$out" | grep -q "already driving p5 (pid $SLP)" && ok "run lock refuses a second driver with its own exit code (4)" || bad "lock rc=$rc: $out"
 kill "$SLP" 2>/dev/null; wait "$SLP" 2>/dev/null
 out="$( cmd_plan_run p5 --once 2>&1 )"; rc=$?
 [ "$rc" != 1 ] && [ ! -d "$OSRC_HOME/plans/p5/run.lock" ] && ok "stale lock from a dead driver is reclaimed and released" || bad "stale lock rc=$rc: $out"
@@ -212,8 +221,9 @@ out="$( date() { if [ "${1:-}" = +%s ]; then local c; c=$(( $(cat "$TMP/clock") 
         cmd_plan_run p7b --interval 1 --max-minutes 1 2>&1 )"; rc=$?
 [ "$rc" = 2 ] && printf '%s' "$out" | grep -q "time cap of 1 minutes reached" && ok "runaway guard: time cap exits 2 with a plain reason" || bad "time cap rc=$rc: $out"
 mkplan p8 't1||scout|1'; touch "$TMP/dispatch-refuse-t1"
-out="$( cmd_plan_run p8 --once 2>&1 )"; rc=$?
-[ "$rc" = 3 ] && [ "$(st p8 t1)" = failed ] && printf '%s' "$out" | grep -q "could not start" && ok "launch failure fails closed (task store marks it failed)" || bad "dispatch refusal rc=$rc: $out"
+out="$( cmd_plan_run p8 --interval 1 2>&1 )"; rc=$?
+[ "$rc" = 3 ] && [ "$(st p8 t1)" = failed ] && printf '%s' "$out" | grep -q "retrying (attempt 1 failed: the worker did not launch" \
+  && printf '%s' "$out" | grep -q "failed for good after 2 attempt" && ok "launch failure is retried within the budget, then fails closed" || bad "dispatch refusal rc=$rc: $out"
 rm -f "$TMP/dispatch-refuse-t1"
 mkplan p9
 out="$( cmd_plan_run p9 --once 2>&1 )"; rc=$?
@@ -326,6 +336,297 @@ out="$( cmd_flow run council-build --plan fx9 --var goal=g --dry-run 2>&1 )"; rc
 # bearings hook: one line per active plan
 out="$(_factory_plans_digest)"
 printf '%s' "$out" | grep -q '^plan p3: 1 need you' && ! printf '%s' "$out" | grep -q '^plan p1:' && ok "digest shows active plans, skips finished ones" || bad "digest: $out"
+
+
+# ================================================================== review-3 hardening (one block per finding)
+rm -f "$TMP"/outcomes/* "$TMP/landed" "$TMP/launches"
+launches() { grep -c "^$1\$" "$TMP/launches" 2>/dev/null | tr -d ' '; }
+setlt() { printf '%s\n' "$3" > "$TMP/lasttxt-$1-$2-${4:-1}"; }   # <plan> <tid> <text> [attempt]
+
+# --- 1. claim window: running + no job yet is a launch in flight, never a second dispatch
+mkplan c1 't1||scout|1'
+echo 3 > "$TMP/slow-c1-t1"
+( _task_dispatch c1 t1 >/dev/null 2>&1 ) & DPID=$!
+sleep 1
+out="$( cmd_plan_run c1 --once 2>&1 )"
+wait "$DPID"
+rm -f "$TMP/slow-c1-t1"
+[ "$(launches c1/t1)" = 1 ] && printf '%s' "$out" | grep -q "t1: still launching" && ok "reconcile leaves a task mid-launch alone (no double dispatch)" || bad "double dispatch: launches=$(launches c1/t1) $out"
+( cmd_plan_run c1 --interval 1 >/dev/null 2>&1 )
+[ "$(st c1 t1)" = done ] && [ "$(_task_get c1 t1 | jq '.jobs | length')" = 1 ] && ok "the in-flight launch is the one that finishes" || bad "claim window: $(_task_get c1 t1)"
+# launcher died after launching (job carries task_ref, task never recorded it): the job is adopted
+mkplan c2 't1||scout|1'
+_task_update c2 t1 '.state = "running" | .attempts = 1 | .claimed_at = "2000-01-01T00:00:00Z"' >/dev/null
+J2="20000101-000000-orphan$RANDOM"; mkdir -p "$OSRC_JOBS/$J2"; echo done > "$OSRC_JOBS/$J2/status"; echo "c1 adopted" > "$OSRC_JOBS/$J2/last.txt"
+echo "c2/t1" > "$OSRC_JOBS/$J2/task_ref"
+out="$( cmd_plan_run c2 --once 2>&1 )"
+[ "$(st c2 t1)" = done ] && [ "$(_task_get c2 t1 | jq -r .job)" = "$J2" ] && [ "$(launches c2/t1)" = 0 ] && ok "an orphaned launch is recovered from its task_ref, not relaunched" || bad "orphan recovery: $out $(_task_get c2 t1)"
+# claimed long ago, no job anywhere: a failed attempt (retried), never stuck forever
+mkplan c3 't1||scout|1'
+_task_update c3 t1 '.state = "running" | .attempts = 1 | .claimed_at = "2000-01-01T00:00:00Z"' >/dev/null
+out="$( cmd_plan_run c3 --interval 1 2>&1 )"; rc=$?
+[ "$rc" = 0 ] && [ "$(st c3 t1)" = done ] && printf '%s' "$out" | grep -q "never launched" && ok "a claim with no job after the grace window is retried" || bad "stale claim rc=$rc: $out"
+
+# --- 2 + 14. run lock: steal guard, unwritable owner, distinct busy code
+mkplan l1 't1||scout|1'; echo running > "$TMP/outcomes/t1"
+mkdir -p "$OSRC_HOME/plans/l1/run.lock"; echo "99999 Mon Jan  1 00:00:00 2001" > "$OSRC_HOME/plans/l1/run.lock/owner"
+( kill() { if [ "${1:-}" = -0 ] && [ ! -f "$TMP/b-slept" ]; then touch "$TMP/b-slept"; sleep 2; fi; command kill "$@"; }
+  cmd_plan_run l1 --interval 1 --max-minutes 1 > "$TMP/B.out" 2>&1 ) & BPID=$!
+sleep 0.5
+( cmd_plan_run l1 --interval 30 --max-minutes 1 > "$TMP/A.out" 2>&1 ) & APID=$!
+sleep 4
+na="$(grep -c 'tick' "$TMP/A.out")"; nb="$(grep -c 'tick' "$TMP/B.out")"
+wait "$BPID" 2>/dev/null; echo $? > "$TMP/B.rc"
+[ "$(cat "$TMP/B.rc" 2>/dev/null)" = 4 ] && [ "$na" -ge 1 ] && [ "$nb" = 0 ] && ok "a slow stale-lock stealer never deletes a fresh lock (one driver only)" || bad "two drivers: A ticks=$na B ticks=$nb B rc=$(cat "$TMP/B.rc" 2>/dev/null)"
+# --- 15. SIGTERM interrupts the sleep at once and releases the lock
+t_term=$(date +%s); kill -TERM "$APID" 2>/dev/null; wait "$APID" 2>/dev/null; echo $? > "$TMP/A.rc"; t_term=$(( $(date +%s) - t_term ))
+[ "$(cat "$TMP/A.rc" 2>/dev/null)" = 143 ] && [ "$t_term" -le 2 ] && [ ! -d "$OSRC_HOME/plans/l1/run.lock" ] && ok "SIGTERM stops plan run within a second and frees the lock" || bad "TERM rc=$(cat "$TMP/A.rc" 2>/dev/null) took ${t_term}s lock=$(ls -d "$OSRC_HOME/plans/l1/run.lock" 2>/dev/null)"
+out="$( mv() { return 1; }; cmd_plan_run l1 --once 2>&1 )"; rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q "could not record this run as the lock owner" && [ ! -d "$OSRC_HOME/plans/l1/run.lock" ] && ok "a lock whose owner cannot be written is not kept" || bad "owner write failure rc=$rc: $out"
+out="$( trap 'echo caller-int' INT; trap 'echo caller-term' TERM; cmd_plan_run l1 --once >/dev/null 2>&1; trap -p INT; trap -p TERM )"
+printf '%s' "$out" | grep -q "caller-int" && printf '%s' "$out" | grep -q "caller-term" && ok "the caller's INT/TERM traps are put back" || bad "caller traps lost: $out"
+for j in $(_task_list l1 | jq -r '.[] | .job | select(. != "")'); do echo done > "$OSRC_JOBS/$j/status"; done; rm -f "$TMP/outcomes/t1"
+
+# --- 3. a worker started by hand on a decision gate or land step never completes it
+( cmd_flow run best-of-n --plan g1 --repo "$REPO" --var goal=g --var n=2 >/dev/null 2>&1 )
+for t in t1 t2 t3; do _task_update g1 "$t" '.state = "done"' >/dev/null; done
+if ( _task_dispatch g1 t4 >/dev/null 2>&1 ); then
+  out="$( cmd_plan_run g1 --once 2>&1 )"
+  [ "$(st g1 t4)" = held ] && ok "a gate started by hand is held, not marked done by its worker" || bad "manual gate start: $(_task_get g1 t4 | jq -c '{state,result}')"
+else
+  [ "$(st g1 t4)" = todo ] && ok "the task store refuses to start a captain's decision by hand" || bad "gate refusal left $(st g1 t4)"
+fi
+# whatever the store allows, a gate found running with a worker job is held by the scheduler
+mkplan g2 't1||scout|1'
+_task_update g2 t1 '.state = "running" | .gate = true | .job = "fakejob" | .jobs = ["fakejob"]' >/dev/null
+mkdir -p "$OSRC_JOBS/fakejob"; echo done > "$OSRC_JOBS/fakejob/status"; echo "VERDICT: PASS" > "$OSRC_JOBS/fakejob/last.txt"
+( cmd_plan_run g2 --once >/dev/null 2>&1 )
+_task_get g2 t1 | jq -e '.state == "held" and (.hold.reason | test("started by hand")) and (.hold.reason | test("task release t1 --answer"))' >/dev/null \
+  && ok "a gate running a worker is held for the captain (worker output ignored)" || bad "gate worker: $(_task_get g2 t1 | jq -c '{state,hold}')"
+_task_update g2 t1 '.state = "running" | .gate = false | .land_target = "t9"' >/dev/null
+( cmd_plan_run g2 --once >/dev/null 2>&1 )
+[ "$(st g2 t1)" = held ] && ok "a land step running a worker is held too" || bad "land worker: $(st g2 t1)"
+
+# --- 4. --auto-land never lands a flow's builds before their review / compare / pick
+rm -f "$TMP/landed"
+( cmd_flow run best-of-n --plan a1 --repo "$REPO" --var goal=g --var n=3 >/dev/null 2>&1 )
+out="$( cmd_plan_run a1 --interval 1 --auto-land 2>&1 )"; rc=$?
+[ ! -s "$TMP/landed" ] && [ "$rc" = 3 ] && [ "$(st a1 t5)" = held ] && ok "--auto-land leaves best-of-n candidates for the captain's pick" || bad "auto-land flow: rc=$rc landed=$(cat "$TMP/landed" 2>/dev/null) $out"
+_task_get a1 t5 | jq -e '.hold.reason | test("land the winner: outsourcerer land <tid> --plan a1")' >/dev/null && ok "the pick names how to land the winner" || bad "pick hint: $(_task_get a1 t5 | jq -r .hold.reason)"
+rm -f "$TMP/landed"
+( cmd_flow run council-build --plan a2 --repo "$REPO" --var goal=g >/dev/null 2>&1 )
+setlt a2 t5 "VERDICT: PASS"
+out="$( cmd_plan_run a2 --interval 1 --auto-land 2>&1 )"; rc=$?
+[ "$rc" = 0 ] && [ "$(cat "$TMP/landed" 2>/dev/null)" = t4 ] \
+  && ok "with a flow land stage the build lands once, after its review" || bad "council auto-land rc=$rc landed=$(cat "$TMP/landed" 2>/dev/null): $out"
+
+# --- 5. reviewer FAIL: automatic redo of the reviewed build, then a fresh review
+rm -f "$TMP/landed"
+( cmd_flow run council-build --plan v1 --repo "$REPO" --var goal=g >/dev/null 2>&1 )
+for t in t1 t2 t3; do _task_update v1 "$t" '.state = "done"' >/dev/null; done
+setlt v1 t5 "VERDICT: FAIL - the tests were skipped" 1; setlt v1 t5 "VERDICT: PASS" 2
+out="$( cmd_plan_run v1 --interval 1 2>&1 )"; rc=$?
+[ "$rc" = 0 ] && [ "$(st v1 t6)" = done ] && [ "$(cat "$TMP/landed" 2>/dev/null)" = t4 ] && [ "$(cat "$TMP/count-v1-t4")" = 2 ] \
+  && ok "reviewer FAIL sends the build back once, the re-review passes, then it lands" || bad "redo path rc=$rc: $out"
+grep -q "Review of your previous attempt" "$TMP/brief-v1-t4-2" && grep -q "the tests were skipped" "$TMP/brief-v1-t4-2" \
+  && ok "the redo brief carries the reviewer's reason" || bad "redo brief: $(cat "$TMP/brief-v1-t4-2" 2>/dev/null)"
+grep -q "Earlier review" "$TMP/brief-v1-t5-2" && ! grep -q "did not finish" "$TMP/brief-v1-t5-2" \
+  && ok "the re-review brief says why it runs again (no 'did not finish')" || bad "re-review brief: $(cat "$TMP/brief-v1-t5-2" 2>/dev/null)"
+[ "$(grep -c 'Review of your previous attempt' <<<"$(_task_get v1 t4 | jq -r .prompt)")" = 1 ] && ok "review notes replace, never pile up" || bad "notes piled"
+# budget used up -> held with exact commands; captain's extra round works
+rm -f "$TMP/landed"
+( cmd_flow run council-build --plan v2 --repo "$REPO" --var goal=g >/dev/null 2>&1 )
+for t in t1 t2 t3; do _task_update v2 "$t" '.state = "done"' >/dev/null; done
+echo "VERDICT: FAIL - still broken" > "$TMP/lasttxt-t5"; setlt v2 t5 "VERDICT: FAIL - second reason" 2
+out="$( cmd_plan_run v2 --interval 1 2>&1 )"; rc=$?
+_task_get v2 t5 | jq -e '(.hold.reason | test("second reason")) and (.hold.reason | test("still broken") | not)' >/dev/null && ok "the hold quotes the latest FAIL reason" || bad "stale reason: $(_task_get v2 t5 | jq -r .hold.reason)"
+_task_get v2 t5 | jq -e '.state == "held" and (.hold.reason | test("task done t5 --force --plan v2")) and (.hold.reason | test("task release t5 --answer"))' >/dev/null \
+  && [ "$rc" = 3 ] && [ "$(cat "$TMP/count-v2-t4")" = 2 ] && ok "redo budget used up -> reviewer held with the exact commands" || bad "budget hold rc=$rc t4 runs=$(cat "$TMP/count-v2-t4") $(_task_get v2 t5 | jq -c '{state,hold}')"
+rm -f "$TMP/lasttxt-t5"; setlt v2 t5 "VERDICT: PASS" 3
+( cmd_task release t5 --plan v2 --answer "use the real fixtures" >/dev/null 2>&1 )
+out="$( cmd_plan_run v2 --interval 1 2>&1 )"; rc=$?
+[ "$rc" = 0 ] && grep -q "use the real fixtures" "$TMP/brief-v2-t4-3" && [ "$(cat "$TMP/landed" 2>/dev/null)" = t4 ] \
+  && ok "releasing a failed review with an answer redoes the build with the captain's note" || bad "captain redo rc=$rc: $out"
+# accepting a failed review by hand unblocks the land stage
+( cmd_flow run council-build --plan v3 --repo "$REPO" --var goal=g >/dev/null 2>&1 )
+for t in t1 t2 t3; do _task_update v3 "$t" '.state = "done"' >/dev/null; done
+_task_update v3 t4 '.retries = 0' >/dev/null; setlt v3 t5 "VERDICT: FAIL - nit"
+( cmd_plan_run v3 --interval 1 >/dev/null 2>&1 )
+( cmd_task done t5 --force --plan v3 >/dev/null 2>&1 ); rm -f "$TMP/landed"
+( cmd_plan_run v3 --interval 1 >/dev/null 2>&1 ); rc=$?
+[ "$rc" = 0 ] && [ "$(cat "$TMP/landed" 2>/dev/null)" = t4 ] && ok "'task done --force' on the held review accepts the build and it lands" || bad "accept path rc=$rc t5=$(st v3 t5)"
+
+# --- 6. strict verdicts: anything but an exact last line is held, never passed
+vcase() {   # <plan> <expect done|held> <label> <text...>
+  local p="$1" want="$2" label="$3"; shift 3
+  mkplan "$p" 't1||scout|0'; _task_update "$p" t1 '.require_verdict = true' >/dev/null
+  printf '%s\n' "$@" > "$TMP/lasttxt-$p-t1-1"
+  ( cmd_plan_run "$p" --interval 1 >/dev/null 2>&1 )
+  [ "$(st "$p" t1)" = "$want" ] && ok "verdict: $label -> $want" || bad "verdict: $label -> $(st "$p" t1) (want $want)"
+}
+vcase vd1 done "exact PASS" "looks good" "VERDICT: PASS"
+vcase vd2 done "PASS with a reason" "VERDICT: PASS - all acceptance tests pass"
+vcase vd3 held "fenced PASS after FAIL" "VERDICT: FAIL - broken" '```' "VERDICT: PASS" '```'
+vcase vd4 held "blockquoted PASS" "> VERDICT: PASS"
+vcase vd5 held "template echo" "VERDICT: PASS or VERDICT: FAIL"
+vcase vd6 held "PASSED? no" "VERDICT: PASSED? no"
+vcase vd7 held "bold PASS" "**VERDICT: PASS**"
+vcase vd8 held "PASS after an earlier FAIL" "VERDICT: FAIL - x" "VERDICT: PASS"
+vcase vd9 held "PASS not on the last line" "VERDICT: PASS" "thanks!"
+vcase vd10 held "PASS that mentions FAIL" "VERDICT: PASS - but FAIL on windows"
+mkplan vd11 't1||scout|0'; _task_update vd11 t1 '.require_verdict = true' >/dev/null
+touch "$TMP/nolast-t1"; printf 'VERDICT: PASS\n' > "$TMP/lasttxt-vd11-t1-1"
+( cmd_plan_run vd11 --interval 1 >/dev/null 2>&1 ); rm -f "$TMP/nolast-t1"
+[ "$(st vd11 t1)" != done ] && ok "verdict: a PASS only in out.log is never trusted" || bad "verdict from out.log accepted"
+_task_get vd3 t1 | jq -e '.hold.reason | test("exactly .VERDICT: PASS.")' >/dev/null && ok "a held reviewer is told the exact verdict form" || bad "verdict hint: $(_task_get vd3 t1 | jq -r .hold.reason)"
+
+# --- 7. malformed flows fail closed (nothing written)
+mflow() {   # <name> <expected-error-regex> <json>
+  printf '%s\n' "$3" > "$OSRC_HOME/flows/$1.json"
+  local o r; o="$( cmd_flow run "$1" --plan "mf-$1" --repo "$REPO" 2>&1 )"; r=$?
+  [ "$r" != 0 ] && printf '%s' "$o" | grep -qE "$2" && [ ! -d "$OSRC_HOME/plans/mf-$1" ] && ok "malformed flow refused: $1" || bad "malformed flow $1 rc=$r: $o"
+}
+mflow num 'stage 1 is not an object' '{"name":"num","stages":[1]}'
+mflow depstr 'deps must be a list' '{"name":"depstr","stages":[{"id":"a","prompt":"x"},{"id":"b","prompt":"y","deps":"a"}]}'
+mflow varsarr 'vars must be an object' '{"name":"varsarr","vars":[],"stages":[{"id":"a","prompt":"x"}]}'
+mflow promptnum 'prompt must be text' '{"name":"promptnum","stages":[{"id":"a","prompt":5}]}'
+mflow landrep 'which repeats' '{"name":"landrep","stages":[{"id":"c","shape":"ship","prompt":"x","repeat":"2"},{"id":"l","land":"c","deps":["c"]}]}'
+mflow landscout 'not a build' '{"name":"landscout","stages":[{"id":"c","prompt":"x"},{"id":"l","land":"c"}]}'
+mflow gateverdict 'no output to review' '{"name":"gateverdict","stages":[{"id":"a","prompt":"x"},{"id":"g","hold":true,"verdict":true,"deps":["a"]}]}'
+mflow landtwice 'landed by more than one stage' '{"name":"landtwice","stages":[{"id":"c","shape":"ship","prompt":"x"},{"id":"l","land":"c"},{"id":"m","land":"c"}]}'
+mflow notobj 'one JSON object' '[1,2]'
+
+# --- 8. flow run is all or nothing
+eval "_real_task_new() $(declare -f _task_new | tail -n +2)"
+( _task_new() { if [ "$(ls "$OSRC_HOME/plans/$1/tasks" 2>/dev/null | grep -c '\.json$')" -ge 2 ]; then return 1; fi; _real_task_new "$@"; }
+  cmd_flow run council-build --plan at1 --repo "$REPO" --var goal=g >/dev/null 2>&1 ); rc=$?
+[ "$rc" != 0 ] && [ ! -d "$OSRC_HOME/plans/at1" ] && ok "a flow run that fails mid-way removes the plan it created" || bad "partial new plan left: rc=$rc $(ls "$OSRC_HOME/plans/at1/tasks" 2>/dev/null)"
+mkplan at2 't1||scout|1'
+( _task_new() { if [ "$(ls "$OSRC_HOME/plans/$1/tasks" 2>/dev/null | grep -c '\.json$')" -ge 3 ]; then return 1; fi; _real_task_new "$@"; }
+  cmd_flow run council-build --plan at2 --repo "$REPO" --var goal=g >/dev/null 2>&1 ); rc=$?
+[ "$rc" != 0 ] && [ "$(_task_list at2 | jq length)" = 1 ] && ok "a flow run that fails mid-way on an existing plan removes only what it added" || bad "partial existing plan: $(_task_list at2 | jq -c '[.[].id]')"
+
+# --- 9. fallbacks are stored and re-picked at dispatch and retry
+cat > "$OSRC_HOME/flows/fb.json" <<'EOF'
+{"name":"fb","stages":[{"id":"a","prompt":"x","model":"aaa","fallback":["bbb","ccc"],"retries":2}]}
+EOF
+( cmd_flow run fb --plan fb1 >/dev/null 2>&1 )
+_task_get fb1 t1 | jq -e '.model == "aaa" and .fallback == ["aaa","bbb","ccc"]' >/dev/null && ok "flow tasks keep their fallback models" || bad "fallback stored: $(_task_get fb1 t1 | jq -c '{model,fallback}')"
+_model_excluded() { [ "$1" = aaa ]; }
+printf 'failed\ndone\n' > "$TMP/outcomes/t1"; : > "$TMP/models"
+( cmd_plan_run fb1 --interval 1 >/dev/null 2>&1 )
+[ "$(grep '^fb1/t1 ' "$TMP/models" | awk '{print $2}' | tr '\n' ',')" = "bbb,ccc," ] && ok "a model excluded after flow run is skipped; a retry moves to the next fallback" || bad "repick: $(cat "$TMP/models")"
+_model_excluded() { [ "$1" = glm-5-2 ]; }
+( cmd_flow run best-of-n --plan fb2 --repo "$REPO" --var goal=g --var n=3 >/dev/null 2>&1 )
+[ "$(_task_list fb2 | jq -r '[.[0:3][] | .model] | unique | length')" = 3 ] && ok "excluding one model never collapses candidates onto one model" || bad "collapse: $(_task_list fb2 | jq -c '[.[0:3][]|.model]')"
+rm -f "$TMP/outcomes/t1"
+mkplan fb3 't1||scout|1'; _task_update fb3 t1 '.model = "zzz"' >/dev/null
+_model_excluded() { [ "$1" = zzz ]; }; : > "$TMP/models"
+( cmd_plan_run fb3 --interval 1 >/dev/null 2>&1 )
+[ "$(cat "$TMP/models")" = "fb3/t1 none" ] && ok "an excluded model with no fallbacks is left to the router" || bad "no-fallback exclude: $(cat "$TMP/models")"
+unset -f _model_excluded; rm -f "$TMP/outcomes/t1"
+
+# --- 10. a failed auto-land keeps the build done and calls the captain
+mkplan al1 't1||ship|1'; touch "$TMP/landfail-t1"
+out="$( cmd_plan_run al1 --interval 1 --auto-land 2>&1 )"; rc=$?
+rm -f "$TMP/landfail-t1"
+_task_get al1 t1 | jq -e '.state == "done" and (.land_error | test("merge breaks check"))' >/dev/null && [ "$rc" = 3 ] \
+  && printf '%s' "$out" | grep -q "landing failed: t1 (outsourcerer land t1 --plan al1)" && [ "$(wakes 'factory-land-failed')" -ge 1 ] \
+  && ok "failed auto-land: build stays done, captain gets the land command" || bad "auto-land failure rc=$rc: $out $(_task_get al1 t1 | jq -c '{state,land_error}')"
+
+# --- 11. land stage: crash recovery is counted; a failed land is held, and release lands again
+( cmd_flow run council-build --plan ls1 --repo "$REPO" --var goal=g >/dev/null 2>&1 )
+for t in t1 t2 t3 t4 t5; do _task_update ls1 "$t" '.state = "done"' >/dev/null; done
+_task_update ls1 t6 '.state = "running" | .land_attempts = 1' >/dev/null; rm -f "$TMP/landed"
+( cmd_plan_run ls1 --once >/dev/null 2>&1 )
+[ "$(st ls1 t6)" = done ] && [ "$(cat "$TMP/landed")" = t4 ] && ok "an interrupted land is tried again" || bad "land recovery: $(st ls1 t6)"
+( cmd_flow run council-build --plan ls2 --repo "$REPO" --var goal=g >/dev/null 2>&1 )
+for t in t1 t2 t3 t4 t5; do _task_update ls2 "$t" '.state = "done"' >/dev/null; done
+_task_update ls2 t6 '.state = "running" | .land_attempts = 2' >/dev/null
+( cmd_plan_run ls2 --once >/dev/null 2>&1 )
+[ "$(st ls2 t6)" = held ] && ok "a land interrupted too often is held, not relaunched forever" || bad "land loop: $(st ls2 t6)"
+( cmd_flow run council-build --plan ls3 --repo "$REPO" --var goal=g >/dev/null 2>&1 )
+for t in t1 t2 t3 t4 t5; do _task_update ls3 "$t" '.state = "done"' >/dev/null; done
+touch "$TMP/landfail-t4"; rm -f "$TMP/landed"
+( cmd_plan_run ls3 --once >/dev/null 2>&1 )
+_task_get ls3 t6 | jq -e '.state == "held" and (.hold.reason | test("task release t6 --answer"))' >/dev/null && [ "$(st ls3 t4)" = done ] \
+  && ok "a failed land stage is held with the exact commands; the build stays done" || bad "land fail: $(_task_get ls3 t6 | jq -c '{state,hold}') t4=$(st ls3 t4)"
+rm -f "$TMP/landfail-t4"; ( cmd_task release t6 --plan ls3 --answer "land again" >/dev/null 2>&1 )
+( cmd_plan_run ls3 --once >/dev/null 2>&1 ); rc=$?
+[ "$rc" = 0 ] && [ "$(st ls3 t6)" = done ] && ok "releasing the land stage lands again" || bad "land release rc=$rc t6=$(st ls3 t6)"
+
+# --- 12. a job that never got a worker cannot wait forever
+mkplan sj 't1||scout|0'
+J3="20000101-000000-nostatus$RANDOM"; mkdir -p "$OSRC_JOBS/$J3"; echo $(( $(date +%s) - 100 )) > "$OSRC_JOBS/$J3/started_at"
+_task_update sj t1 '.state = "running" | .attempts = 1 | .job = $j | .jobs = [$j]' --arg j "$J3" >/dev/null
+out="$( OSRC_FACTORY_JOB_STALE_SECS=5 cmd_plan_run sj --once 2>&1 )"; rc=$?
+[ "$(st sj t1)" = failed ] && _task_get sj t1 | jq -e '.result | test("never got a worker")' >/dev/null && ok "a job with no status and no process fails after the stale window" || bad "stale job: $out"
+
+# --- 16. the time cap is checked before starting more work
+mkplan tc 't1||scout|1'; rm -f "$TMP/count-tc-t1"
+echo 0 > "$TMP/clock"
+out="$( date() { if [ "${1:-}" = +%s ]; then local c; c=$(( $(cat "$TMP/clock") + 1 )); echo "$c" > "$TMP/clock"; echo $(( 1000000 + c * 120 )); else command date "$@"; fi; }
+        cmd_plan_run tc --interval 1 --max-minutes 1 2>&1 )"; rc=$?
+[ "$rc" = 2 ] && [ ! -f "$TMP/count-tc-t1" ] && ok "past the time cap, no new work starts" || bad "time cap overshoot rc=$rc launched=$(cat "$TMP/count-tc-t1" 2>/dev/null)"
+
+# --- 18. flow runs without --plan never share a plan; --repo must match an existing plan
+fixdate() { if [ "${1:-}" = "+%Y%m%d-%H%M%S" ]; then echo 20990101-000000; else command date "$@"; fi; }
+o1="$( date() { fixdate "$@"; }; cd "$REPO" && cmd_flow run council-build --var goal=one 2>&1 )"; o2="$( date() { fixdate "$@"; }; cd "$REPO" && cmd_flow run council-build --var goal=two 2>&1 )"
+p1="$(printf '%s' "$o1" | sed -n 's/^flow council-build added .* to plan \(.*\):$/\1/p')"; p2="$(printf '%s' "$o2" | sed -n 's/^flow council-build added .* to plan \(.*\):$/\1/p')"
+[ -n "$p1" ] && [ -n "$p2" ] && [ "$p1" != "$p2" ] && [ "$(_task_list "$p2" | jq length)" = 6 ] && ok "two quick flow runs get two plans ($p1, $p2)" || bad "plan collision: [$p1] [$p2]"
+mkdir -p "$TMP/repo2"; git -C "$TMP/repo2" init -q; git -C "$TMP/repo2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m i
+out="$( cmd_flow run council-build --plan fx2 --repo "$TMP/repo2" --var goal=g 2>&1 )"; rc=$?
+[ "$rc" != 0 ] && printf '%s' "$out" | grep -q "plan fx2 works in" && ok "a --repo that is not the plan's repo is refused" || bad "repo mismatch rc=$rc: $out"
+
+# --- 19. messages name the exact next command
+mkplan mg 't1||scout|0'; echo blocked > "$TMP/outcomes/t1"
+out="$( cmd_plan_run mg --interval 1 2>&1 )"; rm -f "$TMP/outcomes/t1"
+_task_get mg t1 | jq -e '.hold.reason | test("outsourcerer task release t1 --answer .* --plan mg")' >/dev/null \
+  && printf '%s' "$out" | grep -q 'held: t1 (outsourcerer task release t1 --answer "..." --plan mg)' && ok "blocked worker hold and stop line name the release command" || bad "messages: $out"
+
+# --- 20. the fleet digest reads all plans in one pass
+n_before="$(ls -d "$OSRC_HOME"/plans/*/ | wc -l | tr -d ' ')"
+: > "$TMP/jqcalls"
+out="$( jq() { echo x >> "$TMP/jqcalls"; command jq "$@"; }; _factory_plans_digest )"
+[ "$(wc -l < "$TMP/jqcalls" | tr -d ' ')" -le 2 ] && printf '%s' "$out" | grep -q '^plan p3: 1 need you' && ok "digest: one jq pass for $n_before plans" || bad "digest jq calls: $(wc -l < "$TMP/jqcalls") $out"
+
+# --- 21. a released gate's dependents start in the same pass
+cat > "$OSRC_HOME/flows/gt.json" <<'EOF'
+{"name":"gt","stages":[{"id":"a","prompt":"x"},{"id":"g","hold":true,"deps":["a"]},{"id":"b","prompt":"after the gate","deps":["g"]}]}
+EOF
+( cmd_flow run gt --plan gt1 >/dev/null 2>&1 ); _task_update gt1 t1 '.state = "done"' >/dev/null
+( cmd_plan_run gt1 --once >/dev/null 2>&1 )
+( cmd_task release t2 --plan gt1 --answer "go" >/dev/null 2>&1 ); echo running > "$TMP/outcomes/t3"
+( cmd_plan_run gt1 --once >/dev/null 2>&1 )
+[ "$(st gt1 t2)" = done ] && [ "$(st gt1 t3)" = running ] && ok "after a gate is decided its dependents start in the same pass" || bad "gate dependents waited: t2=$(st gt1 t2) t3=$(st gt1 t3)"
+for j in $(_task_list gt1 | jq -r '.[] | .job | select(. != "")'); do echo done > "$OSRC_JOBS/$j/status"; done; rm -f "$TMP/outcomes/t3"
+mkplan gt2 't1||scout|1'; _task_update gt2 t1 '.gate = true | .state = "todo"' >/dev/null
+( cmd_plan_run gt2 --once >/dev/null 2>&1 )
+[ "$(st gt2 t1)" = held ] && ok "a gate with no answer is never marked done" || bad "unanswered gate: $(st gt2 t1)"
+
+# --- 22. a task someone else is checking is not checked (or landed) twice
+mkplan cc 't1||ship|1'
+sleep 60 & CHK=$!; SLEEPERS="$SLEEPERS $CHK"
+J4="20000101-000000-chk$RANDOM"; mkdir -p "$OSRC_JOBS/$J4"; echo done > "$OSRC_JOBS/$J4/status"; echo ok > "$OSRC_JOBS/$J4/last.txt"
+_task_update cc t1 '.state = "verifying" | .job = $j | .jobs = [$j] | .verifying_pid = $p | .verifying_at = "2000-01-01T00:00:00Z"' --arg j "$J4" --arg p "$CHK" >/dev/null
+: > "$TMP/donechecks"; rm -f "$TMP/landed"
+( cmd_plan_run cc --once --auto-land >/dev/null 2>&1 )
+[ ! -s "$TMP/donechecks" ] && [ ! -s "$TMP/landed" ] && [ "$(st cc t1)" = verifying ] && ok "a live checker's task is left alone" || bad "double check: $(cat "$TMP/donechecks") $(st cc t1)"
+kill "$CHK" 2>/dev/null; wait "$CHK" 2>/dev/null
+( cmd_plan_run cc --once --auto-land >/dev/null 2>&1 )
+[ "$(grep -c . "$TMP/donechecks")" = 1 ] && [ "$(st cc t1)" = done ] && [ "$(cat "$TMP/landed")" = t1 ] && ok "a dead checker's task is taken over once and landed once" || bad "takeover: checks=$(grep -c . "$TMP/donechecks") $(st cc t1)"
+
+# --- 23. huge --var values never hit the argument size limit
+# 2 x SZ in one argument breaks the old code: over macOS's 1MB total at 600KB, over Linux's 128KB
+# per-argument cap at 100KB (each single value still has to fit the task store's own arguments).
+SZ=100000; [ "$(uname -s)" = Darwin ] && SZ=600000
+BIG1="$(head -c "$SZ" /dev/zero | tr '\0' 'a')"; BIG2="$(head -c "$SZ" /dev/zero | tr '\0' 'b')"
+cat > "$OSRC_HOME/flows/big.json" <<'EOF'
+{"name":"big","vars":{"x":"required","y":"required"},"stages":[{"id":"a","prompt":"{{x}}"},{"id":"b","prompt":"{{y}}","deps":["a"]}]}
+EOF
+out="$( cmd_flow run big --plan big1 --var "x=$BIG1" --var "y=$BIG2" 2>&1 )"; rc=$?
+[ "$rc" = 0 ] && [ "$(_task_get big1 t1 | jq -r '.prompt | length')" = "$SZ" ] && [ "$(_task_get big1 t2 | jq -r '.prompt | length')" = "$SZ" ] \
+  && ok "two ${SZ}-byte vars expand without hitting the argument limit" || bad "big vars rc=$rc: $(printf '%s' "$out" | tail -2 | cut -c1-200)"
 
 echo "---"
 echo "test_factory_flow: $pass passed, $fail failed"
