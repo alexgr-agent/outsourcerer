@@ -194,3 +194,7 @@ the cheapest option. Use `estimate` when you already know the model and want a c
   proxy of 50, which exceeds a benchmarked capable model's REAL `agentic_index` (glm-5.2: 43.1).
   On agentic tasks, unbenchmarked capable models therefore outrank benchmarked ones. A field-aware
   proxy is the fix; until then, `advise --refresh` (more live rows) narrows the gap.
+
+## How `advise` fits the orchestrator (moved from SKILL.md)
+
+When the user hasn't named a model, **always run `advise`** — it classifies the task, takes reasoning effort as a selection input, pulls live benchmark scores, and returns the best capable-tier value that clears the bar unless the work requires a frontier. The candidate pool is the curated table plus every benchmarked model in the live OpenRouter catalog, so a brand-new model is recommendable on merit the day it appears, no manual list update. The winning model then runs on its **cheapest available lane** across every provider that serves it (a free/plan lane you already pay for beats a per-token cash lane; the model itself is never downgraded) — set `OSRC_ADVISE_ROUTER=0` to keep it on the ranked lane. This is the model-selection brain in **every** mode; the mode only decides whether you ask first (auto-pilot: take the winner + proceed; you-drive/hybrid: present it and wait). Cheap ≠ dumb: `glm`/`hy3`/`deepseek`/`kimi` are `capable` tier (frontier capability, budget price) and get flagship-grade prompting. Details: `references/model-advisory.md`, `references/effort-and-tiers.md`.

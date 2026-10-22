@@ -245,3 +245,44 @@ talk to the user; this is *how* to run the plumbing once they've said yes.)
   delegate's output without independent verification (cheap models resist injection poorly).
 - Prefer `second-opinion` for high-stakes factual/judgment calls; prefer `--with skills=…` over
   `OUTSOURCERER_LOADED=1` (least privilege, and it works on every provider).
+
+## Watch what you launch, and report on a clock (moved from SKILL.md)
+
+**Every delegated run gets a watcher immediately, in the same turn you launch it, AND you report to the
+user on a ~2-minute cadence until it ends.** Continuous monitoring is not optional and not "when asked":
+turn it on the moment work starts. Every ~2 minutes (or when a state changes), post at least a one-line
+status covering **(1) what's happening now, (2) which model(s)/lane(s) are running, (3) which agent is on
+what**. Example: `⏳ 02:14 — GLM(devin) building the auth fix · Fable(cc) reviewing the diff · Sonnet(cc)
+mapping tests · all green, next check ~02:16`. A detached job nobody is observing is the failure this
+tool exists to prevent: it accepts the work, goes silent, and you find out it wedged an hour later.
+Launch, then `watch` — or `status` on that cadence if you are juggling several. Never launch and wander
+off. If you genuinely cannot watch it, say so to the user and cancel it rather than leaving it running blind.
+
+The tool enforces this from its side: a launch prints **NOW WATCH IT**, and any later invocation lists
+jobs that have been running with nobody looking. If you see that warning, you already made this mistake
+— watch or cancel before doing anything else. Watching is also what makes loops steerable: you cannot
+course-correct or kill a bad run you are not reading.
+
+**If you are an async / message-driven orchestrator that only takes a turn when input arrives (a
+chat/Slack/Telegram bot, or any assistant that sits idle between messages — even a long-lived process
+counts, because staying alive is not the same as polling), watching-by-polling is impossible: nothing
+gives you a turn between inputs.** The background beacon still records status durably, but it can only
+WRITE a pulse; it cannot wake you. So arm a push: export `OSRC_HEARTBEAT_WAKE="<your notifier command>"` before you
+launch, and the beacon runs it on every state change (blocked/dead) and on the periodic digest
+(still-cooking / landed), passing the compact summary as `$1` and the full event JSON on stdin. Point it
+at whatever re-invokes you or messages the user through your OWN sanctioned send path — the plugin never
+sends anything itself. A headless launch with no wake armed prints an **ASYNC SUPERVISION** warning
+naming the fix; don't ignore it, or your delegate will run silent until the user pings. (Suppress just
+the periodic-digest push with `OSRC_HEARTBEAT_WAKE_DIGEST=0`, keeping only the attention-needed wakes.)
+
+## `fleet`: one view of every session you are running
+
+`fleet ls` prints a single list of every AI coding session Outsourcerer can see on this machine: your live **Claude Code** sessions plus **every job you delegated through Outsourcerer** (any lane — Codex, Devin/GLM, Fable, droid, cursor, warp, cline). Each row carries an honest state derived from the live process and the session's own transcript tail — `Working` / `Waiting on you` / `Maybe stuck` / `Idle` / `Done` / `Stopped mid-task` / `Failed` (never "dead") — so you can walk up to the one session that actually needs you instead of checking all of them.
+
+`fleet name` reads each session's transcript and gives it a human name via the free GLM lane (cached per session at `fleet/names.jsonl`), so `session-71` reads as `Refactor the auth retry path`. `fleet show <id>` dives into one session. `fleet supervise` (auto-armed with `OSRC_FLEET_SUPERVISION=1`) runs a background heartbeat that catches a stalled or never-initialized delegate and bounds it instead of leaving it silent.
+
+Scope today: Claude Code sessions + Outsourcerer's own delegated jobs. It does **not** enumerate sessions those other tools started independently of Outsourcerer (a Cursor agent you launched inside Cursor, say) — that cross-tool enumeration is planned, not shipped. Don't describe `fleet` as a universal cross-tool dashboard.
+
+## Full subcommand index and failure-state notes (moved from SKILL.md)
+
+Core: `brief` · `mode` · `consent` · `run`/`explore`/`research`/`edit`/`yolo` · `bg`/`fanout` (+ `status`/`watch`/`result`/`cancel`) · `fleet` (`ls`/`show`/`name`/`supervise` — one view of your Claude Code sessions + delegated jobs; see below) · `advise` · `doctor` · `models`. More: `suggest`/`deals` (cheap now) · `estimate` (cost quote) · `tab` (the ledger) · `second-opinion` · `image` · `continue` · `tap` (capture live limits without token-optimizer) · `sanitize` (scrub fallback-trigger vocabulary from state/todo/memory/commit prose — `--write` applies; `references/vocabulary-hygiene.md`) · `parity`/`parity-codex`/`parity-droid`/`parity-cursor`/`parity-hermes` (two-way bridges) · `posture` (show/reset remembered lane org-policy restrictions) · `classify` (post-hoc verdict for a terminated job: `REUSE-OUTPUT` / `RETRY-DIFFERENT-LANE` / `REAL-FAIL` — deterministic, zero-LLM; `references/jobs-and-safety.md`) · `cleanup`/`gc`. Failure states map to one-line user messages (`launching`→`running`→ `done`/`done?`/`blocked`/`permission-blocked`/`interrupted`/`timeout`/`wedged`/`failed`): `references/jobs-and-safety.md`. `permission-blocked` (a headless delegate hit a wall it can't confirm — e.g. devin print-mode) is NOT `blocked`: re-run with `yolo` or restructure the prompt, don't just read the result. `launching` that never becomes `running` → `failed` (stillborn: the environment killed the detached worker — run foreground).

@@ -2,6 +2,17 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.14.0
+
+### Added
+
+- **Software factory.** Plan multi-step work as a task graph on disk (`plan`, `task`, `plan run`). It survives the session, runs ready steps in parallel, and picks up where it left off after a crash.
+- **Context travels between workers.** Every task gets a brief with its spec, the results of the tasks it depends on, and any decision you made, so no worker starts blind.
+- **"Done" is proven, not claimed.** Code tasks need real commits on a named branch, a passing check and a clean secret scan; research tasks need a report. Every verdict is saved as evidence.
+- **A merge gate that never clobbers.** `land` merges one change at a time per repo, re-runs the check on the merged result, and leaves your checkout alone. `--pr` opens a pull request when you ask for one.
+- **Ready-made flows and held decisions.** `council-build`, `spec-build` and `best-of-n` set up a whole plan in one line, and choices that belong to you wait as held steps.
+- **A model you exclude stays excluded.** `exclude add <model-or-family>` keeps it out of every pick: routing, advice, failover, second opinions, loops and plans. Fixes #45.
+
 ## 0.13.6
 
 ### Fixed

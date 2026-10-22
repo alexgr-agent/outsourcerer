@@ -241,3 +241,21 @@ Pick a different model for a single call (flexible, overrides the default):
 `session model deepseek` filters the picker and confirms; `session read` then shows the new model in the footer (e.g. `✓ Model set to DeepSeek V4 Pro`). With no NAME it just opens the picker for manual select.
 
 **Why tmux and not ACP?** Devin also ships `devin acp` (an Agent Client Protocol server over stdio, with `--agent-type review|summarizer`), a robust machine protocol, but using it means *building an ACP client* (handshake, sessions, permission callbacks). tmux needs zero protocol code and can drive TUI-only affordances like `opt+m`. For anything fire-and-forget, the non-interactive `-p`/`-c` path beats both. Use ACP only if this graduates into a real hosted integration.
+
+### `session` as the default delegation mode (moved from SKILL.md)
+
+**`session` is the DEFAULT delegation mode — reach for it first, not `bg`.** It's a persistent interactive TUI you drive programmatically: `session read` shows the delegate's actual work as it happens, `session send "…"` steers it mid-flight (including **answering an approval/permission prompt so the delegate doesn't stall**), `session model <name>` switches its model, `session stop` ends it. **Fable-pin:** a claude-native session launched on Fable can fall back to Opus; watch the running model (`session read`, or the built-in footer observer that feeds `bearings`/the heartbeat) and flip it back when it drifts — `session model fable` navigates Claude Code's picker and re-pins Fable session-only (footer-verified, never touching your global default). The picker only opens between turns, so run the flip when the session is idle (which is exactly when you notice drift — after it produces output); a mid-turn attempt declines cleanly and you retry.
+The heartbeat is REPORT-ONLY for cc drift — it wakes you rather than typing into the session itself, so it can never interrupt an in-flight turn. This is the one mode with a real feedback loop, and it is the fix for the recurring headless failure class: a `bg`/`fanout` delegate that hits an approval wall goes `permission-blocked` and dies unseen, or stalls silently — a session lets you SEE it and steer past. **Default to `session` for any delegation that mutates, is long/complex/exploratory, or could hit an approval prompt.** Fall back to headless `bg`/`fanout` ONLY when a session is genuinely not viable: a non-interactive/CI/detached caller that cannot drive a TUI, or a wide parallel fan-out of many independent one-shot jobs. `run`/`bg`/`fanout` are fire-and-forget — progress markers or a final result, never the chance to course-correct. The read→steer→read loop is the whole value; use it by default. (tmux on Mac/Linux; **winpty broker on Windows Git Bash** — `session` now works on all three.) Full semantics + tiers: `references/mechanism.md`, `references/jobs-and-safety.md`.
+
+**Delegation is INTERACTIVE first. `session` is the default; headless `bg`/`fanout` is the exception you
+justify, not the reflex.** The whole value is that you — the sorcerer — and the main session act AS THE
+USER toward each delegate: `session read` to see its real work, `session send "…"` to guide it, answer
+its approval prompts, correct its course, tell it what to do next, constantly. A headless delegate hits
+an approval wall and dies unseen; an interactive one you steer past it. Reach for headless ONLY when a
+session is genuinely impossible (a non-interactive/CI/detached caller, or a wide fan-out of many
+independent one-shot jobs) — and say so. If you catch yourself writing the work yourself or running a
+one-shot instead of opening a session someone can drive, stop: that is the recurring miss.
+
+### External-session claims
+
+`session claim <external-id> <tmux-pane>` prints a secret claim token. For a later, separate CLI invocation, pass it as `OSRC_SESSION_CLAIM_TOKEN` to `session reply` or `session release`. Set `OSRC_CONTROLLER_ID` to a durable controller identity when commands are driven outside tmux; inside tmux, the controlling tmux session is used automatically. The controller ID and token must both match the claim record. Without either durable source, the token is the capability, protected by the 0700 state directory and 0600 claim record boundary. Do not place the token in logs or shared shell history.
