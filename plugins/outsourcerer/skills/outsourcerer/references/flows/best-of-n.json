@@ -1,0 +1,14 @@
+{
+  "name": "best-of-n",
+  "description": "Build N candidates in parallel on different cheap capable models, have a frontier reviewer compare them, then the captain picks the winner.",
+  "vars": {"goal": "required", "n": {"default": "3"}, "check": "optional"},
+  "stages": [
+    {"id": "candidate", "title": "Candidate {{i}} of {{n}}: {{goal}}", "shape": "ship", "verb": "edit", "repeat": "{{n}}",
+     "models": ["glm-5-2", "swe-1-7", "kimi-k3", "glm", "deepseek"], "check": "{{check}}",
+     "prompt": "Implement this goal: {{goal}}\nYou are candidate {{i}} of {{n}} built independently; do your own best version. Commit your work on the current branch with a clear message."},
+    {"id": "compare", "title": "Compare the candidates", "shape": "scout", "verb": "research", "deps": ["candidate"],
+     "model": "sol", "fallback": ["opus", "gemini-pro"],
+     "prompt": "Several candidates built the same goal independently (branches and commits under 'Inputs from finished work'). Goal: {{goal}}\nCompare them on correctness, scope, code quality and risk. Read the diffs, do not edit. Recommend one by task id and say why in a few lines."},
+    {"id": "pick", "title": "Captain picks the winning candidate", "deps": ["compare"], "hold": true}
+  ]
+}

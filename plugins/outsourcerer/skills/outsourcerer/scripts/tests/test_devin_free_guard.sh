@@ -38,7 +38,9 @@ eval "$(sed -n '/^_devin_zombie_preflight() {/,/^}/p' "$SRC")"
 eval "$(sed -n '/^_devin_is_free_model() {/,/^}/p' "$SRC")"
 eval "$(sed -n '/^_devin_free_own_quota() {/,/^}/p' "$SRC")"
 eval "$(sed -n '/^_devin_probe_classify() {/,/^}/p' "$SRC")"
+eval "$(sed -n '/^_devin_probe_pick() {/,/^}/p' "$SRC")"
 eval "$(sed -n '/^_devin_free_probe() {/,/^}/p' "$SRC")"
+_model_excluded() { return 1; }   # no exclude list in this suite (the probe-model pick consults it)
 
 # Restricted sandboxes can deny process-table reads. Inject only the state
 # discriminator in that environment so the timeout branches remain testable.

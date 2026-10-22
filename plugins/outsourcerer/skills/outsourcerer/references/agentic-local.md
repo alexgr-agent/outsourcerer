@@ -52,6 +52,6 @@ and `OSRC_SHIM_NO_LAUNCH=1` disables auto-launch entirely.
 
 The shim's translation is covered by `scripts/tests/test_shim.py` (mock upstream: non-stream,
 streaming text, tool_use, garbage-tolerance, localhost bind). **The live agentic loop (a real local
-model reading the repo through the shim) must be certified against a real Ollama and LM Studio before
-the v0.3.0 tag** — not yet certified against a live Ollama/LM Studio instance, so mocks prove shape,
-not the full loop.
+model reading the repo through the shim) has not been certified against a live Ollama or LM Studio
+instance yet**, so the mocks prove the translation's shape, not the full loop. Tell the user that when
+the run matters.

@@ -115,6 +115,8 @@ The models don't think alike, so Outsourcerer doesn't prompt them alike. The rig
 - **Run it on your own machine.** A local model on Ollama or LM Studio runs the job on your hardware: `$0`, no tokens burned, fully private. *(Its own section below.)*
 - **Find the cheap seats.** Ask what's free or cheap right now across your platforms (`suggest`). It reads each catalog live, so it keeps up as new models drop (a fresh free model on Devin or OpenRouter shows up on its own).
 - **See what you're saving.** The **Tab** shows real spend vs your frontier model, per lane.
+- **Run a whole build as a plan.** Steps with dependencies, handed from worker to worker with the context each one needs, checked against a done contract and landed through a merge gate. *(Its own section below.)*
+- **Keep a model out of visible routing choices.** `exclude add <model>` blocks matching explicit requests and automatic text-model choices. Unobservable engine defaults and automatic image-backend selection are outside that guarantee.
 
 All of it in plain language. The commands underneath are the sorcerer's, not yours.
 
@@ -151,6 +153,28 @@ While it runs, you can watch it: which attempt it is on, how long it has been go
 It stops when the check goes green. It stops when the same failures come back twice, because a loop that is not converging is an expensive way to be wrong. It stops when the time you gave it runs out. It even stops when the *check itself* hangs, which used to be the one way a bounded loop could quietly run forever.
 
 And stopping early is not a dead end. It keeps the task, the check, and the exact thing that broke last, so you can send it back around from where it stopped instead of paying twice for ground it already covered.
+
+---
+
+## Software factory: a plan that outlives the chat
+
+Big jobs are a chain of steps: map the code, decide the approach, build it, review it, merge it. Keep that chain in one chat and it is gone the moment the session ends. Outsourcerer keeps it on disk as a **plan**, so the work survives the session and anyone can pick it up.
+
+- **Context travels on its own.** Each worker gets a brief with its spec when supplied, bounded results from direct dependencies, and decisions on those dependencies or its own task.
+- **"Done" has a checkable contract.** A code task needs commits on a named branch, a passing check when one is configured, and a clean secret scan. Checks are optional; research tasks need a report and skip shell checks.
+- **Your decisions are part of the plan.** "Pick the winner" or "approve this migration" becomes a held step that waits for you, then passes your answer downstream.
+- **Merges wait their turn.** Finished work lands one change at a time, configured checks re-run on the merged result, and local changes are protected. A clean checkout of the target branch can be advanced.
+- **Ready-made shapes.** `council-build`, `spec-build` and `best-of-n` set up a whole plan in one line.
+
+```bash
+outsourcerer plan new rate-limit --repo .
+outsourcerer flow run council-build --plan rate-limit --var goal="Add per-user rate limiting" --var check="make test"
+outsourcerer plan run --plan rate-limit  # run it again to resume the same plan
+```
+
+You will rarely type these. Say "plan this out and build it" and the sorcerer sets it up. The full guide is in [`references/factory.md`](plugins/outsourcerer/skills/outsourcerer/references/factory.md).
+
+**Worktrees are not a security sandbox.** They isolate files, but a worker on a lane without an OS sandbox runs with your user's rights, including outside its worktree. Use sandboxed verbs and lanes for untrusted work.
 
 ---
 
@@ -202,6 +226,7 @@ Under the robe it's deliberately boring: a self-contained bash script you can re
 | Keyless on what you already pay for | Claude sub only | API keys | ✅ your existing subscriptions, or the API key of your choice |
 | Advisor panel + consensus | ✗ | ✗ | ✅ several top-tier models, act only when they agree |
 | Per-model prompting built in | ✗ | ✗ | ✅ tier-aware wrappers |
+| Multi-step plans that outlive the session | ✗ | ✗ | ✅ task graph on disk, context hand-off, evidence-checked merge gate |
 | Setup | zero | proxy + routing config | none, you just talk to it |
 | Server-side routing at scale | ✗ | ✅ | ✗ this is a local tool, on purpose |
 
@@ -297,7 +322,7 @@ Then just talk to it. On first use it runs its own health check and tells you if
 
 <br>
 
-The model alias picks the lane automatically; `--provider` is only for the OpenRouter/Devin lanes.
+The model alias picks the lane automatically; `--provider` selects a different backend when needed.
 
 | Verb | Does |
 |---|---|
@@ -310,6 +335,8 @@ The model alias picks the lane automatically; `--provider` is only for the OpenR
 | `suggest` / `deals` | live cheap & free models available per platform right now |
 | `doctor` / `models` | health check + live model list |
 | `parity` / `parity-codex` / `parity-hermes` | mirror into Devin/Antigravity/Hermes; reverse-bridge into Codex/Droid/Cursor |
+| `plan` / `task` / `flow` / `land` | the software factory: durable plans, task hand-off, ready-made flows, the merge gate |
+| `exclude` | block matching visible model choices; engine defaults and automatic image backends have limits |
 
 **Lanes:** `hy3`/`glm-5.2`/`deepseek-*` (OpenRouter, via `cc` or `codex`) ·
 `sol`/`terra`/`luna` (Codex native) · `fable`/`opus`/`sonnet`/`haiku` (Claude native) ·
@@ -329,7 +356,7 @@ Add capability to one offload with `--with skills=<name>` / `--with mcp=<name>`.
 
 - **Pi** and more harnesses as the frontier expands.
 - An OpenRouter server-side subagent lane, and completion events so an orchestrator wakes on a job's state change instead of polling.
-- *Already shipped:* the **`fleet`** view (one honest list of every session you're running, with real names and honest states) in v0.7.0; the **Cline** engine lane in v0.6.4, fully supervised, running on your own Cline setup (your API keys, or a ClinePass subscription for discounted open-weight models like GLM, DeepSeek, and Kimi); **loops** (a bounded try→check→retry cycle run on a cheap external model, verified by your own tests) and per-repo lane trust in v0.4.13; the interactive copilot (auto/manual/hybrid modes + live-limit auto-conservation) and **Cursor**, **Droid**, and the `claudex` lane (your ChatGPT model inside the Claude Code harness) in v0.4.8; reverse bridges so you can drive Outsourcerer *from* Codex, Droid, Cursor, or Hermes too (Hermes goes both ways: delegate to it with `-m <any>`, or drive Outsourcerer from inside a Hermes session via `parity-hermes`); parallel `fanout` (v0.2.0); the local Ollama/LM-Studio lane (v0.3.0); git-worktree isolation, agent-library routing, and machine-readable `status --json` (v0.3.1).
+- *Already shipped:* the **software factory** (durable plans, automatic context hand-off, a done contract, a serialized merge gate, and ready-made flows) plus a saved model exclude list in v0.14.0; the **`fleet`** view (one honest list of every session you're running, with real names and honest states) in v0.7.0; the **Cline** engine lane in v0.6.4, fully supervised, running on your own Cline setup (your API keys, or a ClinePass subscription for discounted open-weight models like GLM, DeepSeek, and Kimi); **loops** (a bounded try→check→retry cycle run on a cheap external model, verified by your own tests) and per-repo lane trust in v0.4.13; the interactive copilot (auto/manual/hybrid modes + live-limit auto-conservation) and **Cursor**, **Droid**, and the `claudex` lane (your ChatGPT model inside the Claude Code harness) in v0.4.8; reverse bridges so you can drive Outsourcerer *from* Codex, Droid, Cursor, or Hermes too (Hermes goes both ways: delegate to it with `-m <any>`, or drive Outsourcerer from inside a Hermes session via `parity-hermes`); parallel `fanout` (v0.2.0); the local Ollama/LM-Studio lane (v0.3.0); git-worktree isolation, agent-library routing, and machine-readable `status --json` (v0.3.1).
 
 Issues and PRs welcome.
 

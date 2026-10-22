@@ -31,6 +31,16 @@ _endpoint_mutation_unlock() { return 0; }
 # Relaunch lifecycle mechanics are isolated here. The launch finalizer has its own coverage.
 _heartbeat_start() { return 0; }
 _managed_endpoint_live() { return 0; }
+# Hermetic arm gate. The relaunch finalizer asks _heartbeat_arm_verify, which proves a live leader
+# via $OSRC_HOME/heartbeat/leader/owner.json. A sourced suite can never spawn a real beacon
+# (SCRIPT_PATH is this test file, not an executable outsourcerer.sh), and stubbing only
+# _heartbeat_start left the gate failing NOT-ARMED. conformance.sh masked that by exporting
+# OSRC_HEARTBEAT_DISABLED=1 (gate rc 2, opt-out), so the suite passed there and failed standalone.
+# Clear both knobs and stub the gate itself so standalone == conformance, and record each call so
+# the relaunch is proven to go THROUGH the gate.
+unset OSRC_HEARTBEAT_DISABLED OSRC_FLEET_SUPERVISION
+ARM_LOG="$TMP/arm-log"; : > "$ARM_LOG"; ARM_RC=0
+_heartbeat_arm_verify() { echo arm >> "$ARM_LOG"; return "$ARM_RC"; }
 
 # ---- interrupt (cc/claude -> Escape; others -> C-c) --------------------------------------------
 # Before: a busy pane ("esc to interrupt"). After the keystroke: an idle prompt. The verify loop
@@ -182,7 +192,7 @@ tmux() {
 _state_jsonl_read() { printf '{"event":"start","session_id":"sess-ctrl","model_generation":1}\n'; }
 _session_registry_append() { printf 'APPEND: %s\n' "$*" >> "$SEND_LOG"; return 0; }
 out="$(_session_control_relaunch "$PANE" devin glm-4.6 high 2>&1)"; rc=$?
-if [ "$rc" = 0 ] \
+if [ "$rc" = 0 ] && [ -s "$ARM_LOG" ] \
    && grep -q 'RESPAWN: respawn-pane -k -t sess-ctrl devin --model .glm-4.6. --respect-workspace-trust false' "$SEND_LOG" \
    && printf '%s' "$out" | grep -q 'New pane PID 22202 (was 11101)'; then
   ok "relaunch respawns the pane, verifies the PID changed, preserves the session"
@@ -192,6 +202,18 @@ fi
 
 # relaunch must NOT kill-session (it respawns in place).
 if ! grep -q 'kill-session' "$SEND_LOG"; then ok "relaunch does NOT call kill-session"; else bad "relaunch called kill-session"; fi
+
+# A failed arm gate on relaunch: the call fails loudly, the live pane is KEPT (no kill-session),
+# and the message says LIVE and UNSUPERVISED. Pins that the gate result is honored, not bypassed.
+PID_NOW=11101; SEND_LOG="$TMP/rel-noarm-log"; : > "$SEND_LOG"; : > "$ARM_LOG"; ARM_RC=1
+out="$(_session_control_relaunch "$PANE" devin glm-4.6 high 2>&1)"; rc=$?
+ARM_RC=0
+if [ "$rc" -ne 0 ] && [ -s "$ARM_LOG" ] && ! grep -q 'kill-session' "$SEND_LOG" \
+   && printf '%s' "$out" | grep -q 'LIVE and UNSUPERVISED'; then
+  ok "relaunch with a failed arm gate fails loudly and keeps the live pane"
+else
+  bad "relaunch did not honor a failed arm gate (rc=$rc): $out"
+fi
 
 # relaunch for an unsupported provider refuses with a stop+start hint, no respawn.
 : > "$SEND_LOG"

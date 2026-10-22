@@ -1,13 +1,25 @@
-# Mechanism reference (how the magic contract runs under the hood)
+# Mechanism reference (how the contract runs under the hood)
 
-Everything in this file is the operating manual **for you** (Claude, the orchestrator), the
-exhaustive subcommand table, provider flags, model aliases, and tier system that the
-natural-language contract in `SKILL.md` drives. Power users who want to type raw commands can read
-it too, but it is documented Claude-first.
+The operating manual for you, the orchestrator: setup, provider flags, the tier system, capability
+injection, and `session` mode, all driven by the natural-language contract in `SKILL.md`. Power users
+who want to type raw commands can read it too, but it is written for the orchestrator first.
+
+## Contents
+
+- Prerequisites & first-time setup
+- Step 0, Preflight
+- How it works (architecture)
+- Providers (offload backend)
+- Tier-aware prompt wrapping
+- Capability injection (--with)
+- Core usage
+- Live supervision mode (`session`)
+- `session` as the default delegation mode
+- External-session claims
 
 ## Prerequisites & first-time setup
 
-The skill is self-contained bash, but it drives external tools. Before first use, make sure these exist. **`doctor` reports the status of all of them** (see Step 0 below), so run that first and only install what it flags as missing.
+The skill is self-contained bash, but it drives external tools. **`doctor` reports the status of all of them per provider** (see Step 0 below), so run it first and install only what it flags as missing. Each provider needs only its own row plus bash; the script degrades gracefully and names any missing dependency.
 
 | Dependency | Required for | Install |
 |---|---|---|
@@ -21,16 +33,12 @@ The skill is self-contained bash, but it drives external tools. Before first use
 | **jq** | `parity`, `image` (gemini/OpenRouter backends) | `brew install jq` (macOS) / `apt install jq` (Linux) |
 | **tmux** | `session` + interactive OR launchers | `brew install tmux` / `apt install tmux` |
 
-`doctor` reports the status of all of these per provider, so run it first and install only what it flags. Each provider needs only its own row plus bash; the script degrades gracefully and names any missing dependency.
-
-To install the skill itself: drop the `outsourcerer/` folder into `~/.claude/skills/` (Claude Code) and/or run `parity` to symlink it into Devin too.
-
-The helper is self-contained bash; no external deps beyond `devin`, and `jq`/`tmux` only for `parity`/`session`.
+The skill ships as a Claude Code plugin; per-host install paths (Devin, Antigravity, Codex, Hermes) are in `second-opinion-and-parity.md`.
 
 ## Step 0, Preflight (run once per session)
 
 ```
-~/.claude/skills/outsourcerer/scripts/outsourcerer.sh doctor
+${CLAUDE_PLUGIN_ROOT}/skills/outsourcerer/scripts/outsourcerer.sh doctor
 ```
 
 If it reports **NOT logged in**, tell the user to run it themselves (browser auth):
@@ -39,7 +47,7 @@ If it reports **NOT logged in**, tell the user to run it themselves (browser aut
 ! devin auth login
 ```
 
-Do not try to complete the login yourself, it is an interactive browser flow.
+The login is an interactive browser flow, so the user runs it, not you.
 
 ## How it works (architecture)
 
@@ -59,10 +67,15 @@ Two shapes of parallelism, both first-class:
 - A persistent interactive TUI is available via tmux (opt-in), for genuinely back-and-forth *steering*,
   not for parallelism or tool access (headless already has both, see the mode note in `SKILL.md`).
 
-## Providers (offload backend), `--provider devin | cc | codex | droid | cursor | local`
+## Providers (offload backend)
 
-The offload backend is selectable. Pass `--provider NAME` anywhere (before or after the
-subcommand), or set `OUTSOURCERER_PROVIDER`. Default is `devin` (unchanged).
+The offload backend is selectable. Put `--provider NAME` before the subcommand, or set
+`OUTSOURCERER_PROVIDER`. Delegation commands also accept it after the subcommand, but factory
+commands have their own parsers: use `task add ... --provider NAME` to persist a worker's lane.
+A leading provider flag does not populate that task field. Put `--cloud-ack` before factory
+subcommands. Default is `devin`. Usually you pass no `--provider` at
+all, because the model alias picks the lane (`SKILL.md`). The table covers the agentic backends; the
+gemini, local, tokenrouter, warp, hermes, and cline lanes are in `lanes-and-models.md`.
 
 | Provider | Engine | Protocol | Inherits | Sandbox | Best for |
 |---|---|---|---|---|---|
@@ -73,7 +86,7 @@ subcommand), or set `OUTSOURCERER_PROVIDER`. Default is `devin` (unchanged).
 | `cursor` | `cursor-agent -p` | cursor's own | the user's Cursor rules/AGENTS.md + account models | `--sandbox enabled` (research verb) | users on a Cursor subscription (CLI shares its credit pool) |
 | `claudex` | `claude -p` → user's local CLIProxyAPI | Anthropic-compat `/v1/messages` | Claude Code harness UX (strict MCP isolation) | none (CC permission modes) | GPT-5.6 Sol/Terra inside the Claude harness; DETECT-ONLY, see `lanes-and-models.md` |
 
-**Engine lanes (`droid`/`cursor`) pass `-m` through VERBATIM** — the engine's own catalog (incl.
+**Engine lanes (`droid`/`cursor`) pass `-m` through verbatim**: the engine's own catalog (incl.
 user-configured BYOK models) decides what a name means; the alias table never rewrites it. No `-m`
 = the engine's configured default. Verb mapping: `run` = read-only default, `edit` = `--auto medium`
 / `--force`, `yolo` = `--auto high` / `--force --sandbox disabled`. `--effort` maps natively to
@@ -98,7 +111,7 @@ without touching OpenRouter. `continue`/`session`/`parity` are **Devin-only**, f
 OpenRouter sessions use this skill's own `scripts/run-or-model.sh` (cc) or
 `scripts/run-or-codex.sh` (codex).
 
-## Tier-aware prompt wrapping (frontier / mid / budget / raw)
+## Tier-aware prompt wrapping (frontier / capable / mid / budget / raw)
 
 Every cc/codex/native dispatch classifies the model into a **tier** and wraps the task in a
 tier-appropriate scaffold (a **banner prints the verdict** on every dispatch). Strong models get a
@@ -108,7 +121,7 @@ a scope fence, an output contract, and anti-hallucination rules.
 - Classification (first hit wins): `--tier` flag / `OUTSOURCERER_TIER` env → alias table →
   cached OpenRouter pricing (`~/.outsourcerer/models.json`, refresh via `models --refresh`) →
   name regex → default `mid`.
-- Override per call: `--tier frontier|mid|budget|raw` before the task. `raw` = your prompt
+- Override per call: `--tier frontier|capable|mid|budget|raw` before the task. `raw` = your prompt
   verbatim (plus the progress-protocol block only). Move price cutoffs with
   `OSRC_TIER_BUDGET_MAX_USD_M` / `OSRC_TIER_MID_MAX_USD_M`.
 
@@ -206,13 +219,13 @@ Continue the same Devin conversation (follow-up turn):
 Pick a different model for a single call (flexible, overrides the default):
 ```
 .../outsourcerer.sh run -m deepseek-v4-pro "..."
-.../outsourcerer.sh edit -m claude-sonnet-4.6 "..."   # premium: see cost note below
+.../outsourcerer.sh edit -m sonnet "..."              # claude-native lane: no cash, spends Claude plan limits
 ```
 
-**Switch models mid-conversation.** `continue -m MODEL` swaps the model on an in-flight conversation **with full context preserved**, the new model sees everything the prior one did. Start a probe on a free model, then escalate one hard turn to a premium model without losing state:
+**Switch models mid-conversation.** `continue -m MODEL` swaps the model on an in-flight Devin conversation **with full context preserved**: the new model sees everything the prior one did. `continue` always runs on Devin, so `-m` takes a Devin model id. Start a probe on a free model, then escalate one hard turn to a premium model without losing state:
 ```
 .../outsourcerer.sh run "Map the failure across these modules using subagents."
-.../outsourcerer.sh continue -m claude-opus-4.8 "Now write the fix for the trickiest module."   # premium turn
+.../outsourcerer.sh continue -m <premium Devin id from `models`> "Now write the fix for the trickiest module."   # premium turn
 .../outsourcerer.sh continue -m glm-5.2 "Apply the same pattern to the rest."                    # back to free
 ```
 (For the interactive TUI, switch live with `session model`, see below.)
@@ -223,11 +236,11 @@ Pick a different model for a single call (flexible, overrides the default):
 
 ## Live supervision mode (`session`, tmux)
 
-**This is the orchestrator's feedback loop, not a human-spectator mode.** `session` lets YOU (Claude, the orchestrator) watch a delegate's actual work as it happens and steer it mid-flight: `session read` captures what the model is doing right now, `session send` course-corrects or answers its question, `session model` swaps its model, `session stop` ends it. Headless `run`/`bg`/`fanout` fire-and-forget, so they only ever surface progress markers or a final result, you never get to catch a wrong turn early or unblock a stuck delegate in the moment. That read→steer→read loop is precisely what headless delegations miss.
+**This is the orchestrator's feedback loop, not a spectator mode.** `session` lets YOU (Claude, the orchestrator) watch a delegate's actual work as it happens and steer it mid-flight: `session read` captures what the model is doing right now, `session send` course-corrects or answers its question, `session model` swaps its model, `session stop` ends it. Headless `run`/`bg`/`fanout` fire-and-forget, so they only ever surface progress markers or a final result, you never get to catch a wrong turn early or unblock a stuck delegate in the moment. That read→steer→read loop is precisely what headless delegations miss.
 
 **When to prefer it over headless:** long, complex, exploratory, or high-stakes delegations where an early correction saves a whole wasted run, or where the delegate is likely to need a clarifying answer. For short, well-scoped, obviously-correct work, headless is cheaper and fine.
 
-**tmux is used by the `session` subcommand ONLY** (`run`/`research`/`edit`/`continue` are plain `devin -p`/`-c`, no tmux), so `session` is Mac/Linux; on Windows fall back to `bg` + `status` polling. Provider-aware, and **the alias picks the lane**: `session start -m terra` (or sol/luna/gpt-5.x) starts native codex, `-m opus`/`-m fable` starts native claude, `-m gemini-pro` starts gemini — no `--provider` needed. Open-weight ids (glm/deepseek/kimi) stay on Devin, the default. `--provider` only forces a lane against the alias.
+**tmux is used by the `session` subcommand ONLY** (`run`/`research`/`edit`/`continue` are plain `devin -p`/`-c`, no tmux), and on Windows `session` runs through the bundled winpty broker instead. Provider-aware, and **the alias picks the lane**: `session start -m terra` (or sol/luna/gpt-5.x) starts native codex, `-m opus`/`-m fable` starts native claude, `-m gemini-pro` starts gemini, with no `--provider` needed. Open-weight ids (glm/deepseek/kimi) stay on Devin, the default. `--provider` only forces a lane against the alias.
 
 **Separate tasks get separate sessions.** The tmux session name is derived from the working directory, so a `session start` in one repo can never clobber a concurrent live session in another (each `start` kills only its own name). `read`/`send`/`model`/`stop` run from the same `$PWD` and resolve the same session automatically. To run two isolated sessions in ONE directory, set `OUTSOURCERER_TMUX=<name>` explicitly for each. (`-p` modes were always isolated, each call is its own process.)
 ```
@@ -241,3 +254,31 @@ Pick a different model for a single call (flexible, overrides the default):
 `session model deepseek` filters the picker and confirms; `session read` then shows the new model in the footer (e.g. `✓ Model set to DeepSeek V4 Pro`). With no NAME it just opens the picker for manual select.
 
 **Why tmux and not ACP?** Devin also ships `devin acp` (an Agent Client Protocol server over stdio, with `--agent-type review|summarizer`), a robust machine protocol, but using it means *building an ACP client* (handshake, sessions, permission callbacks). tmux needs zero protocol code and can drive TUI-only affordances like `opt+m`. For anything fire-and-forget, the non-interactive `-p`/`-c` path beats both. Use ACP only if this graduates into a real hosted integration.
+
+### `session` as the default delegation mode
+
+Reach for `session` first, not `bg`. It is a persistent interactive TUI you drive programmatically, and
+you act as the user toward each delegate: `session read` shows its actual work as it happens,
+`session send "…"` steers it mid-flight (including answering an approval prompt so the delegate doesn't
+stall), `session model <name>` switches its model, `session stop` ends it.
+
+Why it is the default: a headless `bg`/`fanout` delegate that hits an approval wall goes
+`permission-blocked` and dies unseen, or stalls silently. A session lets you see it and steer past.
+Default to `session` for any delegation that mutates, is long, complex, or exploratory, or could hit an
+approval prompt. Use headless `bg`/`fanout` only when a session is not viable (a non-interactive, CI, or
+detached caller that cannot drive a TUI, or a wide fan-out of many independent one-shot jobs) and say
+so. If you catch yourself writing the work yourself, or running a one-shot where a session someone can
+drive would fit, switch to a session. It runs on tmux on Mac/Linux and the winpty broker on Windows Git
+Bash. Job states and supervision: `jobs-and-safety.md`.
+
+**Fable-pin.** A claude-native session launched on Fable can fall back to Opus. Watch the running model
+(`session read`, or the built-in footer observer that feeds `bearings` and the heartbeat) and flip it back
+when it drifts: `session model fable` drives Claude Code's picker and re-pins Fable for that session only
+(footer-verified, never touching the global default). The picker only opens between turns, so run the
+flip while the session is idle, which is when you notice drift anyway; a mid-turn attempt declines
+cleanly and you retry. The heartbeat only reports cc drift: it wakes you rather than typing into the
+session, so it can never interrupt an in-flight turn.
+
+### External-session claims
+
+`session claim <external-id> <tmux-pane>` prints a secret claim token. For a later, separate CLI invocation, pass it as `OSRC_SESSION_CLAIM_TOKEN` to `session reply` or `session release`. Set `OSRC_CONTROLLER_ID` to a durable controller identity when commands are driven outside tmux; inside tmux, the controlling tmux session is used automatically. The controller ID and token must both match the claim record. Without either durable source, the token is the capability, protected by the 0700 state directory and 0600 claim record boundary. Do not place the token in logs or shared shell history.

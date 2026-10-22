@@ -4,9 +4,25 @@ Full detail behind the compact alias→lane table in `SKILL.md`: native lanes (c
 claude-native), the Gemini/Antigravity (`agy`) lane, image backends, and model-recommendation
 heuristics.
 
+## Contents
+
+- The model chooses the lane (aliases + native premium lanes)
+- Claudex lane: GPT-5.6 Sol/Terra inside the Claude Code harness
+- Engine lanes: droid (Factory) + cursor
+- Cline lane
+- Gemini / Antigravity lane
+- Local lane (Ollama / LM Studio / llama.cpp)
+- TokenRouter lane
+- Image generation
+- Choosing / recommending models
+- Never use a model: the exclude list
+- Plan limits and cross-harness failover
+- Notes (Devin's two pools)
+- Alias quick table, full rows
+
 ## The model chooses the lane (aliases + native premium lanes)
 
-You no longer type `--provider` for premium models: the **model alias selects the lane**. `-m sol`
+You don't type `--provider` for premium models: the **model alias selects the lane**. `-m sol`
 just works (codex-native). Native lanes use NO OpenRouter overrides, they ride *your own*
 ChatGPT / Claude subscription auth, so they are premium and are **never** auto-escalated to.
 
@@ -23,8 +39,8 @@ ChatGPT / Claude subscription auth, so they are premium and are **never** auto-e
 | `gemini-flash-lite` | newest `gemini-*-flash-lite` (live; agy has no lite tier, so flash there) | gemini | budget | cheapest Gemini text tier |
 | `gpt-image` / `codex-image` | `gpt-image-2` | codex-image | budget | **PREFERRED** image backend, **NOT** a text lane, use `image`; KEYLESS (Codex/ChatGPT sub) |
 | `nano-banana` | newest `gemini-*-flash-image` the API serves (live) | gemini-image | budget | image FALLBACK #2, **NOT** a text lane, use `image`; needs `GEMINI_API_KEY` |
-| `glm` | `z-ai/glm-5.2` | OpenRouter | **capable** | frontier CAPABILITY, budget PRICE (~Opus-4.8 class); default cheap lane (`--provider cc`/`codex`) |
-| `hy3` | `tencent/hy3:free` | OpenRouter | **capable** | ~Opus-4.8 class; `:free` = provider may train on inputs |
+| `glm` | `z-ai/glm-5.2` | OpenRouter | **capable** | frontier CAPABILITY, budget PRICE (near-frontier); default cheap lane (`--provider cc`/`codex`) |
+| `hy3` | `tencent/hy3:free` | OpenRouter | **capable** | near-frontier; `:free` = provider may train on inputs |
 | `deepseek` | `deepseek/deepseek-v4-pro` | OpenRouter | **capable** | strongest cheap lane, pro reasoning flagship |
 | any other OpenRouter id | itself | OpenRouter | by cached price, then name | see tiers below |
 | `glm-5.2` under `--provider devin` | Devin's id | devin | table/name | Devin path unchanged |
@@ -43,7 +59,7 @@ out of credits; force OpenRouter with `--provider cc|codex`. `hy3` is OpenRouter
 ## Claudex lane: GPT-5.6 Sol/Terra INSIDE the Claude Code harness (`--provider claudex`)
 
 The community "claudex" pattern (Theo's recipe): more and more users treat the **model and the
-harness as separate choices** — Claude Code's harness UX driving a ChatGPT-subscription model.
+harness as separate choices**: Claude Code's harness UX driving a ChatGPT-subscription model.
 This lane does it supervised: `--provider claudex run [-m sol|terra|luna] "task"` runs
 `claude -p --model gpt-5.6-*` with `ANTHROPIC_BASE_URL` pointed at the user's **locally-running
 CLIProxyAPI** (default `http://127.0.0.1:8317`, token = the proxy's own `api-keys` entry,
@@ -61,17 +77,17 @@ auto-parsed from `~/.cli-proxy-api/config.yaml`; override with `OSRC_CLAUDEX_URL
   through a third-party proxy breaks Anthropic's usage policy; the claude-native lane already
   serves those models first-class.
 - Verbs map like claude-native (`run` read-only, `edit` acceptEdits, `yolo` bypassPermissions,
-  `research` refused — no OS sandbox); the run VERIFIES the actual model via `modelUsage`.
+  `research` refused, no OS sandbox); the run VERIFIES the actual model via `modelUsage`.
 - **codex CLI keeps its jobs**: gpt-image generation and the codex-native/OpenRouter lanes are
   unchanged; claudex is an additional road, not a replacement.
 
-## Engine lanes: droid (Factory) + cursor — the user's OWN tools
+## Engine lanes: droid (Factory) + cursor, the user's OWN tools
 
 `--provider droid` / `--provider cursor` delegate through the agent CLI the user already runs, with
 the models THEY configured there. This is the "work with MY tools" lane: someone with free/cheap
 BYOK API lanes set up in droid (`~/.factory/settings.json` → `customModels`) or a Cursor
 subscription gets full outsourcerer supervision (bg/fanout/watchdog/ledger/cloud-gate) over their
-existing setup — zero new keys, zero migration.
+existing setup, zero new keys, zero migration.
 
 - `-m <name>` passes through **verbatim** to the engine; the alias table never rewrites it. No
   `-m` = the engine's configured default.
@@ -95,7 +111,7 @@ needs no key). Symmetrically `-m fable --provider codex` dies (Claude-backend-on
 `--provider cline` delegates through the Cline CLI (https://github.com/cline/cline) the user
 already runs, with the provider and models THEY configured in `~/.cline`. This is the "work with MY
 tools" lane for Cline users. Billing is theirs: a **ClinePass subscription** (~$9.99/mo, discounted
-access to open-weight models like GLM, DeepSeek, and Kimi) or their own API keys — the roster and
+access to open-weight models like GLM, DeepSeek, and Kimi) or their own API keys; the roster and
 pricing are cline's, not ours, so do NOT hardcode or promise a specific model or price. Full
 outsourcerer supervision (bg/fanout/watchdog/ledger/cloud-gate) applies.
 
@@ -106,9 +122,9 @@ outsourcerer supervision (bg/fanout/watchdog/ledger/cloud-gate) applies.
   across all lanes, use `suggest`/`deals` (they read each catalog live) rather than trusting a
   hardcoded list.
 - **Posture is BINARY, not graded:** `run`/`explore` → `--plan` (read-only, no edits/commands
-  applied — **version-gated**: requires cline >= 3.0.36, where Plan mode stopped falling back to
+  applied, **version-gated**: requires cline >= 3.0.36, where Plan mode stopped falling back to
   shell edits; on an older CLI the read-only tier is refused, not silently trusted); `edit`/`research`/`yolo` → default act mode with `--auto-approve true` (all tools
-  auto-approved). Cline has **no OS sandbox and no middle approval rung** — the trade is disclosed
+  auto-approved). Cline has **no OS sandbox and no middle approval rung**; the trade is disclosed
   in the posture banner, never silent. Treat `research`/`yolo` on cline as fully autonomous with no
   sandbox boundary; prefer `run` (plan mode) for read-only inspection.
 - `--effort` is **native** on cline (`--thinking none|low|medium|high|xhigh`).
@@ -213,7 +229,7 @@ outsourcerer.sh --provider local run -m <model> "..."
 - **Tier**: classified by model name (a local `qwen2.5-coder`/`llama-4` reads as `capable`; a small
   `*-mini`/`*-lite` as `budget`). Local model quality varies wildly, so pass `--tier` to correct it.
 
-## TokenRouter lane (`--provider tokenrouter`) — OpenAI-compatible gateway
+## TokenRouter lane (`--provider tokenrouter`): OpenAI-compatible gateway
 
 `--provider tokenrouter` delegates through [TokenRouter](https://www.tokenrouter.com), an
 OpenAI-compatible model gateway, using the key in `TOKENROUTER_API_KEY` (`~/.env`, single-key
@@ -225,7 +241,7 @@ outsourcerer.sh run --provider tokenrouter -m <gateway-model-id> "summarize thes
 ```
 
 - **`-m` is REQUIRED and passes through VERBATIM** to the gateway's own catalog; the alias table
-  never rewrites it. There is NO hardcoded default model — the roster is TokenRouter's, discovered
+  never rewrites it. There is NO hardcoded default model; the roster is TokenRouter's, discovered
   live, not ours. List it with
   `curl -s -H "Authorization: Bearer ***" https://api.tokenrouter.com/v1/models`.
 - **It is a CLOUD lane**: the prompt LEAVES the machine, so it flows through the same cloud-consent
@@ -293,20 +309,105 @@ Recommendation rules:
   note below). For agentic/edit work `advise` now prefers **`glm-5.3-flash-high`** (lighter, same
   capability class) when it is available.
 - **Cheap ≠ dumb.** `glm-5.2`/`hy3`/`deepseek-v4-pro` are the **`capable`** tier: frontier capability
-  at budget price (~Opus-4.8 class). They are valid for high-stakes reasoning, security review, and
+  at budget price (near-frontier). They are valid for high-stakes reasoning, security review, and
   deep judgment, not just grunt work. See `effort-and-tiers.md`. Pair them with `--effort high`/`max`
   when the task is hard. Only route AWAY from genuinely *small* models (`haiku`/`gemini-flash-lite`/`*-mini`).
 - The **open-weight** families (`glm*`, `deepseek*`, `kimi*`, `swe*`) are usually the free / low-cost lane, recommend these when the user wants "a free model."
 - **Premium** families (`claude*`, `gpt*`, `gemini*`) typically consume Devin usage/ACUs faster. Flag this before routing heavy work to them, and confirm with the user.
 - Treat all of the above as a heuristic, not gospel. If the user needs certainty on current cost, point them to their Devin usage dashboard.
-- **Task-type routing (manual heuristic, no automated `suggest` command exists):** this skill has
-  no stubbed model-recommendation/`suggest` surface to wire into, these are rules for *you* (the
-  orchestrator) to apply by hand when picking `-m`. Visual-review / image-understanding tasks
+- **Task-type routing (apply by hand when picking `-m`):** `advise` scores models by benchmark and
+  `suggest` lists what is cheap right now, but neither knows these two task-type rules. Visual-review / image-understanding tasks
   (screenshot critique, UI/UX review, "does this match the mockup") → route to `gemini-flash` or
   `gemini-pro` (see the Gemini/Antigravity section above). Image-*generation* tasks → the `image`
   subcommand, backend auto-resolved (GPT-image/Codex preferred, nano-banana and OpenRouter as
-  fallback, see "Image generation" above). If an automated suggest/routing command gets built
-  later, wire these same two mappings into it rather than re-deriving them.
+  fallback, see "Image generation" above).
+
+## Never use a model: the exclude list (`exclude`)
+
+For a model the user cannot or will not use (no Fable subscription, a model their company forbids),
+put it on the exclude list once. It persists across sessions; telling the orchestrator "never use
+Fable" in chat does not.
+
+```
+outsourcerer.sh exclude add fable          # saved in $OSRC_HOME/exclude
+outsourcerer.sh exclude ls                 # what is excluded (saved + env)
+outsourcerer.sh exclude check claude-fable-5-1   # rc0 = excluded, says which entry matched
+outsourcerer.sh exclude rm fable           # allow it again
+outsourcerer.sh exclude clear              # drop the saved list
+```
+
+`OSRC_EXCLUDE_MODELS="fable,gpt-5.6-*"` adds entries for one shell or CI, on top of the saved list.
+
+**What an entry matches** (case-insensitive). Every name is compared in its canonical form, so the
+same model matches however it is spelled: alias, exact id, provider-prefixed id (`anthropic/`, `z-ai/`,
+`openai/`), dotted or dashed version (`glm-5.2` = `glm-5-2`), a `[1m]` suffix, an effort suffix
+(`-high`, `-max`, `-preview`) or a date stamp (`-20251001`).
+- a **family word** covers every model of that family: `fable` matches `fable`, `claude-fable-5`,
+  `claude-fable-5-1`, `anthropic/claude-5-fable`, `claude-fable-5-1[1m]`; `claude` covers every
+  Claude family (fable, opus, sonnet, haiku);
+- an **alias** also matches what it resolves to (`sol` matches `gpt-5.6-sol`, `glm` matches `z-ai/glm-5.2`);
+- an **exact id** covers that model in every spelling (`claude-fable-5` matches
+  `anthropic/claude-5-fable` and Devin's `claude-fable-5-high`), but **not** a different release or
+  size: `claude-sonnet-5` leaves `claude-sonnet-5-5` allowed, `gpt-5.5` leaves `gpt-5.5-mini` allowed,
+  `gemini-flash` leaves `gemini-flash-lite` allowed. To cover point releases use a glob
+  (`claude-fable-5*`) or the family word;
+- a **bare family alias** is refused when the family word itself is excluded, or when an entry
+  covers the model that alias runs **today**: `sol`/`terra`/`luna`/`glm`/`swe` use the alias table,
+  and `fable`/`opus`/`sonnet`/`haiku` use the current Claude ids (`claude-fable-5-1`,
+  `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`). An entry also covers the current id
+  when that id is a listed point release of it (today only `claude-fable-5-1` of `claude-fable-5`),
+  so `exclude add claude-fable-5` refuses `-m fable` and `claude-opus-5-5` refuses `-m opus`, while
+  excluding a different, older model (`claude-sonnet-5`, `claude-opus-5`, `claude-opus-4-8`) leaves
+  `-m sonnet` / `-m opus` usable. `gemini-pro`,
+  `gemini-flash` and `gemini-flash-lite` pick their id live, so any excluded version of that family
+  refuses them (fail closed, and the refusal says why); name an exact id with `-m` instead;
+- a **glob** (`gpt-5.6-*`; only `*` and `?` are wildcards) is matched against the name, its resolved
+  id and its canonical form;
+- short family words reach further than they look: `pro` also matches `deepseek-v4-pro`, `flash`
+  matches `glm-5.3-flash`. `exclude add` prints every known model the entry covers, so check that line;
+- an entry with no letters (`5`) is refused, so a typo can never exclude half the catalog;
+- an entry that is not a valid model name (only a hand-edited file or `OSRC_EXCLUDE_MODELS` can hold
+  one, `exclude add` rejects it) **fails closed**: every model counts as excluded, with a warning
+  naming the entry, until you fix or remove it. A matcher failure fails closed the same way.
+
+**Where it is enforced.** An explicit `-m` naming an excluded model is refused with one line naming
+the fix, on every verb (`run`/`explore`/`research`/`edit`/`yolo`/`bg`/`fanout` incl. `--route` and
+agent frontmatter/`crew`/`loop verify`/`loop escalate` incl. `--ladder`/`second-opinion -m a,b`/
+`continue`/`session start`/`session model`/`task add -m`). The id an alias **resolves to** is checked
+again just before launch: Devin's live catalog (`-m claude` resolving to a Fable id is refused), the
+Gemini family pick (`-m gemini-pro` resolving to an excluded dated id), and the droid/warp alias maps.
+Automatic choices skip it: `advise` (text and `--json` recommendation + shortlist), the transport
+fallback shortlist, cross-harness failover, the OpenRouter chain (`OR_OFFLOAD_CHAIN`), the
+`second-opinion` default pair (a swap never picks a model that resolves to the other one) and premium
+judge (an excluded judge falls back to the next allowed one: opus, terra, gemini-pro, sol, and says
+so), the `loop escalate` default ladder (the rung is dropped out loud; when that leaves one rung the
+error says the exclude list did it), `suggest`/`deals` listings, fleet session naming, the `doctor`
+ping probes (codex, claude, agy, gemini-cli) and Devin health/plan probes (the next allowed probe model
+is used, or the probe is skipped). A provider whose built-in default is excluded (e.g. `--provider
+devin` with `glm` excluded) is refused with the fix rather than run, and `fanout` refuses it up front,
+before any member starts. When everything a request could use is excluded, it stops with a clear
+message; it never quietly runs an excluded model.
+
+**Models outsourcerer cannot see.** While a list is active:
+- `continue` without `-m` is refused (the conversation keeps its original model, which may be excluded); pass `-m`;
+- `session start` without `-m` on Claude Code or Codex checks the CLI's configured default
+  (`ANTHROPIC_MODEL` / `~/.claude/settings.json`, `~/.codex/config.toml`) and refuses when it is
+  excluded, or when none is configured and the list covers a model of that family; pass `-m`;
+- a session is never relaunched (`session control relaunch`, `session effort`) or drift-restored onto a
+  model you have since excluded;
+- engine lanes run without `-m` (droid, cursor, hermes, cline, a Devin session) use the model the
+  engine is configured with, which outsourcerer cannot see; they print one line saying so. Pass `-m`
+  to be sure;
+- a background job whose `-m` was excluded after it was queued fails with reason `excluded-model`.
+
+**Why it sticks.** `brief` (the session-start handshake) and `doctor` print the active list, so every
+new orchestrator session sees it before it picks a model.
+
+**Cost.** With no list, the checks cost nothing (no extra processes). With a list, entries are read
+once per process and each distinct model name is matched once.
+
+Not covered: the `image` subcommand's automatic backend pick (image-only models; `image -m X` is
+refused like any -m), and `OSRC_MODEL_DENYLIST` (the older exact-id org denylist, still honored alongside).
 
 ## Plan limits and cross-harness failover
 
@@ -388,3 +489,19 @@ capacity; both are described in `jobs-and-safety.md`.
   `brief`/`status` show a proactive meter, "N Devin plan jobs today", with a WARN past
   `OSRC_DEVIN_PLAN_JOBS_WARN` (default 8): routing advice only, never a block. The older claim that
   GLM does not draw Devin limits described the ACU pool only; do not read it as "unlimited".
+
+## Alias quick table, full rows
+
+| Alias(es) | Lane |
+|---|---|
+| `sol` / `terra` / `luna` / `gpt-5.5` | codex-native (ChatGPT sub); add `--provider claudex` to run it inside the Claude Code harness via the user's own CLIProxyAPI (offer only when `doctor` says claudex READY; unofficial bridge, detect-only) |
+| `fable` / `opus` / `sonnet` / `haiku` | claude-native (Claude sub) |
+| `gemini-pro` / `gemini-flash` / `gemini-flash-lite` | gemini (agy keyless) |
+| `glm` / `hy3` / `deepseek` / any OpenRouter id | OpenRouter (`--provider cc`/`codex`); `capable` tier |
+| `swe` / `swe-1.7` / `kimi` / any Devin id | devin (default); glm/deepseek self-heal here when OpenRouter is out of credits |
+| `ollama:<m>` / `local:<m>` | local (keyless, PRIVATE, $0) |
+| any TokenRouter gateway id | **tokenrouter** (`--provider tokenrouter`): OpenAI-compatible cloud gateway, key `TOKENROUTER_API_KEY` in `~/.env`; `-m` is REQUIRED and passes through verbatim to the gateway's own catalog (no hardcoded default; the roster is the gateway's, discovered live; some models are a $0 promo RIGHT NOW, confirmed at runtime by billing errors, never a hardcoded date). TEXT delegation, cloud-gated. |
+| `gpt-image` / `nano-banana` | image only (`image` subcommand) |
+| any model the USER configured | **droid** / **cursor** / **warp** / **hermes** / **cline** (`--provider droid\|cursor\|warp\|hermes\|cline`): the user's OWN agent CLIs, THEIR models (incl. BYOK); `-m` passes through verbatim. Warp drives `oz agent run` (models via `oz model list`) and can even host the Claude/Codex harness (`OSRC_WARP_HARNESS=claude\|codex`). **Cline** runs on the user's own Cline setup: a ClinePass subscription (discounted open-weight models) or their own keys in `~/.cline`; `-m` passes through verbatim (the roster + pricing are cline's, not ours). **These are easy to forget; the user has warp AND droid AND cline installed; when they say "use warp/droid/cline," this is the lane, don't reach for devin.** |
+
+**A pinned Claude/GPT/Gemini model runs on ITS OWN native lane, never Devin.** `-m opus`, `-m fable`, `-m claude-opus-5-5`, `-m claude-opus-5-5[1m]`, any `claude-*`/`gpt-5.*`/`gemini-*` id resolves to the claude/codex/gemini-native lane automatically (the alias picks the lane; no `--provider` needed, and you should NOT add `--provider cc` for a Claude model; that means the OpenRouter transport, not the Claude subscription). If the user says "spin up Fable and Opus 5.5," that is `-m fable` and `-m opus` (or the pinned ids) on the claude-native lane, on their Claude subscription, putting that on Devin burns the wrong limits and is the #1 mistake to avoid.
