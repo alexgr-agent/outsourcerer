@@ -52,6 +52,10 @@ git -C "$R" log --format=%s main | grep -q '^land(demo/t2): build it$' && ok "ma
 [ "$(jq -r .verdict "$T/t2/evidence.json")" = done ] && [ "$(jq -r .secret_scan "$T/t2/evidence.json")" = clean ] \
   && ok "evidence records the verdict and a clean secret scan" || bad "evidence incomplete"
 
+j2="$(jq -r '.jobs[0] // ""' "$T/t2.json")"
+[ -n "$j2" ] && [ "$(cat "$OSRC_HOME/jobs/$j2/task_ref" 2>/dev/null)" = demo/t2 ] \
+  && ok "the real launch links its job back to the task" || bad "job $j2 has no task_ref"
+
 if [ "$fail" -gt 0 ]; then
   # A rare first-run failure was seen once and never reproduced; print enough to explain the next one.
   echo "--- diagnostics (plan run rc=$rc) ---"

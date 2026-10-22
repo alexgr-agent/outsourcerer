@@ -11837,6 +11837,9 @@ _bg_launch() {
     [ "$tries" -ge 8 ] && { echo "bg: could not allocate a unique job dir under $OSRC_JOBS" >&2; return 1; }
   done
   chmod 700 "$jd" 2>/dev/null
+  # A factory task launch links the job to its task the moment the job exists, so a launcher killed
+  # before it records the job id still leaves a job the scheduler can find and adopt.
+  case "${OSRC_TASK_REF:-}" in ?*/?*) printf '%s\n' "$OSRC_TASK_REF" > "$jd/task_ref" 2>/dev/null || true ;; esac
   # Keep job history bounded even when nobody remembers to run `gc`.  This is
   # intentionally best-effort and capped: launch latency must never depend on
   # sweeping a large historical directory.  STDERR preserves this function's
