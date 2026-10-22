@@ -11840,6 +11840,7 @@ _bg_launch() {
   # A factory task launch links the job to its task the moment the job exists, so a launcher killed
   # before it records the job id still leaves a job the scheduler can find and adopt.
   case "${OSRC_TASK_REF:-}" in ?*/?*) printf '%s\n' "$OSRC_TASK_REF" > "$jd/task_ref" 2>/dev/null || true ;; esac
+  [ -z "${OSRC_TASK_ATTEMPT:-}" ] || printf '%s\n' "$OSRC_TASK_ATTEMPT" > "$jd/task_attempt" 2>/dev/null || true
   # Keep job history bounded even when nobody remembers to run `gc`.  This is
   # intentionally best-effort and capped: launch latency must never depend on
   # sweeping a large historical directory.  STDERR preserves this function's
@@ -12424,7 +12425,7 @@ run_job() {
   # The worktree decision is made: these switches were for THIS job only. Leaving them exported would
   # make every nested outsourcerer call the delegate makes inherit them (a nested job pinned to our
   # base commit, or refusing to run without a worktree).
-  unset OSRC_WORKTREE OSRC_WORKTREE_REQUIRED OSRC_WORKTREE_BASE
+  unset OSRC_WORKTREE OSRC_WORKTREE_REQUIRED OSRC_WORKTREE_BASE OSRC_TASK_REF OSRC_TASK_ATTEMPT
   # peek model/tier for windows + meta (non-fatal)
   _consume_flags "$@" 2>/dev/null || true
   # Classify from the REAL task text (REST), not the "job:<id>" placeholder record_ledger sees.
