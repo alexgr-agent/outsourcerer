@@ -104,7 +104,7 @@ Full table + image backend order: `references/lanes-and-models.md`.
 - **Cost honesty.** Split cash from plan limits. A subscription/keyless run is $0 cash but spends finite plan limits — say both. Only the local lane is truly free. Details: `references/tab.md`.
 - **"state home NOT WRITABLE"** = the sandbox denies `~/.outsourcerer`. The error spells out the two fixes (allowWrite, or `OSRC_HOME=`). Don't rerun unchanged.
 - **Missing CLI?** Say what's missing in one line, suggest the fastest ready lane, keep going.
-- **Windows: no WSL.** Runs under Git Bash; `outsourcerer.cmd`/`.ps1` launch it. Only tmux `session` is unavailable (bg/fanout cover it).
+- **Windows: no WSL.** Runs under Git Bash; `outsourcerer.cmd`/`.ps1` launch it. `session` runs through the bundled winpty broker instead of tmux.
 
 ## Subcommands
 

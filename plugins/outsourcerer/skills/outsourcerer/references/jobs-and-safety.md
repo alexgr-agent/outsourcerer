@@ -220,8 +220,8 @@ bookkeeping only) and is bounded by `OSRC_FAILOVER_MAX` per job (default 2).
 
 `run`/`edit`/`yolo`/`bg`/`fanout`/`status`/`doctor`/`advise`/`consent` all work under Git Bash
 (ships with Git for Windows). `scripts/outsourcerer.cmd` / `scripts/outsourcerer.ps1` launch it
-from cmd/PowerShell and find Git Bash automatically. Only tmux `session` mode is unavailable —
-use `bg` + `watch` for the same supervised capability. `jq` on Windows: `winget install jqlang.jq`.
+from cmd/PowerShell and find Git Bash automatically. `session` uses the bundled winpty broker
+(`scripts/outsourcerer-winpty-broker.sh`) in place of tmux. `jq` on Windows: `winget install jqlang.jq`.
 
 ## Orchestration rules while this skill is active
 
