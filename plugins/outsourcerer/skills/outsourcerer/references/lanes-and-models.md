@@ -308,6 +308,48 @@ Recommendation rules:
   fallback, see "Image generation" above). If an automated suggest/routing command gets built
   later, wire these same two mappings into it rather than re-deriving them.
 
+## Never use a model: the exclude list (`exclude`)
+
+For a model the user cannot or will not use (no Fable subscription, a model their company forbids),
+put it on the exclude list once. It persists across sessions; telling the orchestrator "never use
+Fable" in chat does not.
+
+```
+outsourcerer.sh exclude add fable          # saved in $OSRC_HOME/exclude
+outsourcerer.sh exclude ls                 # what is excluded (saved + env)
+outsourcerer.sh exclude check claude-fable-5-1   # rc0 = excluded, says which entry matched
+outsourcerer.sh exclude rm fable           # allow it again
+outsourcerer.sh exclude clear              # drop the saved list
+```
+
+`OSRC_EXCLUDE_MODELS="fable,gpt-5.6-*"` adds entries for one shell or CI, on top of the saved list.
+
+**What an entry matches** (case-insensitive):
+- a **family word** covers every id that contains it as a word: `fable` matches `fable`,
+  `claude-fable-5`, `claude-fable-5-1`, `anthropic/claude-5-fable`, `claude-fable-5-1[1m]`;
+- an **alias** also matches what it resolves to (`sol` matches `gpt-5.6-sol`, `glm` matches `z-ai/glm-5.2`);
+- an **exact id** covers its point releases (`claude-fable-5` matches `claude-fable-5-1`, not `opus`);
+- a **glob** (`gpt-5.6-*`) is matched against the name and its resolved id;
+- an entry with no letters (`5`) is refused, so a typo can never exclude half the catalog.
+
+**Where it is enforced.** An explicit `-m` naming an excluded model is refused with one line naming
+the fix, on every verb (`run`/`explore`/`research`/`edit`/`yolo`/`bg`/`fanout` incl. `--route` and
+agent frontmatter/`crew`/`loop verify`/`loop escalate` incl. `--ladder`/`second-opinion -m a,b`/
+`continue`/`session start`/`session model`). Automatic choices skip it: `advise` (text and `--json`
+recommendation + shortlist), the transport fallback shortlist, cross-harness failover, the OpenRouter
+chain (`OR_OFFLOAD_CHAIN`), the `second-opinion` default pair and premium judge (an excluded judge
+falls back to the next allowed one: opus, terra, gemini-pro, sol, and says so), the `loop escalate`
+default ladder (the rung is dropped out loud), `suggest`/`deals` listings, fleet session naming, and the
+`doctor` ping probes. A provider whose built-in default is excluded (e.g. `--provider devin` with
+`glm` excluded) is refused with the fix rather than run. When everything a request could use is
+excluded, it stops with a clear message; it never quietly runs an excluded model.
+
+**Why it sticks.** `brief` (the session-start handshake) and `doctor` print the active list, so every
+new orchestrator session sees it before it picks a model.
+
+Not covered: the `image` subcommand's automatic backend pick (image-only models; `image -m X` is refused like any -m), Devin health-probe models used by `doctor`
+liveness checks, and `OSRC_MODEL_DENYLIST` (the older exact-id org denylist, still honored alongside).
+
 ## Plan limits and cross-harness failover
 
 Every subscription harness eventually refuses work because *its own* plan window is spent: Devin's
