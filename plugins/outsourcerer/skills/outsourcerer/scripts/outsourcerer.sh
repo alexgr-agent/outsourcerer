@@ -13047,19 +13047,26 @@ _crew_worktree_clean() {
   [ -z "$(git -C "$1" status --porcelain -uno 2>/dev/null | head -1)" ]
 }
 
-# _crew_scan_staged <dir> -> rc 0 if the STAGED delta contains a live-secret VALUE (block integration).
+# _crew_scan_staged <dir> -> rc 0 if the STAGED delta ADDS a live-secret VALUE (block integration).
 # Mirrors the value patterns in _secret_scan (second defense; workers already passed the cloud gate).
 _crew_scan_staged() {
   # --text/--no-ext-diff/--no-textconv defeat a worker-planted .gitattributes that would hide or
-  # execute during the diff. Patterns cover current key shapes (sk-proj-, github_pat_, xox*, AKIA).
+  # execute during the diff. Only added lines count: deleting a leaked key must not block.
   # The diff is captured before matching: a staged diff larger than the pipe buffer would SIGPIPE
   # git on grep's early exit, and pipefail would then report a planted key as "clean" (rc 141).
   local _sd
-  _sd="$(git -C "$1" diff --cached --text --no-ext-diff --no-textconv 2>/dev/null)" || return 1
-  grep -Eq "$OSRC_SECRET_VALUE_ERE" <<<"$_sd"
+  _sd="$(git -C "$1" diff --cached --text --no-ext-diff --no-textconv --no-color 2>/dev/null)" || return 1
+  grep -Eq "$OSRC_SECRET_ADDED_ERE" <<<"$_sd"
 }
+# Live-secret VALUE shapes (never variable NAMES: code that reads OPENROUTER_API_KEY or
+# AWS_SECRET_ACCESS_KEY from the environment is not a leak). OpenAI/Anthropic sk-, Stripe live
+# sk_live_/rk_live_, GitHub ghp_/github_pat_, Slack xox*/xapp-, AWS AKIA, Google AIza, PEM keys.
 # Shared with the factory merge gate (factory-land.sh scans base..head with the same patterns).
-OSRC_SECRET_VALUE_ERE='OPENROUTER_API_KEY|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[bpoas]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AWS_SECRET[_A-Z]*|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+OSRC_SECRET_VALUES_ALT='sk-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]{16,}|rk_live_[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[bpoas]-[A-Za-z0-9-]{10,}|xapp-[0-9]+-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+# A value anywhere in text (not glued to a preceding letter or digit, so "task-..." is not "sk-...").
+OSRC_SECRET_VALUE_ERE="(^|[^A-Za-z0-9])($OSRC_SECRET_VALUES_ALT)"
+# A value on an ADDED line of a unified diff ("+..."; removed and context lines never match).
+OSRC_SECRET_ADDED_ERE="^[+](.*[^A-Za-z0-9])?($OSRC_SECRET_VALUES_ALT)"
 
 # crew --check '<cmd>' [fanout routing flags] -- "task1" "task2" ...
 cmd_crew() {
@@ -20577,7 +20584,7 @@ main() {
     *) case "$cmd" in
          -*) die "'$cmd' looks like a flag, not a subcommand. Global flags (--provider X, --cloud-ack) are accepted before OR after the subcommand, but a subcommand is required. Example: $0 run --provider cc --cloud-ack \"task\"" ;;
        esac
-       die "unknown subcommand '$cmd' (try: doctor|brief|mode|consent|exclude|models|run|research|edit|yolo|explore|deals|bg|fanout|fleet|status|classify|explain|rundown|bearings|heartbeat|watch|wait|result|logs|cancel|cleanup|tab|estimate|suggest|advise|second-opinion|image|continue|session|parity|parity-codex|parity-droid|parity-cursor|parity-hermes; providers: devin|cc|codex|droid|cursor|hermes|warp|cline|gemini|gm|claudex|local|tokenrouter)" ;;
+       die "unknown subcommand '$cmd' (try: doctor|brief|mode|consent|exclude|models|plan|task|land|flow|run|research|edit|yolo|explore|deals|bg|fanout|fleet|status|classify|explain|rundown|bearings|heartbeat|watch|wait|result|logs|cancel|cleanup|tab|estimate|suggest|advise|second-opinion|image|continue|session|parity|parity-codex|parity-droid|parity-cursor|parity-hermes; providers: devin|cc|codex|droid|cursor|hermes|warp|cline|gemini|gm|claudex|local|tokenrouter)" ;;
 
   esac
   # ---- blind-turn guard: refuse to end the orchestrating turn while live delegated work needs a
