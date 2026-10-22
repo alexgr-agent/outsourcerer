@@ -13,6 +13,12 @@ All notable changes to the Outsourcerer plugin are documented here.
 - **Ready-made flows and held decisions.** `council-build`, `spec-build` and `best-of-n` set up a whole plan in one line, and choices that belong to you wait as held steps.
 - **A model you exclude stays excluded.** `exclude add <model-or-family>` keeps it out of every pick: routing, advice, failover, second opinions, loops and plans. Fixes #45.
 
+### Fixed
+
+- **Isolated workers stay isolated.** A crew or plan worker that cannot get its own git worktree now stops instead of running in your checkout.
+- **Worker worktrees stay out of your `git status`.** The `.outsourcerer/` folder is added to the repo's local exclude list.
+- **"NOT-ARMED" says why.** When the supervision watcher fails to start, the message now carries the real reason.
+
 ## 0.13.6
 
 ### Fixed
