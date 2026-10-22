@@ -7,8 +7,8 @@ checked against a done contract, and code reaches your branch only through a ser
 Contents: when to use a plan · a first plan in six commands · lifecycle · how context flows · the done
 contract · held decisions · the merge gate · flows · crash recovery · the exclude list · where the flags live
 
-Every command below is `outsourcerer.sh <subcommand>`. Flag details live in the builders' CLI
-references, `references/factory-*-cli.md`. Lines marked `TODO-merge` are assumptions this guide makes
+Every command below is `outsourcerer.sh <subcommand>`. Flag details live in the CLI references,
+`references/factory-*-cli.md`. Lines marked `TODO-merge` are assumptions this guide makes
 about flag spelling that get checked against those files after integration.
 
 ## When to use a plan, and when not to
@@ -33,7 +33,6 @@ outsourcerer.sh task add "Review the diff for missed call sites" --shape scout -
 outsourcerer.sh plan run --max-parallel 2
 outsourcerer.sh land t2
 ```
-<!-- TODO-merge: confirm `plan new` takes --goal/--repo and `task add` takes --shape/--verb/--deps/--check/--spec/-m/--prompt exactly as written (see factory-tasks-cli.md). -->
 
 `plan run` starts t1, waits for it, hands its findings to t2, runs the test command on t2's branch,
 then starts t3. When everything is done it stops and prints a summary. `land t2` merges the change.
@@ -115,7 +114,6 @@ shape. Make that a task.
 outsourcerer.sh task hold t4 --reason "Pick the winning candidate"
 outsourcerer.sh task release t4 --answer "Use t2, it keeps the public API unchanged"
 ```
-<!-- TODO-merge: confirm `task hold --reason` / `task release --answer` spelling (factory-tasks-cli.md). -->
 
 A flow stage with `"hold": true` becomes a held task as soon as its deps finish. `plan run` raises a wake
 event when a task is held or fails, so an async orchestrator gets pinged (`OSRC_HEARTBEAT_WAKE`). The
@@ -227,8 +225,7 @@ so a new orchestrator sees it before it routes anything.
 ## Where the flags live
 
 - `references/factory-tasks-cli.md`: `plan` and `task` subcommands and the data model.
-  <!-- TODO-merge: file name assumed. -->
-- `references/factory-land-cli.md`: `land` and the done contract. <!-- TODO-merge: file name assumed. -->
+- `references/factory-land-cli.md`: `land` and the done contract.
 - `references/factory-flow-cli.md`: `plan run`, `flow`, and the flow JSON format.
   <!-- TODO-merge: file name assumed. -->
-- `exclude` is covered above and in `lanes-and-models.md`. <!-- TODO-merge: confirm Track A documents it there. -->
+- `exclude` is covered above and in `lanes-and-models.md`.

@@ -4,6 +4,16 @@ A plan is a durable task graph that lives outside the orchestrator's head, under
 `$OSRC_HOME/plans/<plan>/`. Each task is a JSON file; workers get everything they need from a
 generated brief, so the orchestrator never relays context by hand. Needs `jq`.
 
+## Contents
+
+- Plans
+- Tasks (`task add` options)
+- States
+- What `task start` does
+- The brief (context handoff)
+- Files
+- Example
+
 ## Plans
 
 | Command | What it does |
@@ -13,7 +23,7 @@ generated brief, so the orchestrator never relays context by hand. Needs `jq`.
 | `plan show [name] [--json]` | Four buckets: **Captain's Call** (held + failed, with the release/retry command), **Done** (done, landed, canceled), **Underway** (running, verifying, with job id), **Next** (ready, and blocked with the blocking task and its state named). Then a `Dependencies` list (`t3 <- t1, t2`). |
 | `plan use <name>` | Set the current plan (`$OSRC_HOME/plans/current`). |
 | `plan rm <name> [--force]` | Delete a plan's records. Refuses while a task is running or verifying unless `--force`. Never touches git worktrees or branches. |
-| `plan run ...` | Provided by factory-flow.sh (scheduler). Without it: a one-line "needs factory-flow.sh". |
+| `plan run ...` | The scheduler, provided by `factory-flow.sh`. If that script is missing, it stops with "plan run needs factory-flow.sh next to outsourcerer.sh". |
 
 Plan names: letters, digits, `.`, `-`, `_`, up to 64 characters, not `current`.
 
@@ -31,7 +41,7 @@ Every task command takes `--plan <name>`; without it the current plan is used.
 | `task brief <tid>` | Build and print the brief a worker would get (also saved to `tasks/<tid>/brief.md`). |
 | `task hold <tid> --reason "question" [--until "when"]` | Park a task for a human decision. Allowed from todo, verifying, failed (or re-hold). Raises a heartbeat wake event. |
 | `task release <tid> --answer "decision" [--done]` | Answer a held task. It returns to todo and the answer goes into its own brief and its dependents' briefs. `--done` closes it instead, with the answer as its result (for pure decision items like "pick the winning candidate"). |
-| `task done <tid> [--result "..."] [--force]` | Run the done check (track C's `_factory_done_check` when installed; otherwise a basic check: the job ended `done`/`done?` with a non-empty result). Passes through `verifying`; on failure the previous state is restored and the reason printed. On success a scout's output is copied to `report.md` and an empty result is filled with a short summary. `--force` marks done by hand without a check (also for tasks with no job). |
+| `task done <tid> [--result "..."] [--force]` | Run the done check (the done contract in `factory-land-cli.md` when `factory-land.sh` is present; otherwise a basic check: the job ended `done`/`done?` with a non-empty result). Passes through `verifying`; on failure the previous state is restored and the reason printed. On success a scout's output is copied to `report.md` and an empty result is filled with a short summary. `--force` marks done by hand without a check (also for tasks with no job). |
 | `task fail <tid> [--reason "..."]` | Mark failed (stops a live job). Dependents stay blocked. Raises a wake event. |
 | `task cancel <tid>` | Mark canceled (stops a live job). Dependents stay blocked. |
 | `task retry <tid>` | Failed or canceled back to todo; clears job, worktree, branch, base/head, evidence; keeps history (`jobs`, `attempts`, last `result`). The next brief carries an "Earlier attempt" section with that result. |

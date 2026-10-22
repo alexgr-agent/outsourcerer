@@ -4,6 +4,16 @@ The `advise` subcommand answers "which model should I use for this task?" with *
 guesses**. It classifies the task, scores every known model against live benchmark data, and
 recommends the best value model that meets the capability threshold.
 
+## Contents
+
+- Usage
+- How it works (classification, scoring, recommendation, graceful degradation)
+- Data source
+- Output format
+- Relationship to other subcommands
+- Limitations
+- How `advise` fits the orchestrator
+
 ## Usage
 
 ```
@@ -30,9 +40,9 @@ creative > simple. Default (no keyword hits): simple.
 
 **Task-shape rule (blended).** Before the tally, a prompt with at least one `code` hit AND two or
 more `agentic` hits classifies as **agentic**. "Edit X to fix the bug, run the test suite, verify"
-describes multi-step tool use (edit, run, observe, iterate), not one code operation; under
-most-hits-wins it tied 2:2 and code won the tie, so it was scored on `coding_index` and a
-reasoning-heavy model floated to #1 for a job that is all about turning tools quickly. The agentic
+describes multi-step tool use (edit, run, observe, iterate), not one code operation, so it is scored
+on `agentic_index`; otherwise a 2:2 tie goes to code and a reasoning-heavy model floats to #1 for a
+job that is all about turning tools quickly. The agentic
 keyword list carries the edit-run-verify signals for this: `run the tests`, `run the test suite`,
 `run tests`, `make the tests pass`, `verify the fix`, `iterate until`, `edit and run`,
 `fix and verify`, `then verify`.
@@ -64,7 +74,7 @@ For each model in the alias table (`OSRC_MODEL_TABLE`), the advisory:
    outweigh every adjustment. **Kimi K3's near-frontier adjustment (+20) is reasoning-shaped only:**
    it applies to a `hard` task in the `reasoning` category, never to `code`/`agentic` work. Kimi's
    edge is deep analysis; its long pure-reasoning bursts are the wrong shape for edit-run-verify,
-   where the old any-hard-task bump floated it to #1 (score 80) and cost two zero-write burns.
+   where they produce long stretches with no file writes.
 4. Calculates the **value ratio** = score / max(cost_per_m_input, 0.01). Free models (cost=0)
    are floored to $0.01/M so they rank high but don't dominate infinitely.
 5. Subscription lanes (cx/cc/dv/gm) have their price set to $0 BEFORE the value ratio
@@ -87,8 +97,7 @@ closest to the requested `--effort` wins (so at `--effort high`, `glm-5.3-flash-
 `OK (lighter sibling preferred)` and, in `--json`, carry `lighter_sibling_preferred: true` and
 leave the shortlist's top group. This is a shape rule, never a price (prices rot); on plan lanes
 the cost column is a flat "plan limits", so this weight is also the tiebreak between candidates
-with identical value ratios (proxy scores tie constantly), replacing the old table-order
-accident. Off at `--effort max`, when the task requires the frontier, or with
+with identical value ratios (proxy scores tie constantly). Off at `--effort max`, when the task requires the frontier, or with
 `OSRC_ADVISE_VARIANT_PREF=0`.
 
 Devin's GLM-5.3 family is in the table with Devin's real ids: `glm-5.3`/`glm-5-3` -> `glm-5-3`,
@@ -184,8 +193,9 @@ the cheapest option. Use `estimate` when you already know the model and want a c
 - **Keyword classification, not ML**: handles 90% of cases well but misses subtle distinctions
   (e.g. "write a test" is code not creative). Acceptable for v1, an ML classifier would add
   latency and cost for marginal gains.
-- **No verify-then-escalate**: the advisory recommends a model but doesn't verify the output
-  was good enough. Verification is a future feature.
+- **No output check**: `advise` recommends a model but doesn't verify the output was good
+  enough. When a machine check exists, `loop escalate` does that: cheap model first, a stronger
+  tier only when the check keeps failing (`loops.md`).
 - **Single data source**: OR benchmarks only. Multi-source (LMArena, CloudPrice) deferred to v2.
 - **Subscription lane cost is qualitative**: subscription models (cx/cc/dv/gm) show "$0 (plan)"
   because the user pays plan limits, not per-token. The value ratio treats them as free, which
@@ -195,6 +205,6 @@ the cheapest option. Use `estimate` when you already know the model and want a c
   On agentic tasks, unbenchmarked capable models therefore outrank benchmarked ones. A field-aware
   proxy is the fix; until then, `advise --refresh` (more live rows) narrows the gap.
 
-## How `advise` fits the orchestrator (moved from SKILL.md)
+## How `advise` fits the orchestrator
 
-When the user hasn't named a model, **always run `advise`** — it classifies the task, takes reasoning effort as a selection input, pulls live benchmark scores, and returns the best capable-tier value that clears the bar unless the work requires a frontier. The candidate pool is the curated table plus every benchmarked model in the live OpenRouter catalog, so a brand-new model is recommendable on merit the day it appears, no manual list update. The winning model then runs on its **cheapest available lane** across every provider that serves it (a free/plan lane you already pay for beats a per-token cash lane; the model itself is never downgraded) — set `OSRC_ADVISE_ROUTER=0` to keep it on the ranked lane. This is the model-selection brain in **every** mode; the mode only decides whether you ask first (auto-pilot: take the winner + proceed; you-drive/hybrid: present it and wait). Cheap ≠ dumb: `glm`/`hy3`/`deepseek`/`kimi` are `capable` tier (frontier capability, budget price) and get flagship-grade prompting. Details: `references/model-advisory.md`, `references/effort-and-tiers.md`.
+When the user hasn't named a model, **always run `advise`**: it classifies the task, takes reasoning effort as a selection input, pulls live benchmark scores, and returns the best capable-tier value that clears the bar unless the work requires a frontier. The candidate pool is the curated table plus every benchmarked model in the live OpenRouter catalog, so a brand-new model is recommendable on merit the day it appears, no manual list update. The winning model then runs on its **cheapest available lane** across every provider that serves it (a free/plan lane you already pay for beats a per-token cash lane; the model itself is never downgraded), set `OSRC_ADVISE_ROUTER=0` to keep it on the ranked lane. This is the model-selection brain in **every** mode; the mode only decides whether you ask first (auto-pilot: take the winner + proceed; you-drive/hybrid: present it and wait). Cheap ≠ dumb: `glm`/`hy3`/`deepseek`/`kimi` are `capable` tier (frontier capability, budget price) and get flagship-grade prompting. Tiers: `effort-and-tiers.md`.
