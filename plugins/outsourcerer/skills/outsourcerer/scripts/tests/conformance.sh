@@ -106,6 +106,7 @@ _ALL_SUITES="$_ALL_SUITES test_conformance_suite_timeout"
 _ALL_SUITES="$_ALL_SUITES test_timeout_capture"
 _ALL_SUITES="$_ALL_SUITES test_session_probe_sigpipe"
 _ALL_SUITES="$_ALL_SUITES test_exit_trap_chain"
+_ALL_SUITES="$_ALL_SUITES test_factory_exclude"
 # Per-suite wall-clock bound. A suite that wedges must fail the gate loudly and quickly, not park
 # it: without a bound a busy-spinning suite would hold the gate indefinitely. Default 600s,
 # override with OSRC_SUITE_TIMEOUT (seconds; 0 disables the bound; a non-numeric value falls

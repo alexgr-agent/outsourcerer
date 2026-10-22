@@ -60,6 +60,8 @@ Set it with `mode auto|manual|hybrid` (A/B/C accepted). The user re-steers anyti
 
 When the user hasn't named a model, **always run `advise`** — it classifies the task, takes reasoning effort as a selection input, pulls live benchmark scores, and returns the best capable-tier value that clears the bar unless the work requires a frontier. The candidate pool is the curated table plus every benchmarked model in the live OpenRouter catalog, so a brand-new model is recommendable on merit the day it appears, no manual list update. The winning model then runs on its **cheapest available lane** across every provider that serves it (a free/plan lane you already pay for beats a per-token cash lane; the model itself is never downgraded) — set `OSRC_ADVISE_ROUTER=0` to keep it on the ranked lane. This is the model-selection brain in **every** mode; the mode only decides whether you ask first (auto-pilot: take the winner + proceed; you-drive/hybrid: present it and wait). Cheap ≠ dumb: `glm`/`hy3`/`deepseek`/`kimi` are `capable` tier (frontier capability, budget price) and get flagship-grade prompting. Details: `references/model-advisory.md`, `references/effort-and-tiers.md`.
 
+Models on the user's exclude list (`brief` prints it; `exclude add|rm|ls`) are never picked and `-m` with one is refused: when the user says "never use X", run `exclude add X`. See `references/lanes-and-models.md`.
+
 ## The verbs (verb = permission mode)
 
 `run`/`explore` (read-only) · `research` (sandboxed exec, devin/codex) · `edit` (auto-accept edits) · `yolo` (all tools, no sandbox — sparingly). Wrap any verb in `bg` for supervised background work (poll `status`), or `fanout` for N parallel jobs.
