@@ -12435,6 +12435,11 @@ run_job() {
   # meta previously recorded only provider (the ORIGINAL provider, e.g. devin), which mislabels a
   # plan lane (gm/cx/cc) as a cash lane in the Tab. Persist the resolved lane so accounting is truthful.
   [ -n "$row" ] && { id2="${row%%|*}"; ttier="${row##*|}"; lane="$(printf '%s' "$row" | awk -F'|' '{print $2}')"; }
+  # An explicit model with no table row (e.g. a new gpt-6-* or claude-* id) is routed by family to
+  # its native lane; record that same lane, or the job is labelled as the OpenRouter cash lane.
+  if [ -z "$row" ] && [ "${MODEL_EXPLICIT:-0}" = "1" ] && [ -n "$MODEL" ]; then
+    local _jinf; _jinf="$(lane_from_name "$MODEL" 2>/dev/null)" && lane="$_jinf"
+  fi
   # Engine lanes (droid/cursor) own their model catalog: -m passes through verbatim, and with no -m
   # the ENGINE's configured default runs -- never our alias table's, so don't record it as such.
   case "$prov" in
