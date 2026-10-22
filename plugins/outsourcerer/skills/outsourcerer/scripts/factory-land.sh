@@ -35,6 +35,16 @@ _factory_job_ok() {
   return 1
 }
 
+# _factory_job_wait_reason <job-id> -> one plain line explaining why the job does not count as finished.
+_factory_job_wait_reason() {
+  local st; st="$(_factory_job_status "$1" | grep . || echo missing)"
+  case "$st" in
+    running|launching|working|stalled*|verifying)
+      printf 'worker job %s is still running (status: %s); wait for it with: outsourcerer wait %s' "$1" "$st" "$1" ;;
+    *) printf 'worker job %s has not finished successfully (status: %s); retry the task or read: outsourcerer explain %s' "$1" "$st" "$1" ;;
+  esac
+}
+
 # _factory_scan_range <dir> <base> <head> -> rc0 = a live secret is in the base..head diff (block),
 # rc1 = clean, rc2 = the diff could not be read (callers fail closed). Same hardening as
 # _crew_scan_staged: --text/--no-ext-diff/--no-textconv defeat a planted .gitattributes, and the diff
@@ -70,8 +80,7 @@ _factory_gate_ship() {
   _FG_BASE="$base"; _FG_CHECK="$check"
   if [ -z "$job" ]; then _FG_REASON="no worker job is on record for this work yet; start it first"; return 1; fi
   if ! _factory_job_ok "$job"; then
-    st="$(_factory_job_status "$job")"
-    _FG_REASON="worker job $job has not finished successfully (status: ${st:-missing}); wait for it or retry"
+    _FG_REASON="$(_factory_job_wait_reason "$job")"
     return 1
   fi
   if [ -z "$wt" ]; then _FG_REASON="no worktree is on record (ship work must run in its own worktree)"; return 1; fi
@@ -166,7 +175,7 @@ _factory_done_check() {
     local res="" src=""
     if [ -z "$job" ]; then reason="no worker job is on record for this task yet; start it first"
     elif ! _factory_job_ok "$job"; then
-      reason="worker job $job has not finished successfully (status: $(_factory_job_status "$job" | grep . || echo missing)); wait for it or retry"
+      reason="$(_factory_job_wait_reason "$job")"
     else
       if [ -s "$OSRC_JOBS/$job/last.txt" ]; then src="$OSRC_JOBS/$job/last.txt"
       elif [ -s "$OSRC_JOBS/$job/out.log" ]; then src="$OSRC_JOBS/$job/out.log"; fi

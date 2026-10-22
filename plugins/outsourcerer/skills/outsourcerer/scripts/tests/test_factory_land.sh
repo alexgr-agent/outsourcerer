@@ -106,7 +106,7 @@ out="$(drv _factory_done_check p t6)"; rc=$?
   && ok "ship: failing check -> refused, rc in evidence" || bad "ship check fail (rc=$rc out=$out)"
 echo "running" > "$ST/jobs/j-t6/status"
 out="$(drv _factory_done_check p t6)"; rc=$?
-[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'not finished' && ok "ship: unfinished job -> refused" || bad "ship unfinished job (rc=$rc out=$out)"
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'still running' && ok "ship: unfinished job -> refused" || bad "ship unfinished job (rc=$rc out=$out)"
 
 mk_task t7 ship "true"
 commit_in t7 cfg.txt "token=gh""p_$(printf 'A%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30)"
