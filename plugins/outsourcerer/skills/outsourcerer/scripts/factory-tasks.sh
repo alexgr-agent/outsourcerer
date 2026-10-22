@@ -212,9 +212,10 @@ _plan_unlock() {
   [ "$_FACTORY_LOCK_DEPTH" -gt 0 ] && return 0
   lock="$(_plan_dir "$plan")/.lock"
   # Only remove the lock if it is still ours: if a waiter wrongly broke it and someone else now holds
-  # the path, removing it would let a third writer in.
+  # the path, removing it would let a third writer in. No owner record at all means our own publish
+  # failed (disk full), so the lock is still ours to remove.
   { IFS= read -r cur < "$lock/owner"; } 2>/dev/null || cur=""
-  if [ -z "$_FACTORY_LOCK_OWNER" ] || [ "$cur" = "$_FACTORY_LOCK_OWNER" ]; then
+  if [ -z "$_FACTORY_LOCK_OWNER" ] || [ -z "$cur" ] || [ "$cur" = "$_FACTORY_LOCK_OWNER" ]; then
     rm -f "$lock/owner" "$lock"/owner.* 2>/dev/null
     rmdir "$lock" 2>/dev/null || true
   fi
@@ -387,8 +388,8 @@ _task_new() {
     return 1
   fi
   now="$(_factory_now)"
-  task="$(jq -cn --arg id "$tid" --arg plan "$plan" --arg now "$now" --argjson f "$fields" --argjson prot "$_FACTORY_TASK_PROTECTED" '
-    {schema:1,id:$id,plan:$plan,title:"",shape:"scout",state:"todo",deps:[],prompt:"",spec:"",check:"",
+  task="$(printf '%s' "$fields" | jq -c --arg id "$tid" --arg plan "$plan" --arg now "$now" --argjson prot "$_FACTORY_TASK_PROTECTED" '
+    . as $f | {schema:1,id:$id,plan:$plan,title:"",shape:"scout",state:"todo",deps:[],prompt:"",spec:"",check:"",
      verb:"",model:"",provider:"",deliver:"local",retries:1,attempts:0,job:"",jobs:[],
      worktree:"",branch:"",base_sha:"",head_sha:"",hold:{reason:"",until:"",answer:""},
      result:"",evidence:"",flow:{name:"",stage:""},created:$now,updated:$now}
@@ -636,16 +637,15 @@ _task_dispatch_fail() {
 # first. The brief itself can be large (spec, dependency results), and a command line cannot: Linux
 # caps one argument at 128KB and Windows a whole command line at 32,767 characters.
 _task_worker_prompt() {
-  local plan="$1" tid="$2" brief="$3" t pj
-  t="$(_task_get "$plan" "$tid" 2>/dev/null)" || t='{}'
-  pj="$(jq -c . "$(_plan_dir "$plan")/plan.json" 2>/dev/null)" || pj='{}'
-  jq -rn --argjson t "$t" --argjson p "$pj" --arg ref "$plan/$tid" --arg brief "$brief" '
-    def line(n): (. // "" | tostring | split("\n") | map(select(test("\\S"))) | (.[0] // "") | if length > n then .[0:n] + "..." else . end);
-    "Task \($ref): \($t.title | line(200))",
-    (($p.goal | line(300)) as $g | if $g != "" then "Plan goal: \($g)" else empty end),
-    "",
-    "Before anything else, read your full brief: \($brief)",
-    "It is the whole assignment: the task, the spec, the rules for when you are done, and the results of earlier work you build on. Follow it exactly."'
+  local plan="$1" tid="$2" brief="$3" title goal
+  # Task and plan JSON go through stdin, never jq's own argv (a huge prompt would hit the same limit).
+  local firstline='def line(n): (. // "" | tostring | split("\n") | map(select(test("\\S"))) | (.[0] // "") | if length > n then .[0:n] + "..." else . end);'
+  title="$(_task_get "$plan" "$tid" 2>/dev/null | jq -r "$firstline .title | line(200)" 2>/dev/null)"
+  goal="$(jq -r "$firstline .goal | line(300)" "$(_plan_dir "$plan")/plan.json" 2>/dev/null)"
+  printf 'Task %s/%s: %s\n' "$plan" "$tid" "$title"
+  [ -n "$goal" ] && printf 'Plan goal: %s\n' "$goal"
+  printf '\nBefore anything else, read your full brief: %s\n' "$brief"
+  printf 'It is the whole assignment: the task, the spec, the rules for when you are done, and the results of earlier work you build on. Follow it exactly.\n'
 }
 
 # _task_dispatch <plan> <tid> -> claim, brief, launch. Prints the job id; rc1 with a reason if the
@@ -1040,10 +1040,11 @@ _task_cli_add() {
   fi
   local d; deps="$(printf '%s' "$deps" | tr ', ' '\n\n' | sed '/^$/d')"
   for d in $deps; do _task_id_ok "$d" || die "task add: '$d' is not a task id (they look like t1, t2)."; done
-  fields="$(jq -cn --arg title "$title" --arg prompt "$prompt" --arg shape "$shape" --arg deps "$deps" --arg spec "$spec" \
+  # The prompt (possibly a large --prompt-file) goes through stdin, not jq's argv.
+  fields="$(printf '%s' "$prompt" | jq -Rsc --arg title "$title" --arg shape "$shape" --arg deps "$deps" --arg spec "$spec" \
     --arg check "$check" --arg verb "$verb" --arg model "$model" --arg provider "$provider" --arg deliver "$deliver" \
     --argjson retries "$retries" --arg hold "$hold" --arg flow "$flow" --arg stage "$stage" '
-    {title:$title,prompt:$prompt,shape:$shape,
+    . as $prompt | {title:$title,prompt:$prompt,shape:$shape,
      deps:($deps | split("\n") | map(select(. != "")) | reduce .[] as $d ([]; if any(.[]; . == $d) then . else . + [$d] end)),
      spec:$spec,check:$check,verb:$verb,model:$model,provider:$provider,deliver:$deliver,retries:$retries,
      flow:{name:$flow,stage:$stage}}
