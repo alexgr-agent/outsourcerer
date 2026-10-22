@@ -100,9 +100,11 @@ outsourcerer loop escalate [-m <cheap>] [--ladder "m1,m2,m3"] --check "npm test"
 outsourcerer loop resume <loop-id> [--max N]
 ```
 
-Picks up a `verify` loop that ended `blocked`, `max_turns`, or `max_time`, keeping its task, check,
-model, verb, time bound, worktree, and accumulated failure feedback. Only the attempt ceiling can be
-raised. A loop that already succeeded is refused.
+Picks up a `verify` loop that ended `blocked`, `max_turns`, or `max_time`, using its saved task, check,
+model, verb, time bound, worktree, and accumulated failure feedback. Use only the loop id and optional
+`--max N` (which must raise the attempt ceiling). A loop that already succeeded is refused.
+The current parser still accepts positional replacement task text, including after `--`; avoid it,
+because that changes the task while retaining the old check and feedback.
 
 ## Recipes you drive (no engine, just compose the verbs)
 

@@ -7,15 +7,15 @@ All notable changes to the Outsourcerer plugin are documented here.
 ### Added
 
 - **Software factory.** Plan multi-step work as a task graph on disk (`plan`, `task`, `plan run`). It survives the session, runs ready steps in parallel, and picks up where it left off after a crash.
-- **Context travels between workers.** Every task gets a brief with its spec, the results of the tasks it depends on, and any decision you made, so no worker starts blind.
-- **"Done" is proven, not claimed.** Code tasks need real commits on a named branch, a passing check and a clean secret scan; research tasks need a report. Every verdict is saved as evidence.
-- **A merge gate that never clobbers.** `land` merges one change at a time per repo, re-runs the check on the merged result, and leaves your checkout alone. `--pr` opens a pull request when you ask for one.
+- **Context travels between workers.** Every task gets a brief with its supplied spec, bounded results from direct dependencies, and decisions on those dependencies or its own task.
+- **A recorded done contract.** Code tasks need real commits on a named branch, a passing check when configured, and a clean secret scan; research tasks need a report and skip shell checks. Checks are optional. Every verdict is saved as evidence.
+- **A merge gate that protects local changes.** `land` merges one change at a time per repo and re-runs configured checks on the merged result. It can advance a clean target checkout. `--pr` or task `--deliver pr` requests a pull request; `--deliver branch` records verified branch delivery without merging.
 - **Ready-made flows and held decisions.** `council-build`, `spec-build` and `best-of-n` set up a whole plan in one line, and choices that belong to you wait as held steps.
-- **A model you exclude stays excluded.** `exclude add <model-or-family>` keeps it out of every pick: routing, advice, failover, second opinions, loops and plans. Fixes #45.
+- **Persistent model exclusions.** `exclude add <model-or-family>` filters matching visible choices in routing, advice, failover, second opinions, loops and plans. Unobservable engine defaults and automatic image-backend selection are outside this guarantee. Fixes #45.
 
 ### Fixed
 
-- **Isolated workers stay isolated.** A crew or plan worker that cannot get its own git worktree now stops instead of running in your checkout.
+- **Required worktrees fail closed.** A crew or plan worker that cannot get its own git worktree now stops instead of running in your checkout. Worktrees isolate files, not permissions: an unsandboxed worker retains your user's rights. Use sandboxed verbs and lanes for untrusted work.
 - **Worker worktrees stay out of your `git status`.** The `.outsourcerer/` folder is added to the repo's local exclude list.
 - **"NOT-ARMED" says why.** When the supervision watcher fails to start, the message now carries the real reason.
 

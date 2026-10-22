@@ -2,7 +2,7 @@
 
 Source: `scripts/factory-flow.sh`. Tests: `scripts/tests/test_factory_flow.sh`.
 
-## `plan run [plan] [--max-parallel N] [--once] [--interval S] [--auto-land] [--max-minutes M] [--setup CMD]`
+## `plan run [plan | --plan name] [--max-parallel N] [--once] [--interval S] [--auto-land] [--max-minutes M] [--setup CMD]`
 
 Drives a plan until it is finished or needs you. Each pass ("tick") does two things:
 
@@ -14,7 +14,9 @@ Drives a plan until it is finished or needs you. Each pass ("tick") does two thi
      (default 900) counts as failed, so nothing waits forever.
    - Job finished well: the pass that moves the task running -> verifying runs the done check (`land`'s done
      contract); a task someone else is checking (a `task done`, another driver) is left to them unless that checker
-     is gone or its claim is older than `OSRC_FACTORY_VERIFY_STALE_SECS` (default 900). Pass = done. Fail = counts as a failed attempt.
+     is provably dead (including a process-identity mismatch) OR its `verifying_at` timestamp (epoch seconds) is older
+     than `OSRC_FACTORY_VERIFY_STALE_SECS` (default 900). Ownership is recorded as `verifying_pid`,
+     `verifying_start` and `verifying_at`, and cleared when verification ends. Pass = done. Fail = counts as a failed attempt.
    - Job failed (or its worker died): if attempts remain (`retries`, default 1), the task is reset the way
      `task retry` does it and `.result` becomes "previous attempt failed because ...", which the next brief shows
      under "Earlier attempt". Otherwise the task is failed with the reason (the task store wakes the heartbeat).
@@ -36,22 +38,25 @@ It stops with one plain line saying why:
 
 | exit | meaning |
 |---|---|
-| 0 | everything is done (or the plan has no tasks) |
-| 3 | needs you: something is held or failed and nothing else can move (the line lists held, failed, and what waits on what) |
+| 0 | all tasks are done or canceled, with no unresolved landing error; also an empty plan |
+| 3 | nothing else can move: held or failed tasks, blocked dependencies, or landing errors need attention |
 | 2 | time cap (`--max-minutes`, default 240) reached; running jobs keep going, run `plan run` again to resume |
-| 124 | `--once` finished its single pass with work still underway |
+| 124 | `--once` finished its single pass with work remaining, including ready tasks even if no job is running |
 | 4 | another `plan run` is already driving this plan (nothing was done) |
 | 1 | error |
 
 - `--once`: one pass, for the heartbeat or an orchestrator turn.
+- `--interval`: seconds between passes, default 30. `--max-parallel`, `--interval` and
+  `--max-minutes` require positive whole numbers.
 - `--auto-land`: land each plain build (ship) task through the merge gate as soon as it is done. Builds made by a
   flow are never auto-landed: the flow's own land stage lands them after their review (council-build), or the
-  captain lands the winner after the pick (best-of-n). A failed auto-land never undoes the build: it stays done,
-  the reason goes in `land_error`, a wake is sent, and the stop line lists `land tX --plan p`.
+  captain lands the winner after the pick (best-of-n). A failed or conflicted auto-land preserves
+  the build's state: a done build stays done. The reason goes in `land_error` with `land_error_at`,
+  a wake is sent, and the stop line lists `land tX --plan p`. Cancellation or a separate hold still wins.
 - `--setup CMD`: the default command `land` runs in the clean merged checkout before the check (for example
   `npm ci`). A land stage's own `setup`, then the build task's `setup`, win over it. Passed only to a `land` that
-  supports `--setup`. A failed land never changes the build's state from here: if `land` holds it (merge
-  conflict), it stays held with land's reason.
+  supports `--setup`. A failed land records a separate landing error; a flow's land stage may be held
+  while the build stays done.
 - Only one `plan run` can drive a plan at a time (lock at `plans/<plan>/run.lock`). A lock left by a crashed run is
   taken over automatically, under a second guard lock and only if its owner record is unchanged, so a slow taker
   never removes a fresh lock. A run that cannot record itself as the owner (disk full) refuses to start.
@@ -105,20 +110,27 @@ excluded the task gets no model and the router picks (which also respects the li
 - `deps` name earlier stages only (no cycles). A dep on a repeated stage means every copy.
 - `repeat` (1-10) makes copies `<id>-1..N`; `{{i}}` is the copy number, `{{n}}` the count; `models` rotates per copy.
 - `hold: true`: a decision for the captain. Created as todo with `hold_after_deps: true`; once its deps are done the
-  scheduler holds it and wakes you. Answer with `task release <tid> --answer "<decision>"`. With no prompt it is a pure gate
-  (stored as `gate: true`): it completes with your answer as its result (`task release --done` closes it at once). With a prompt, a worker runs with your answer in its brief.
-- `verdict: true`: a reviewer. The LAST non-empty line of its job's `last.txt` must be exactly `VERDICT: PASS` or
-  `VERDICT: FAIL - <reason>` (no markup; `out.log` is never read). Anything else (no verdict, a fenced or quoted
-  verdict, an echoed template, a PASS that also says FAIL, a PASS after an earlier FAIL line) holds the reviewer for you.
+  scheduler holds it and wakes you. Answer with `task release <tid> --plan p --answer "<decision>"`. With no prompt it is a pure gate
+  (stored as `gate: true`): it completes with your answer as its result (`task release <tid> --plan p --answer "<decision>" --done` closes it at once). With a prompt, a worker runs with your answer in its brief.
+- `verdict: true`: a reviewer. Trailing blank lines and `OSRC::DONE`, `OSRC::BLOCKED` or
+  `OSRC::PROGRESS` marker lines are stripped from its job's `last.txt`. The last remaining line
+  must match `^VERDICT: (PASS|FAIL)( - .*)?$`: bare PASS or FAIL, each optionally followed by
+  ` - <reason>`. Put it outside code fences and before the required completion marker.
+  `out.log` is never read. Missing, quoted, fenced (including an unclosed fence), or contradictory
+  verdicts are ambiguous and hold the reviewer for you. A line containing both PASS and FAIL is ambiguous.
   - FAIL: the build it reviewed (its one ship dependency) goes back in line with the reviewer's reason in its brief
     (and its previous branch to start from), counted against that build's `retries`; then the review runs again.
+  - A reviewer records the build revision in `reviewed_head`. Changing the build's `head_sha`
+    resets that reviewer to todo; an approval of the old revision cannot authorize the new one.
   - Budget used up (or no single build to redo): the reviewer is held with the commands:
     accept anyway `task done tV --force --plan p`, one more redo `task release tV --answer "<what to fix>" --plan p`
     (your answer goes into the build's brief), or stop `task cancel tV --plan p`.
 - `land: "<stage>"`: no worker runs; when its deps are done the scheduler lands that stage's task through `land`.
   The target must be one non-repeated build (ship) stage, landed by only this stage. Each try is counted
-  (`land_attempts`); a failed land holds the stage with the commands (`task release tL --answer "land again"`, or land
-  by hand and `task done tL --force`). A land interrupted mid-way is tried again up to `retries + 1` times, then held.
+  (`land_attempts`); a failed land holds the stage. Resolve the build's landing error first, then
+  `task release tL --plan p --answer "land again"`, or land by hand with `land tB --plan p` and
+  `task done tL --plan p --force`. If the build itself is held, resolve and release it before the land
+  stage. A land interrupted mid-way is tried again up to `retries + 1` times, then held.
 
 Validation fails closed: a stage that is not an object, deps that are not a list, a non-text prompt/model/check, a
 bad `retries` (0-10), a land stage that also holds/reviews/repeats, a hold+verdict stage with no prompt, or a flow
@@ -133,6 +145,7 @@ all active plans; a plan whose finished marker is newer than its tasks is not ev
 ## Extra task fields (written by flows, kept by the task store)
 
 `hold_after_deps`, `gate`, `land_target`, `require_verdict`, `fallback`, plus the scheduler's own bookkeeping
-(`verdict_failed`, `prompt_orig`, `attempt_base`, `land_attempts`, `land_started_at`, `land_error`, `verifying_at`,
-`verifying_pid`); it reads the task store's `claimed_at` and `launch_failed` when present. Tasks are created through the task store's
+(`verdict_failed`, `reviewed_head`, `prompt_orig`, `attempt_base`, `land_attempts`, `land_started_at`,
+`land_error`, `land_error_at`, `verifying_at`, `verifying_pid`, `verifying_start`); it reads the task store's
+`claimed_at`, `attempt_token` and `launch_failed` when present. Tasks are created through the task store's
 `_task_new`, in stage order (deps always exist first). See the header of `factory-flow.sh`.

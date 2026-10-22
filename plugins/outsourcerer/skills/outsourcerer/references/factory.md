@@ -1,15 +1,18 @@
 # The software factory (plans, tasks, flows, landing)
 
 For the user and for the orchestrating agent. A plan is a task graph kept on disk, outside anyone's
-head. Workers pick up ready tasks, each one gets a brief with everything it needs, finished work is
-checked against a done contract, and code reaches your branch only through a serialized merge gate.
+head. Workers pick up ready tasks, each one gets a bounded brief, finished work is
+checked against a done contract, and `land` delivers it through a serialized merge gate.
 
 Contents: when to use a plan · a first plan in six commands · lifecycle · how context flows · the done
 contract · held decisions · the merge gate · flows · crash recovery · the exclude list · where the flags live
 
 Every command below is `outsourcerer.sh <subcommand>`. Flag details live in the CLI references,
-`references/factory-*-cli.md`. Lines marked `TODO-merge` are assumptions this guide makes
-about flag spelling that get checked against those files after integration.
+`references/factory-*-cli.md`.
+
+Worktrees isolate files, **not security permissions**. A worker on a lane without an OS sandbox
+runs with your user's rights, including access outside its worktree and to shared Git state.
+For untrusted work, use sandboxed verbs and lanes; a worktree alone is not a security sandbox.
 
 ## When to use a plan, and when not to
 
@@ -69,23 +72,26 @@ Each tick prints four buckets: **Captain's Call** (held or failed, needs you), *
 ## How context flows
 
 Every task gets a `brief.md`, written just before it starts and saved at
-`$OSRC_HOME/plans/<plan>/tasks/<tid>/brief.md`. The brief is the whole hand-off. A worker sees the brief
-and the repo, nothing else, so the brief is built to be complete and bounded:
+`$OSRC_HOME/plans/<plan>/tasks/<tid>/brief.md`. It carries the task handoff in addition to the
+repo and the lane's normal instructions. Briefs up to 16,384 bytes are inlined by default
+(`OSRC_BRIEF_INLINE_MAX`); larger briefs are passed by file path, which the worker must be able to read:
 
 1. the plan goal, one line at the top;
 2. the task prompt;
 3. **Spec**: the spec file's contents (or its path, if it is over 64KB);
 4. **Done when**: the check command and the rules for its shape;
-5. **Inputs from finished work**: for each direct dep, its title, a trimmed result summary (about 4KB
-   each), its branch and head commit if it shipped code, and the path to its full report;
-6. **Decision from the captain**: the answer given when a hold was released, if any.
+5. **Inputs from finished work**: up to 12 direct deps by default (`OSRC_BRIEF_MAX_DEPS`), each with
+   a result summary capped at 2,000 characters, output capped at 4,000 characters, its branch and
+   head commit if it shipped code, a full-report path, and any answer on that dependency;
+6. **Decision from the captain**: this task's own released-hold answer, if any.
 
 The repo is the shared memory. Ship tasks leave commits on named branches, scout tasks leave reports
 under the plan folder, and the next brief points at both. Nothing depends on the orchestrator
 remembering what happened three tasks ago.
 
-A good habit for larger work: a spec scout writes `SPEC.md`, a plan scout turns it into steps, and each
-build task gets `--spec` pointing at the file. The `spec-build` flow does exactly that.
+`spec-build` passes the spec scout's report to the plan scout, then both reports to the builder
+through dependency briefs. Its scouts do not edit files; it neither creates `SPEC.md` nor sets
+`--spec`. If you already have a spec file, attach it to a manually added task with `--spec`.
 
 ## The done contract
 
@@ -93,7 +99,7 @@ A worker saying "done" is a claim. The factory checks it and writes the verdict 
 `tasks/<tid>/evidence.json`.
 
 - **Scout:** the job finished cleanly and produced a non-empty result. The result is copied to
-  `tasks/<tid>/report.md`. A scout never needs commits.
+  `tasks/<tid>/report.md`. A scout never needs commits and does not run its shell `check`.
 - **Ship:** all of these, or it is not done:
   - the job finished cleanly;
   - the task branch has at least one commit beyond where it started;
@@ -118,7 +124,8 @@ outsourcerer.sh task release t4 --answer "Use t2, it keeps the public API unchan
 
 A flow stage with `"hold": true` becomes a held task as soon as its deps finish. `plan run` raises a wake
 event when a task is held or fails, so an async orchestrator gets pinged (`OSRC_HEARTBEAT_WAKE`). The
-answer lands in every downstream brief under "Decision from the captain".
+answer appears in the released task's own "Decision from the captain" section, and in its direct
+dependents' "Inputs from finished work". It is not automatically copied to every later task.
 
 For the orchestrating agent: a decision you are allowed to make is not a hold. Holds are for the three
 escalations in SKILL.md (direction forks, real cash, irreversible outside actions) and for anything the
@@ -139,15 +146,16 @@ What it does, in order:
 2. Takes the repo's merge lock, so lands into one repo happen one at a time. This lock is the queue.
 3. Builds a fresh integration worktree at the target's tip and merges the task branch there (no
    fast-forward, message `land(<plan>/<tid>): <title>`).
-4. Re-runs the check on the merged result. Two branches can each pass alone and break together; this
+4. Re-runs the check, when configured, on the merged result. Two branches can each pass alone and break together; this
    step catches that.
 5. Green: moves the target forward and records the evidence. It only does that when your checkout of
    the target is clean or the target is not checked out at all. It never overwrites your work.
-6. Red: aborts, leaves the target untouched, marks the task failed with "merge breaks check", and
-   raises a wake event.
+6. Red or conflicted: leaves the target untouched, records `land_error` and `land_error_at`, and
+   keeps the build's state (a done build stays done). Resolve the reported issue before retrying land.
 
-Nothing is pushed to a remote unless you pass `--pr`. `land` also accepts a plain job id for work
-started outside a plan.
+Remote publication requires `--pr` or a task created with `--deliver pr`. Task `--deliver branch`
+verifies and records branch delivery without merging; `local` uses the merge path above.
+`land` also accepts a plain job id for work started outside a plan.
 
 ## Flows
 
@@ -161,13 +169,13 @@ outsourcerer.sh flow show council-build
 
 **council-build**: two advisors on different frontier models argue the approach, a third scout
 synthesizes the plan, a build task ships it against your check, a fidelity review compares the result to
-the plan, then you land it. Use it when the plan is the risky part.
+the plan, then the scheduler's land stage lands it automatically. Use it when the plan is the risky part.
 
 ```
 outsourcerer.sh plan new rate-limit --repo .
-outsourcerer.sh flow run council-build --var goal="Add per-user rate limiting to the API" \
+outsourcerer.sh flow run council-build --plan rate-limit --var goal="Add per-user rate limiting to the API" \
     --var check="make test"
-outsourcerer.sh plan run
+outsourcerer.sh plan run --plan rate-limit
 ```
 
 **spec-build**: spec scout, then plan scout, then a ship task, then a verify scout. Use it when the work
@@ -186,8 +194,8 @@ pick the winner. Use it when there is no single right answer and comparing is ea
 outsourcerer.sh flow run best-of-n --plan onboarding-copy \
     --var goal="Rewrite the onboarding screen copy" --var n=3
 outsourcerer.sh plan run onboarding-copy
-outsourcerer.sh task release t5 --answer "Candidate 2"
-outsourcerer.sh land t3
+outsourcerer.sh task release t5 --plan onboarding-copy --answer "Candidate 2" --done
+outsourcerer.sh land t2 --plan onboarding-copy
 ```
 With `n=3` the plan gets t1 to t3 (candidates), t4 (compare) and t5 (your pick).
 
@@ -197,8 +205,8 @@ Flows are plain JSON (`name`, `description`, `vars`, and `stages` with `id`, `ti
 ## Crash recovery
 
 All plan state is on disk under `$OSRC_HOME/plans/<plan>/`: `plan.json`, one JSON file per task, each
-task's brief, evidence and report, and an append-only `events.jsonl`. Writes are atomic and every change
-happens under the plan lock.
+task's brief, evidence and report, and an append-only `events.jsonl`. Task JSON updates are atomic
+and serialized under the plan lock; briefs, reports and logs are separate artifacts.
 
 If the orchestrator session dies, the laptop sleeps, or `plan run` gets killed: run `plan run` again. It
 reconciles first. Tasks whose jobs finished while nobody was looking get checked against the done
@@ -218,12 +226,19 @@ A model you exclude stays excluded across sessions. The list lives at `$OSRC_HOM
 `OSRC_EXCLUDE_MODELS` environment variable adds to it for one shell. Entries can be an alias, an exact id
 or a family: `fable` covers `claude-fable-5`, `claude-fable-5-1` and `anthropic/claude-5-fable`.
 
-It applies everywhere a model gets chosen: an explicit `-m` (refused, with a line saying how to undo it),
+It filters visible text-model choices: an explicit `-m` (refused, with a line saying how to undo it),
 `advise`, failover, OpenRouter escalation, `second-opinion` (it falls back to the next allowed premium
 model), loops, crews, fanout, sessions, and plan tasks. `brief` prints the list at every session start,
 so a new orchestrator sees it before it routes anything.
 
+Unobservable engine defaults without `-m` and automatic image-backend selection are outside this
+guarantee. Excluding an old version does not necessarily exclude its bare family alias; exclude the
+family itself to block all its versions. Exact matching rules: `references/lanes-and-models.md`.
+
 ## Where the flags live
+
+The top-level help currently omits the factory commands. They are available; use these CLI
+references for their syntax, plus `plan run --help`, `flow --help` and `land --help`.
 
 - `references/factory-tasks-cli.md`: `plan` and `task` subcommands and the data model.
 - `references/factory-land-cli.md`: `land` and the done contract.
