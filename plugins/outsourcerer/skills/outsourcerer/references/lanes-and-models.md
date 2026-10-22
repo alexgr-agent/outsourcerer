@@ -338,31 +338,69 @@ outsourcerer.sh exclude clear              # drop the saved list
 
 `OSRC_EXCLUDE_MODELS="fable,gpt-5.6-*"` adds entries for one shell or CI, on top of the saved list.
 
-**What an entry matches** (case-insensitive):
-- a **family word** covers every id that contains it as a word: `fable` matches `fable`,
-  `claude-fable-5`, `claude-fable-5-1`, `anthropic/claude-5-fable`, `claude-fable-5-1[1m]`;
+**What an entry matches** (case-insensitive). Every name is compared in its canonical form, so the
+same model matches however it is spelled: alias, exact id, provider-prefixed id (`anthropic/`, `z-ai/`,
+`openai/`), dotted or dashed version (`glm-5.2` = `glm-5-2`), a `[1m]` suffix, an effort suffix
+(`-high`, `-max`, `-preview`) or a date stamp (`-20251001`).
+- a **family word** covers every model of that family: `fable` matches `fable`, `claude-fable-5`,
+  `claude-fable-5-1`, `anthropic/claude-5-fable`, `claude-fable-5-1[1m]`; `claude` covers every
+  Claude family (fable, opus, sonnet, haiku);
 - an **alias** also matches what it resolves to (`sol` matches `gpt-5.6-sol`, `glm` matches `z-ai/glm-5.2`);
-- an **exact id** covers its point releases (`claude-fable-5` matches `claude-fable-5-1`, not `opus`);
-- a **glob** (`gpt-5.6-*`) is matched against the name and its resolved id;
-- an entry with no letters (`5`) is refused, so a typo can never exclude half the catalog.
+- an **exact id** covers that model in every spelling (`claude-fable-5` matches
+  `anthropic/claude-5-fable` and Devin's `claude-fable-5-high`), but **not** a different release or
+  size: `claude-sonnet-5` leaves `claude-sonnet-5-5` allowed, `gpt-5.5` leaves `gpt-5.5-mini` allowed,
+  `gemini-flash` leaves `gemini-flash-lite` allowed. To cover point releases use a glob
+  (`claude-fable-5*`) or the family word;
+- a **bare family alias** (`fable`, `opus`, `sonnet`, `haiku`, `gemini-pro`, `gemini-flash`) runs
+  whatever is newest in that family, so excluding **any** version of the family also refuses the bare
+  alias: `exclude add claude-fable-5` refuses `-m fable`. Name the exact version you want instead;
+- a **glob** (`gpt-5.6-*`; only `*` and `?` are wildcards) is matched against the name, its resolved
+  id and its canonical form;
+- short family words reach further than they look: `pro` also matches `deepseek-v4-pro`, `flash`
+  matches `glm-5.3-flash`. `exclude add` prints every known model the entry covers, so check that line;
+- an entry with no letters (`5`) is refused, so a typo can never exclude half the catalog;
+- an entry that is not a valid model name (only a hand-edited file or `OSRC_EXCLUDE_MODELS` can hold
+  one, `exclude add` rejects it) **fails closed**: every model counts as excluded, with a warning
+  naming the entry, until you fix or remove it. A matcher failure fails closed the same way.
 
 **Where it is enforced.** An explicit `-m` naming an excluded model is refused with one line naming
 the fix, on every verb (`run`/`explore`/`research`/`edit`/`yolo`/`bg`/`fanout` incl. `--route` and
 agent frontmatter/`crew`/`loop verify`/`loop escalate` incl. `--ladder`/`second-opinion -m a,b`/
-`continue`/`session start`/`session model`). Automatic choices skip it: `advise` (text and `--json`
-recommendation + shortlist), the transport fallback shortlist, cross-harness failover, the OpenRouter
-chain (`OR_OFFLOAD_CHAIN`), the `second-opinion` default pair and premium judge (an excluded judge
-falls back to the next allowed one: opus, terra, gemini-pro, sol, and says so), the `loop escalate`
-default ladder (the rung is dropped out loud), `suggest`/`deals` listings, fleet session naming, and the
-`doctor` ping probes. A provider whose built-in default is excluded (e.g. `--provider devin` with
-`glm` excluded) is refused with the fix rather than run. When everything a request could use is
-excluded, it stops with a clear message; it never quietly runs an excluded model.
+`continue`/`session start`/`session model`/`task add -m`). The id an alias **resolves to** is checked
+again just before launch: Devin's live catalog (`-m claude` resolving to a Fable id is refused), the
+Gemini family pick (`-m gemini-pro` resolving to an excluded dated id), and the droid/warp alias maps.
+Automatic choices skip it: `advise` (text and `--json` recommendation + shortlist), the transport
+fallback shortlist, cross-harness failover, the OpenRouter chain (`OR_OFFLOAD_CHAIN`), the
+`second-opinion` default pair (a swap never picks a model that resolves to the other one) and premium
+judge (an excluded judge falls back to the next allowed one: opus, terra, gemini-pro, sol, and says
+so), the `loop escalate` default ladder (the rung is dropped out loud; when that leaves one rung the
+error says the exclude list did it), `suggest`/`deals` listings, fleet session naming, the `doctor`
+ping probes (codex, claude, agy, gemini-cli) and Devin health/plan probes (the next allowed probe model
+is used, or the probe is skipped). A provider whose built-in default is excluded (e.g. `--provider
+devin` with `glm` excluded) is refused with the fix rather than run, and `fanout` refuses it up front,
+before any member starts. When everything a request could use is excluded, it stops with a clear
+message; it never quietly runs an excluded model.
+
+**Models outsourcerer cannot see.** While a list is active:
+- `continue` without `-m` is refused (the conversation keeps its original model, which may be excluded); pass `-m`;
+- `session start` without `-m` on Claude Code or Codex checks the CLI's configured default
+  (`ANTHROPIC_MODEL` / `~/.claude/settings.json`, `~/.codex/config.toml`) and refuses when it is
+  excluded, or when none is configured and the list covers a model of that family; pass `-m`;
+- a session is never relaunched (`session control relaunch`, `session effort`) or drift-restored onto a
+  model you have since excluded;
+- engine lanes run without `-m` (droid, cursor, hermes, cline, a Devin session) use the model the
+  engine is configured with, which outsourcerer cannot see; they print one line saying so. Pass `-m`
+  to be sure;
+- a background job whose `-m` was excluded after it was queued fails with reason `excluded-model`.
 
 **Why it sticks.** `brief` (the session-start handshake) and `doctor` print the active list, so every
 new orchestrator session sees it before it picks a model.
 
-Not covered: the `image` subcommand's automatic backend pick (image-only models; `image -m X` is refused like any -m), Devin health-probe models used by `doctor`
-liveness checks, and `OSRC_MODEL_DENYLIST` (the older exact-id org denylist, still honored alongside).
+**Cost.** With no list, the checks cost nothing (no extra processes). With a list, entries are read
+once per process and each distinct model name is matched once.
+
+Not covered: the `image` subcommand's automatic backend pick (image-only models; `image -m X` is
+refused like any -m), and `OSRC_MODEL_DENYLIST` (the older exact-id org denylist, still honored alongside).
 
 ## Plan limits and cross-harness failover
 
