@@ -2,6 +2,12 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.14.2
+
+### Added
+
+- **Claude Code can't walk away from running work.** The plugin now ships a stop guard. If Claude tries to end its turn while a run it launched is still going and nothing will wake it when that run finishes, the turn stays open and Claude is told the exact `wait` commands to start. Runs already being waited on, finished runs and other sessions' runs never block it. It reminds at most twice for the same runs, and `OSRC_STOP_GUARD=0` turns it off. (#48, thanks @dlibis)
+
 ## 0.14.1
 
 ### Fixed

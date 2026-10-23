@@ -282,6 +282,13 @@ prints its output, exit 0 on success, 1 on failure, 3 when it is waiting on you.
 session it returns when the turn ends (idle after working). Every launch prints the exact line as
 **WAKE**.
 
+**The stop guard backs this up in Claude Code.** The plugin installs a Stop hook. Each launch made from a
+Claude Code session records that session as its owner. When the session tries to end its turn while one
+of its runs is still going and no `wait` covers it, the hook blocks the stop and lists the exact `wait`
+commands to start. Runs with a waiter, finished runs and other sessions' runs never block. The same
+unwaited set is blocked at most twice (`OSRC_STOP_GUARD_MAX`), then the turn may end. Turn it off with
+`OSRC_STOP_GUARD=0`. Any error lets the turn end.
+
 **If you are an async / message-driven orchestrator that only takes a turn when input arrives (a
 chat/Slack/Telegram bot, or any assistant that sits idle between messages, even a long-lived process
 counts, because staying alive is not the same as polling), watching-by-polling is impossible: nothing

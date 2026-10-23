@@ -152,7 +152,7 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 # Version identifier. Single source of truth; bump the rightmost
 # number for patch releases. `doctor` and `--version` both read this.
-OSRC_VERSION="0.14.1"
+OSRC_VERSION="0.14.2"
 DEFAULT_MODEL="${OUTSOURCERER_MODEL:-glm-5.2}"
 
 # ---- platform detection (mac | linux | windows-gitbash). Windows = Git Bash / MSYS2, NO WSL
@@ -11889,6 +11889,7 @@ _bg_launch() {
     tries=$((tries+1))
     [ "$tries" -ge 8 ] && { echo "bg: could not allocate a unique job dir under $OSRC_JOBS" >&2; return 1; }
   done
+  _owner_record "$id"
   chmod 700 "$jd" 2>/dev/null
   # A factory task launch links the job to its task the moment the job exists, so a launcher killed
   # before it records the job id still leaves a job the scheduler can find and adopt.
@@ -12349,6 +12350,7 @@ _autodetach_run() {
   printf '>>>   session : %s\n' "$_ad_sess" >&2
   printf '>>>   WATCH  : tmux attach -t %s\n' "$_ad_sess" >&2
   printf '>>>   STEER  : OUTSOURCERER_TMUX=%s %s session read   |   OUTSOURCERER_TMUX=%s %s session send "..."   |   OUTSOURCERER_TMUX=%s %s session stop\n' "$_ad_sess" "$0" "$_ad_sess" "$0" "$_ad_sess" "$0" >&2
+  _owner_record "$_ad_sess"
   _wake_on_finish_hint "$_ad_sess"
   echo "$_ad_sess"
   return 0
@@ -19358,6 +19360,7 @@ _winpty_session() {
         echo "Started winpty session '$SESSION_NAME' running $PROVIDER (model: $MODEL) in $PWD."
       fi
       echo "Give it ~8s to boot, then:  $0 session read   |   $0 session send \"…\"   |   $0 session clear   |   $0 session model [name]   |   $0 session stop"
+      _owner_record "$SESSION_NAME"
       echo "To be woken when a turn ends: after each session send, start '$0 wait $SESSION_NAME' as a background command."
       ;;
     send)
@@ -19530,6 +19533,7 @@ session() {
         die "session start: interactive launch did not become a supervised live session."
       echo "Started tmux session '$SESSION_NAME' running $PROVIDER (model: $MODEL) in $PWD."
       echo "Give it ~8s to boot, then:  $0 session read   |   $0 session send \"…\"   |   $0 session answer [y|n|<i>|<label>]   |   $0 session control <interrupt|exit|relaunch>   |   $0 session clear   |   $0 session model [name]   |   $0 session stop"
+      _owner_record "$SESSION_NAME"
       echo "To be woken when a turn ends: after each session send, start '$0 wait $SESSION_NAME' as a background command."
       ;;
     send)
@@ -19697,6 +19701,114 @@ _warn_unwatched() {
     printf '>>>   %s  (unobserved %ss)   watch it: %s watch %s\n' "$_i" "$_a" "$0" "$_i" >&2
   done
   printf '>>>   An unwatched job is how a wedge becomes a lost hour. Watch it, or cancel it.\n' >&2
+}
+
+# ---- stop guard (Claude Code Stop hook) ---------------------------------------------------
+# Claude Code takes a turn only on user input or when a background command it started exits.
+# A delegate launched without a background `wait` therefore finishes unnoticed, and the agent keeps
+# telling the user it is "still going" (issue #48). The plugin's Stop hook runs `stop-guard`: when
+# the session that is about to end its turn launched delegates that are still live and nothing is
+# waiting on them, it blocks the stop and names the exact `wait` commands to start. A live run with
+# a waiter is fine, because the waiter's exit will wake the session.
+#
+# Ownership: every launch made from a Claude Code session records its id under
+# $OSRC_HOME/owners/<session-id>/. Other sessions' work never blocks this one.
+# Loop safety: the same unwaited set is blocked at most OSRC_STOP_GUARD_MAX times (default 2), then
+# the stop is allowed. A new set blocks again. OSRC_STOP_GUARD=0 turns the guard off. Any error
+# allows the stop.
+
+_owner_sid() { # [session-id] -> sanitized session id, or nothing
+  printf '%s' "${1:-${CLAUDE_CODE_SESSION_ID:-}}" | tr -cd 'A-Za-z0-9._-' | cut -c1-128
+}
+
+_owner_record() { # <job-or-session-id>
+  local s; s="$(_owner_sid)"
+  [ -n "$s" ] && [ -n "${1:-}" ] || return 0
+  case "$1" in */*|.|..) return 0 ;; esac
+  mkdir -p "$OSRC_HOME/owners/$s" 2>/dev/null && : > "$OSRC_HOME/owners/$s/$1" 2>/dev/null
+  return 0
+}
+
+# _owned_live_state <id> -> prints live|done|gone. done/gone mean the owner record can go.
+_owned_live_state() {
+  local id="$1" st
+  if [ -d "$OSRC_JOBS/$id" ]; then
+    st="$(_reconcile_status "$id" 2>/dev/null || printf '?')"
+    case "$st" in
+      done|'done?'|blocked|permission-blocked|failed|wedged|timeout|interrupted|canceled) printf 'done' ;;
+      *) printf 'live' ;;
+    esac
+    return 0
+  fi
+  if [ -e "$OSRC_HOME/autodetach/$id.log" ] || [ -e "$OSRC_HOME/autodetach/$id.rc" ]; then
+    if [ -s "$OSRC_HOME/autodetach/$id.rc" ]; then printf 'done'
+    elif have tmux && tmux has-session -t "=$id" 2>/dev/null; then printf 'live'
+    else printf 'gone'; fi
+    return 0
+  fi
+  if have tmux && tmux has-session -t "=$id" 2>/dev/null; then
+    # An interactive session counts only while it is working a turn; an idle REPL is not owed a wait.
+    st="$(_fleet_snapshot_read 2>/dev/null | jq -r --arg id "$id" '[.items[]? | select(.session_id==$id) | .state][0] // empty' 2>/dev/null)"
+    case "$st" in working|unresponsive\?) printf 'live' ;; *) printf 'idle' ;; esac
+    return 0
+  fi
+  printf 'gone'
+}
+
+# _waited_ids -> ids that a running `wait` / `fanout wait` already covers, one per line.
+_waited_ids() {
+  local line rest gid
+  ps -axo command= 2>/dev/null | grep -E 'outsourcerer(\.sh)?[^ ]* (.* )?wait( |$)' | grep -v 'stop-guard' | while IFS= read -r line; do
+    rest="${line##* wait }"
+    case "$line" in
+      *" fanout wait "*)
+        gid="${line##* fanout wait }"; gid="${gid%% *}"
+        [ -f "$(_fanout_dir "$gid" 2>/dev/null)/members.tsv" ] && cut -f1 "$(_fanout_dir "$gid")/members.tsv" 2>/dev/null
+        ;;
+      *) printf '%s\n' "${rest%% *}" ;;
+    esac
+  done
+}
+
+cmd_stop_guard() {
+  [ "${OSRC_STOP_GUARD:-1}" = "0" ] && return 0
+  have jq || return 0
+  local input sid dir live="" id state waited n reason key cnt max="${OSRC_STOP_GUARD_MAX:-2}"
+  case "$max" in ''|*[!0-9]*) max=2 ;; esac
+  input="$(head -c 65536 2>/dev/null)" || input=""
+  sid="$(_owner_sid "$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)")"
+  [ -n "$sid" ] || sid="$(_owner_sid)"
+  [ -n "$sid" ] || return 0
+  dir="$OSRC_HOME/owners/$sid"
+  [ -d "$dir" ] || return 0
+  waited="$(_waited_ids 2>/dev/null)"
+  for id in $(ls -1 "$dir" 2>/dev/null); do
+    state="$(_owned_live_state "$id" 2>/dev/null)"
+    case "$state" in
+      done|gone) rm -f "$dir/$id" 2>/dev/null ;;
+      live) printf '%s\n' "$waited" | grep -qxF "$id" || live="$live $id" ;;
+    esac
+  done
+  live="${live# }"
+  if [ -z "$live" ]; then
+    rm -f "$dir/.stop-blocks" 2>/dev/null
+    rmdir "$dir" 2>/dev/null
+    return 0
+  fi
+  # Loop safety: count consecutive blocks for this exact set.
+  key="$(printf '%s' "$live" | cksum | awk '{print $1}')"
+  cnt="$(awk -v k="$key" '$1==k{print $2}' "$dir/.stop-blocks" 2>/dev/null)"; cnt="${cnt:-0}"
+  if [ "$cnt" -ge "$max" ]; then
+    printf '[outsourcerer] stop-guard: %s still running with nothing waiting on it; letting the turn end after %s reminders.\n' "$live" "$cnt" >&2
+    return 0
+  fi
+  printf '%s %s\n' "$key" "$((cnt + 1))" > "$dir/.stop-blocks" 2>/dev/null
+  n="$(printf '%s\n' $live | grep -c .)"
+  reason="$(printf 'Outsourcerer: %s delegate run(s) you launched are still going, and nothing will wake you when they finish. Before ending your turn, start one background command per run (Bash with run_in_background: true):' "$n")"
+  for id in $live; do reason="$reason $(printf '\n  %s wait %s' "$SCRIPT_PATH" "$id")"; done
+  reason="$reason$(printf '\nThen tell the user what is running. Each wait returns with the result when its run ends, which gives you a turn to report it.')"
+  jq -cn --arg r "$reason" '{decision:"block", reason:$r}'
+  return 0
 }
 
 # ---- blind-turn guard ------------------------------------------------------------------
@@ -21161,7 +21273,7 @@ main() {
   # someone has to remember mid-session. Suppressed inside a detached job (it IS the work) and for the
   # commands whose whole purpose is already to look.
   case "${1:-}" in
-    __runjob|__heartbeat-beacon|watch|status|result|logs|cancel|gc|rundown|bearings|fleet|"") ;;
+    __runjob|__heartbeat-beacon|watch|status|result|logs|cancel|gc|rundown|bearings|fleet|stop-guard|"") ;;
     *) [ "${OSRC_STREAM:-0}" = "1" ] || _warn_unwatched || true ;;
   esac
   # GLOBAL flags are accepted in ANY order before the subcommand (and --provider/--cloud-ack are
@@ -21224,6 +21336,7 @@ main() {
     bearings)    cmd_bearings "$@" ;;                      # render the last normalized fleet snapshot
     heartbeat)   cmd_heartbeat "$@" ;;                     # verified supervision arm: start|status
     watch)       cmd_watch "$@" ;;                         # bounded ~15s status poll (OSRC_STATUS_DEADLINE); run-to-terminal callers use `wait`
+    stop-guard)  cmd_stop_guard "$@" ;;                  # Claude Code Stop hook: block a turn end while owned runs have no waiter (#48)
     wait)        cmd_wait "$@" ;;                          # BLOCK until a job is terminal; honest exit code (0 done|done?, 3 blocked|permission-blocked, 1 other failure, 124 --for elapsed while live)
     result)      cmd_result "$@" ;;                        # print a job's final message (last.txt)
     logs)        cmd_logs "$@" ;;                          # tail a job's raw log (forensics only)
@@ -21290,7 +21403,7 @@ main() {
   fi
   case "$cmd" in
     __runjob|__heartbeat-beacon|__gencost|__runcost|__so-agree|__escalate-ladder|\
-    watch|status|result|logs|cancel|gc|rundown|bearings|heartbeat|fleet|wait|explain|classify|session|\
+    watch|status|result|logs|cancel|gc|rundown|bearings|heartbeat|fleet|wait|stop-guard|explain|classify|session|\
     ""|-h|--help|help|--version|-V) ;;
     run|explore|research|edit|yolo|bg|fanout|crew|loop|continue)
       if ! _blind_turn_guard; then

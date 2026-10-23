@@ -1,0 +1,16 @@
+{
+  "description": "Outsourcerer stop guard: keeps a Claude Code turn from ending while runs it launched are still going with nothing waiting on them, so the agent gets woken when they finish.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"${CLAUDE_PLUGIN_ROOT}/skills/outsourcerer/scripts/outsourcerer.sh\"; [ -x \"$s\" ] || exit 0; \"$s\" stop-guard || exit 0",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
