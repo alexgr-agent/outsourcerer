@@ -152,7 +152,7 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 # Version identifier. Single source of truth; bump the rightmost
 # number for patch releases. `doctor` and `--version` both read this.
-OSRC_VERSION="0.14.0"
+OSRC_VERSION="0.14.1"
 DEFAULT_MODEL="${OUTSOURCERER_MODEL:-glm-5.2}"
 
 # ---- platform detection (mac | linux | windows-gitbash). Windows = Git Bash / MSYS2, NO WSL
@@ -8038,6 +8038,14 @@ _wake_notify_external() {
 # command and no attached sink. The beacon still records status durably, but a message-driven caller
 # (one turn per inbound message) will never see it unattended. Say so at launch, once, with the exact
 # fix — so an async orchestrator arms the push instead of discovering the gap after an hour of silence.
+# _wake_on_finish_hint <job-or-session-id> -> tell an agent caller how to be woken when this ends.
+# Agent harnesses (Claude Code, Codex) only take a turn on user input or when a background command
+# they started exits, so a pushed event cannot wake them. A background `wait` can (issue #48).
+_wake_on_finish_hint() {
+  { [ -t 0 ] || [ -t 1 ]; } && return 0                  # a human at a terminal is watching already
+  printf '>>>   WAKE   : to be told when it finishes, start NOW as a background command: %s wait %s   (Claude Code: Bash run_in_background=true; it returns when the run ends, with its output)\n' "$0" "$1" >&2
+}
+
 _async_supervision_notice() {
   { [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; } && return 0     # an attached terminal already sees the pulse
   [ -n "${OSRC_HEARTBEAT_WAKE:-}" ] && return 0          # a wake command is armed → status is pushed
@@ -8299,16 +8307,27 @@ _session_command_is_shell() { # <command>
   esac
 }
 
+# An auto-detached run puts outsourcerer.sh itself in the pane. It is a bash script, so the process
+# looks like a shell by name. Its command line names the script, which tells it apart from an idle
+# prompt (issue #47).
+_session_command_is_osrc_wrapper() { # <command>
+  case " $1 " in
+    *"/outsourcerer.sh "*|*" outsourcerer.sh "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Find the delegate engine below the tmux pane shell. tmux's pane_pid identifies that shell, so it
 # stays live after a foreground engine exits. The launch commands here exec the provider directly
 # from that shell, making its first non-shell child the engine identity we need for reaping.
+# An auto-detached run's engine is the outsourcerer.sh wrapper, which counts too.
 _session_engine_pid() { # <pane> <harness-pid>
   local pane="$1" harness_pid="$2" pid ppid command
   case "$harness_pid" in ''|*[!0-9]*) return 1 ;; esac
   while IFS=' ' read -r pid ppid command; do
     case "$pid:$ppid" in ''|*[!0-9:]*|*:|:*) continue ;; esac
     [ "$ppid" = "$harness_pid" ] || continue
-    _session_command_is_shell "$command" && continue
+    _session_command_is_shell "$command" && ! _session_command_is_osrc_wrapper "$command" && continue
     printf '%s\n' "$pid"
     return 0
   done < <(ps -axo pid=,ppid=,command= 2>/dev/null)
@@ -8338,7 +8357,11 @@ _session_engine_alive() { # <endpoint> <harness-pid> <harness-start> [engine-pid
           _session_harness_alive "$harness_pid" "$harness_start"
           return $?
         }
-        _session_command_is_shell "$current" && return 1
+        if _session_command_is_shell "$current"; then
+          # A running outsourcerer.sh wrapper also reports a shell name; its child proves it.
+          _session_engine_pid "$pane" "$harness_pid" >/dev/null 2>&1 && return 0
+          return 1
+        fi
         return 0
       fi
       ;;
@@ -11142,6 +11165,19 @@ _perm_denials() {
 #
 # Match on pid rather than "newest log in the dir": concurrent fanout jobs each get their own devin
 # process, and picking the newest file would let a busy sibling vouch for a genuinely hung job.
+# _tree_cpu_centis <pid> -> total CPU time of <pid> and its descendants, in hundredths of a second.
+# ps prints TIME as [[dd-]hh:]mm:ss[.cc]; parse each form so a long run does not wrap to zero.
+_tree_cpu_centis() {
+  local root="$1" pids
+  case "$root" in ''|*[!0-9]*) return 1 ;; esac
+  pids="$(printf '%s ' "$root" $(_descendants "$root" 2>/dev/null) | sed 's/ *$//; s/ /,/g')"
+  ps -o time= -p "$pids" 2>/dev/null | awk '
+    { t=$1; d=0; if (index(t,"-")) { split(t,a,"-"); d=a[1]; t=a[2] }
+      n=split(t,p,":"); s=0; for (i=1;i<=n;i++) s=s*60+p[i]
+      tot+= (d*86400+s)*100 }
+    END { if (NR>0) printf "%d\n", tot }'
+}
+
 _devin_live_mtime() {
   local dlog_dir="${HOME}/.local/share/devin/cli/logs"
   [ -d "$dlog_dir" ] || return 1
@@ -11556,6 +11592,19 @@ _supervise() {
         last_change="$_dmt"; idle=$(( now - last_change ))
         [ "$(cat "$jd/status" 2>/dev/null)" = "stalled?" ] && echo running > "$jd/status"
       fi
+    fi
+    # PRINT-MODE LIVENESS. Some lanes print nothing until the answer is complete (cursor-agent
+    # --output-format text, e.g. a Grok model thinking for minutes), so silence is not a hang
+    # (issue #48). A delegate tree still burning CPU is working; a wedged one waiting on a dead
+    # socket burns none. The hard cap still bounds a process that spins forever.
+    # OSRC_CPU_LIVENESS=0 disables.
+    if [ "$idle" -ge "$warn" ] && [ "${OSRC_CPU_LIVENESS:-1}" = "1" ]; then
+      local _cpu; _cpu="$(_tree_cpu_centis "$pid")"
+      if [ -n "$_cpu" ] && [ -n "${_last_cpu:-}" ] && [ "$_cpu" -gt "$(( _last_cpu + ${OSRC_CPU_LIVENESS_MIN:-5} ))" ]; then
+        last_change=$now; idle=0
+        [ "$(cat "$jd/status" 2>/dev/null)" = "stalled?" ] && echo running > "$jd/status"
+      fi
+      [ -n "$_cpu" ] && _last_cpu="$_cpu"
     fi
     if [ "$idle" -ge "$kill_after" ]; then
       # A job that never emitted ANYTHING past the launch banner is a different failure from one that
@@ -12124,7 +12173,7 @@ cmd_bg() {
   # about its own routing, so name it as a default and point at the record that is actually true.
   echo "[outsourcerer] job $id launched (default lane: $PROVIDER; a model alias can route it elsewhere, and '$0 status $id' shows the model it really ran)." >&2
   echo "[outsourcerer] NOW WATCH IT: $0 watch $id     (it runs unobserved until you do; status/result: $0 status $id | $0 result $id)" >&2
-  _async_supervision_notice
+  _wake_on_finish_hint "$id"; _async_supervision_notice
 }
 
 # AUTO-DETACH: a non-interactive slow-lane foreground run blocks until the model finishes (3-5 min
@@ -12182,6 +12231,19 @@ _autodetach_should() {
 # Cloud consent comes FIRST, before ANY launch machinery below (the tmux probe included): a
 # non-interactive cloud run must fail at the CLOUD GATE, never at a missing-tmux error, so the
 # gate stays the first thing a cloud dispatch hits on every platform.
+# _autodetach_finished_output <pane-log> -> print what the run showed, without the typed command
+# line or terminal control codes. The pane clears itself before the run, so keep what follows the
+# last screen clear.
+_autodetach_finished_output() {
+  local log="$1"
+  [ -s "$log" ] || return 0
+  if have perl; then
+    perl -0777 -ne 's/.*\e\[H\e\[[23]?J//s; s/\e\][^\a]*\a//g; s/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e[()][A-Z0-9]//g; s/\r//g; s/[^\n]*\z//; print' "$log"
+  else
+    sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' "$log"
+  fi
+}
+
 _autodetach_run() {
   local _ar_verb="$1"; shift
   _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
@@ -12210,7 +12272,7 @@ _autodetach_run() {
     printf '>>> [auto-detach] non-interactive slow-lane run detached to bg to avoid a caller tool-timeout.\n' >&2
     printf '>>>   job id : %s\n' "$id" >&2
     printf '>>>   NOW WATCH IT: %s watch %s   (unobserved until you do; status: %s status %s | result: %s result %s)\n' "$0" "$id" "$0" "$id" "$0" "$id" >&2
-    _async_supervision_notice
+    _wake_on_finish_hint "$id"; _async_supervision_notice
     echo "$id"
     return 0
   fi
@@ -12248,16 +12310,46 @@ _autodetach_run() {
   if ! tmux new-session -d -s "$_ad_sess" -x 200 -y 50 -c "$PWD" 2>/dev/null; then
     die "auto-detach: tmux new-session failed for '$_ad_sess' (tmux server error or session name collision). Set OSRC_REQUIRE_INTERACTIVE=0 to allow the headless bg path, or check tmux."
   fi
+  # The pane writes its exit code to a marker and its screen to a log, so a run that finishes
+  # before supervision attaches still hands back its answer (issue #47: a quick task is done
+  # within seconds and used to be reported as a failed launch).
+  local _ad_dir="$OSRC_HOME/autodetach" _ad_rc _ad_log
+  mkdir -p "$_ad_dir" 2>/dev/null || true
+  _ad_rc="$_ad_dir/$_ad_sess.rc"; _ad_log="$_ad_dir/$_ad_sess.log"
+  rm -f "$_ad_rc" "$_ad_log" 2>/dev/null || true
+  tmux pipe-pane -t "$_ad_sess" -o "cat >> $(printf '%q' "$_ad_log")" 2>/dev/null || true
+  _ad_full="$_ad_full; printf '%s\\n' \"\$?\" > $(printf '%q' "$_ad_rc")"
   if ! tmux send-keys -t "$_ad_sess" "$_ad_full" Enter; then
     _session_launch_cleanup "$_ad_sess" send-failed
     die "auto-detach: tmux send-keys failed for '$_ad_sess'; the interactive command was not submitted."
   fi
-  _session_launch_finalize "$_ad_sess" "$PROVIDER" "$MODEL" "${EFFORT:-}" "$_ad_full" || \
-    die "auto-detach: interactive launch did not become a supervised live session."
+  if ! _session_launch_finalize "$_ad_sess" "$PROVIDER" "$MODEL" "${EFFORT:-}" "$_ad_full"; then
+    # Finished already: hand back its output and exit code, same as a foreground run.
+    [ -s "$_ad_rc" ] || sleep 1   # the engine can exit a moment before the pane writes its marker
+    if [ -s "$_ad_rc" ]; then
+      _autodetach_finished_output "$_ad_log"
+      local _ad_code; _ad_code="$(tr -dc '0-9' < "$_ad_rc")"
+      return "${_ad_code:-1}"
+    fi
+    # Never started: nothing ran, so the headless path is a safe retry, not a second run.
+    if [ ! -s "$_ad_log" ] || ! grep -q 'RESOLVED lane=' "$_ad_log" 2>/dev/null; then
+      [ "${OSRC_REQUIRE_TMUX:-0}" = "1" ] && die "auto-detach: interactive launch did not start and OSRC_REQUIRE_TMUX=1."
+      printf '>>> [auto-detach] the tmux window did not start the run; falling back to the headless bg path.\n' >&2
+      local id; id="$(_bg_launch "$_ar_verb" "$@")"
+      [ -n "$id" ] || die "auto-detach: headless fallback failed -- no job id was minted (nothing was started)."
+      printf '>>>   job id : %s\n' "$id" >&2
+      printf '>>>   NOW WATCH IT: %s watch %s   (status: %s status %s | result: %s result %s)\n' "$0" "$id" "$0" "$id" "$0" "$id" >&2
+      _wake_on_finish_hint "$id"; _async_supervision_notice
+      echo "$id"
+      return 0
+    fi
+    die "auto-detach: interactive launch did not become a supervised live session (log: $_ad_log)."
+  fi
   printf '>>> [auto-detach] non-interactive slow-lane run routed to INTERACTIVE tmux session (not headless bg).\n' >&2
   printf '>>>   session : %s\n' "$_ad_sess" >&2
   printf '>>>   WATCH  : tmux attach -t %s\n' "$_ad_sess" >&2
   printf '>>>   STEER  : OUTSOURCERER_TMUX=%s %s session read   |   OUTSOURCERER_TMUX=%s %s session send "..."   |   OUTSOURCERER_TMUX=%s %s session stop\n' "$_ad_sess" "$0" "$_ad_sess" "$0" "$_ad_sess" "$0" >&2
+  _wake_on_finish_hint "$_ad_sess"
   echo "$_ad_sess"
   return 0
 }
@@ -13239,6 +13331,71 @@ cmd_watch() {
 # via _reconcile_status, NEVER a raw `cat status` — reconciliation is what flips a dead job out
 # of `running`. No separate stall detector: the lane-aware watchdog already handles healthy
 # long inference, and second-guessing it here would re-introduce the false-stall class.
+# _wait_session <session-id> <forset> <forsec> -> block until a tmux session's work ends, with the
+# same exit codes as cmd_wait. An auto-detached run ends when its pane writes the exit-code marker;
+# its output is printed like `result` would. An interactive session ends its turn when the fleet sees
+# it go idle after working (or idle for OSRC_WAIT_IDLE_GRACE seconds, default 30, since the wait began),
+# waiting on you (3), or gone (1).
+_wait_session() {
+  local id="$1" forset="$2" forsec="$3"
+  case "$id" in ''|*/*|.|..) die "no such job or session: $id" ;; esac
+  local rcf="$OSRC_HOME/autodetach/$id.rc" log="$OSRC_HOME/autodetach/$id.log" ad=0
+  [ -e "$log" ] || [ -e "$rcf" ] && ad=1
+  if [ "$ad" = 0 ] && ! { have tmux && tmux has-session -t "=$id" 2>/dev/null; } \
+     && ! _state_jsonl_read "$OSRC_SESSION_REGISTRY" 2>/dev/null | grep -q "\"session_id\":\"$id\""; then
+    die "no such job or session: $id"
+  fi
+  local t0 elapsed st="" last="" seen_work=0 idle_since="" grace="${OSRC_WAIT_IDLE_GRACE:-30}" poll code alive
+  case "$grace" in ''|*[!0-9]*) grace=30 ;; esac
+  t0=$(date +%s)
+  while :; do
+    alive=0; have tmux && tmux has-session -t "=$id" 2>/dev/null && alive=1
+    if [ "$ad" = 1 ]; then
+      if [ -s "$rcf" ]; then
+        _autodetach_finished_output "$log"
+        code="$(tr -dc '0-9' < "$rcf")"
+        printf '[outsourcerer] wait: %s finished (exit %s).\n' "$id" "${code:-?}" >&2
+        [ "${code:-1}" = 0 ] && return 0
+        return 1
+      fi
+      if [ "$alive" = 0 ]; then
+        printf '[outsourcerer] wait: %s ended without an exit code (stopped or killed).\n' "$id" >&2
+        return 1
+      fi
+      st=working
+    else
+      st="$(_fleet_snapshot_refresh 2>/dev/null | jq -r --arg id "$id" '[.items[]? | select(.session_id==$id) | .state][0] // empty' 2>/dev/null)"
+      [ -z "$st" ] && [ "$alive" = 0 ] && st=ended
+      case "$st" in
+        working|unresponsive\?) seen_work=1; idle_since="" ;;
+        blocked|blocked\?) printf '[outsourcerer] wait: %s is waiting on you.\n' "$id" >&2; return 3 ;;
+        done|completed) printf '[outsourcerer] wait: %s is done.\n' "$id" >&2; return 0 ;;
+        failed|dead|ended|stopped) printf '[outsourcerer] wait: %s %s.\n' "$id" "$st" >&2; return 1 ;;
+        idle|'')
+          [ -n "$idle_since" ] || idle_since=$(date +%s)
+          if [ "$seen_work" = 1 ] || [ $(( $(date +%s) - idle_since )) -ge "$grace" ]; then
+            printf '[outsourcerer] wait: %s finished its turn and is idle. Read it: OUTSOURCERER_TMUX=%s %s session read\n' "$id" "$id" "$0" >&2
+            return 0
+          fi
+          ;;
+      esac
+    fi
+    [ "$st" != "$last" ] && { printf '[outsourcerer] wait: %s %s\n' "$id" "${st:-unknown}" >&2; last="$st"; }
+    elapsed=$(( $(date +%s) - t0 ))
+    if [ "$forset" = 1 ] && { [ "$forsec" -eq 0 ] || [ "$elapsed" -ge "$forsec" ]; }; then
+      printf '[outsourcerer] wait --for %ss elapsed for %s; still %s (non-terminal).\n' "$forsec" "$id" "${st:-live}" >&2
+      return 124
+    fi
+    poll="${OSRC_POLL:-10}"; case "$poll" in ''|*[!0-9]*|0) poll=10 ;; esac
+    [ "$ad" = 1 ] && [ "$poll" -gt 3 ] && poll=3   # the marker check is a file stat, so poll it often
+    if [ "$forset" = 1 ] && [ "$forsec" -gt 0 ]; then
+      local remain=$(( forsec - elapsed )); [ "$remain" -lt 1 ] && remain=1
+      [ "$poll" -gt "$remain" ] && poll=$remain
+    fi
+    sleep "$poll"
+  done
+}
+
 cmd_wait() {
   # Parse args in any order: the first non-flag is the job id; `--for N` (or --for=N) may appear
   # anywhere. --for 0 means "check once now" (return 124 immediately if still live), not "wait
@@ -13254,6 +13411,12 @@ cmd_wait() {
     esac
   done
   [ -n "$id" ] || die "wait needs a job id"
+  # A tmux session id (an auto-detached run, or a `session start`) waits on the session instead.
+  # Run it as a background command and an agent harness wakes the moment it returns (issue #48).
+  if [ ! -d "$OSRC_JOBS/$id" ]; then
+    _wait_session "$id" "$forset" "$forsec"
+    return $?
+  fi
   _mark_watched "$id"
   local jd="$OSRC_JOBS/$id"; [ -d "$jd" ] || die "no such job: $id"
   local t0; t0=$(date +%s); local last="" lastprog=""
@@ -18443,7 +18606,7 @@ _session_launch_liveness_check() {
   case "$secs" in 0) return 0 ;; ''|*[!0-9]*) secs=6 ;; esac
   have tmux || return 0
   tmux has-session -t "$sess" 2>/dev/null || return 0   # nothing to verify; let the caller's own checks speak
-  local cmd="" i=0
+  local cmd="" i=0 ppid=""
   # Give the engine a moment to take over the pane (send-keys just typed the command; the shell
   # is still foreground while the engine process forks/boots). Poll until the foreground command
   # is NOT the shell, or the budget elapses.
@@ -18452,6 +18615,10 @@ _session_launch_liveness_check() {
     cmd="$(tmux display-message -p -t "$sess" '#{pane_current_command}' 2>/dev/null)" || cmd=""
     case "$cmd" in
       bash|zsh|sh|dash|fish|ksh|tcsh|csh|"")
+        # A shell name can still be a running outsourcerer.sh wrapper (auto-detach). If the pane
+        # shell has an engine child, the launch is up.
+        ppid="$(tmux display-message -p -t "$sess" '#{pane_pid}' 2>/dev/null)" || ppid=""
+        [ -n "$ppid" ] && _session_engine_pid "$sess" "$ppid" >/dev/null 2>&1 && return 0
         # Still the shell (or empty). Keep polling — the engine may not have taken over yet.
         continue
         ;;
@@ -19191,6 +19358,7 @@ _winpty_session() {
         echo "Started winpty session '$SESSION_NAME' running $PROVIDER (model: $MODEL) in $PWD."
       fi
       echo "Give it ~8s to boot, then:  $0 session read   |   $0 session send \"…\"   |   $0 session clear   |   $0 session model [name]   |   $0 session stop"
+      echo "To be woken when a turn ends: after each session send, start '$0 wait $SESSION_NAME' as a background command."
       ;;
     send)
       [ -n "${1:-}" ] || die "session send needs text"
@@ -19362,6 +19530,7 @@ session() {
         die "session start: interactive launch did not become a supervised live session."
       echo "Started tmux session '$SESSION_NAME' running $PROVIDER (model: $MODEL) in $PWD."
       echo "Give it ~8s to boot, then:  $0 session read   |   $0 session send \"…\"   |   $0 session answer [y|n|<i>|<label>]   |   $0 session control <interrupt|exit|relaunch>   |   $0 session clear   |   $0 session model [name]   |   $0 session stop"
+      echo "To be woken when a turn ends: after each session send, start '$0 wait $SESSION_NAME' as a background command."
       ;;
     send)
       [ -n "${1:-}" ] || die "session send needs text"

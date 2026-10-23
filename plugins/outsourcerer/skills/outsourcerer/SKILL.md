@@ -101,7 +101,9 @@ Skip the loop when nothing external can verify the result (a model would be mark
 
 Every delegated run gets a watcher in the same turn you launch it, and you report to the user every ~2 minutes (or on a state change) until it ends: what is happening now, which model(s) and lane(s) are running, which agent is on what. A detached job nobody watches is the failure this tool exists to prevent. If you cannot watch a run, say so and cancel it. A launch prints **NOW WATCH IT**, and later calls list unwatched jobs: watch or cancel those before anything else.
 
-Async or message-driven orchestrators (bots, anything idle between inputs) cannot poll: export `OSRC_HEARTBEAT_WAKE="<your notifier>"` before launching so the beacon wakes you. An **ASYNC SUPERVISION** warning means it is unset. Cadence, wake payload, digest switch, and `fleet`: `references/jobs-and-safety.md`.
+**Agent harnesses (Claude Code, Codex) take a turn only on user input or when a background command they started exits.** So in the same turn as every launch, start `outsourcerer.sh wait <job-or-session-id>` as a background command (Claude Code: Bash `run_in_background: true`), one per job. It returns when that run ends, with its output, and that wakes you. It works for `bg` jobs and for tmux runs alike; the launch prints the exact line as **WAKE**.
+
+Chat bots and other message-driven orchestrators cannot poll: export `OSRC_HEARTBEAT_WAKE="<your notifier>"` before launching so the beacon wakes you. An **ASYNC SUPERVISION** warning means it is unset. Cadence, wake payload, digest switch, and `fleet`: `references/jobs-and-safety.md`.
 
 ## Operating rules
 

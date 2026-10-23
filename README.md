@@ -112,7 +112,7 @@ outsourcerer fanout collect <id>            # every result in one place, then: o
 
 `--worktree` runs each editing specialist in its **own disposable git worktree** so parallel edits never collide; worktrees are preserved after the run (never auto-deleted), and `cleanup` refuses to bin one that has unmerged work unless you `--force`. Every job is watchdog-supervised so it ends **classified** (done / blocked / timed-out), carries your skills via `--with` (MCP on the Claude lanes), and lands on the **Tab**. You keep the persona, the decomposition, the merge policy; the sorcerer runs the fleet.
 
-**On the roadmap:** **completion events** so the orchestrator wakes on a state change instead of polling, and a richer receipt (cost + branch/SHA) in that same JSON.
+**It wakes you when a job ends.** Every launch prints a `wait` line. Start it as a background command and Claude Code or Codex gets a turn the moment the work finishes, with the result in hand. **On the roadmap:** pushed completion events for chat bots, and a richer receipt (cost + branch/SHA) in that same JSON.
 
 ---
 
@@ -364,7 +364,7 @@ Add capability to one offload with `--with skills=<name>` / `--with mcp=<name>`.
 **Today it drives like a copilot.** It greets you each session, shows your live token budget, and hands you the wheel: **auto-pilot**, **you-drive**, or **hybrid**, then conserves your limits on its own when the session runs hot. And it works across **Claude Code · Codex · Antigravity · Devin · Cursor · Droid · Hermes**, on Mac, Linux, and Windows (Git Bash, no WSL). Next up:
 
 - **Pi** and more harnesses as the frontier expands.
-- An OpenRouter server-side subagent lane, and completion events so an orchestrator wakes on a job's state change instead of polling.
+- An OpenRouter server-side subagent lane, and pushed completion events for chat-bot orchestrators.
 - *Already shipped:* the **software factory** (durable plans, automatic context hand-off, a done contract, a serialized merge gate, and ready-made flows) plus a saved model exclude list in v0.14.0; the **`fleet`** view (one honest list of every session you're running, with real names and honest states) in v0.7.0; the **Cline** engine lane in v0.6.4, fully supervised, running on your own Cline setup (your API keys, or a ClinePass subscription for discounted open-weight models like GLM, DeepSeek, and Kimi); **loops** (a bounded try→check→retry cycle run on a cheap external model, verified by your own tests) and per-repo lane trust in v0.4.13; the interactive copilot (auto/manual/hybrid modes + live-limit auto-conservation) and **Cursor**, **Droid**, and the `claudex` lane (your ChatGPT model inside the Claude Code harness) in v0.4.8; reverse bridges so you can drive Outsourcerer *from* Codex, Droid, Cursor, or Hermes too (Hermes goes both ways: delegate to it with `-m <any>`, or drive Outsourcerer from inside a Hermes session via `parity-hermes`); parallel `fanout` (v0.2.0); the local Ollama/LM-Studio lane (v0.3.0); git-worktree isolation, agent-library routing, and machine-readable `status --json` (v0.3.1).
 
 Issues and PRs welcome.

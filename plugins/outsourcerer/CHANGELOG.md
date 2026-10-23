@@ -2,6 +2,18 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.14.1
+
+### Fixed
+
+- **Background runs no longer die at launch.** A slow-lane `run` started from an agent moves to its own tmux window. The launch check read the running Outsourcerer script as an idle shell, so after 6 seconds it reported "did NOT stay up" and closed a healthy run. It now sees the run, and the heartbeat tracks it as alive. (#47, thanks @dlibis)
+- **A run that finishes in seconds returns its answer.** If the work ends before supervision attaches, you get its output and exit code instead of a launch error. If the window never starts the run at all, it falls back to the headless path. (#47, thanks @dlibis)
+- **Quiet models are not reaped as stuck.** Lanes that print nothing until the answer is ready (Cursor with a thinking model, for one) were stopped after the silence window. The watchdog now checks whether the delegate is still using the CPU before it calls a job stalled. `OSRC_CPU_LIVENESS=0` turns this off. (#48, thanks @dlibis)
+
+### Added
+
+- **Agents get woken when work finishes.** `wait` now takes a tmux session as well as a job id, and returns with the run's output when it ends. Every launch prints a **WAKE** line: start that `wait` as a background command and Claude Code or Codex takes a turn the moment the job is done. (#48, thanks @dlibis)
+
 ## 0.14.0
 
 ### Added

@@ -272,6 +272,16 @@ jobs that have been running with nobody looking. If you see that warning, you al
 ; watch or cancel before doing anything else. Watching is also what makes loops steerable: you cannot
 course-correct or kill a bad run you are not reading.
 
+**If you are an agent harness (Claude Code, Codex CLI), wake yourself with a background `wait`.** These
+harnesses take a turn only when the user types or when a background command they started exits; a
+command run by `OSRC_HEARTBEAT_WAKE` cannot inject a turn. So in the same turn as the launch, start
+`outsourcerer.sh wait <id>` as a background command (Claude Code: Bash `run_in_background: true`), one
+per job. `<id>` is a `bg` job id or a tmux session name (an auto-detached `run` prints its session as
+`osrc-ad-...`; a `session start` uses its session name). For a run, `wait` returns when it ends and
+prints its output, exit 0 on success, 1 on failure, 3 when it is waiting on you. For an interactive
+session it returns when the turn ends (idle after working). Every launch prints the exact line as
+**WAKE**.
+
 **If you are an async / message-driven orchestrator that only takes a turn when input arrives (a
 chat/Slack/Telegram bot, or any assistant that sits idle between messages, even a long-lived process
 counts, because staying alive is not the same as polling), watching-by-polling is impossible: nothing
